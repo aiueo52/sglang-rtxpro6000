@@ -561,7 +561,9 @@ def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
 
-    idx = tl.load(h0_indices + i_n)
+    # int64: envelope pitches overflow an int32 index product (mirrors the
+    # sibling kernel at line ~117; h0_indices arrive as int32 from the backend).
+    idx = tl.load(h0_indices + i_n).to(tl.int64)
     p_h0 = h0_source + idx * HV * K * V + i_hv * K * V + o_v[None, :] * K + o_k[:, None]
     b_h = tl.load(p_h0, mask=(idx >= 0) & mask_h, other=0).to(tl.float32)
 
@@ -569,7 +571,7 @@ def fused_sigmoid_gating_delta_rule_recover_final_state_kernel(
     # boundary pass reads h_0 from the working slot and writes the folded boundary
     # state to a separate ping-pong track slot. out_indices == h0_indices gives the
     # default in-place recovery. out_idx < 0 rows are skipped on store.
-    out_idx = tl.load(out_indices + i_n)
+    out_idx = tl.load(out_indices + i_n).to(tl.int64)
     p_out = (
         h0_source
         + out_idx * HV * K * V
@@ -645,6 +647,13 @@ def fused_sigmoid_gating_delta_rule_recover_final_state(
     is_kda: bool = False,
     output_state_indices: Optional[torch.Tensor] = None,
 ):
+    # The kernel hardcodes the per-slot pitch as HV*K*V (no stride param).
+    # Envelope-strided pools would silently write wrong slots — fail loudly.
+    _hv, _v, _k = initial_state_source.shape[1:4]
+    assert initial_state_source.stride(0) == _hv * _v * _k, (
+        'recover_final_state requires a densely packed state pool: '
+        f'stride(0)={initial_state_source.stride(0)} != {_hv*_v*_k}'
+    )
     """Recovery-only GDN recurrence for gdn_mtp_cache_mode=none.
 
     This writes h_{accepted_step} directly back to the SSM state slot and
