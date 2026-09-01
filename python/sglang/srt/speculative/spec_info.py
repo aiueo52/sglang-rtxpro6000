@@ -55,6 +55,11 @@ class SpeculativeAlgorithm(Enum):
             return cls[upper]
         except KeyError:
             pass
+        if upper == "NGRAM_CHAIN":
+            # Built as a registered EAGLE-like provider rather than an enum member.
+            # Import lazily to avoid loading the EAGLE worker for non-spec servers.
+            from sglang.srt.speculative import ngram_chain_worker  # noqa: F401
+
         spec = _get_registered_spec(upper)
         if spec is not None:
             return spec

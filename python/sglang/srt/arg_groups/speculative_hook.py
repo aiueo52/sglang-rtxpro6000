@@ -790,13 +790,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
     if cfg.speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
-        # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
-        # the rejection-sampling kernel consumes; everything else (STANDALONE,
-        # FROZEN_KV_MTP, NGRAM, DFLASH) is unsupported.
-        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        # EAGLE/EAGLE3 emit target-vocab proposals, and NGRAM_CHAIN emits a
+        # target-vocab delta proposal. Everything else is unsupported.
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "NGRAM_CHAIN"):
             raise NotImplementedError(
                 "--speculative-use-rejection-sampling is only supported for "
-                "EAGLE / EAGLE3 / NEXTN, not "
+                "EAGLE / EAGLE3 / NEXTN / NGRAM_CHAIN, not "
                 f"speculative_algorithm={cfg.speculative_algorithm}."
             )
         if cfg.speculative_eagle_topk != 1:

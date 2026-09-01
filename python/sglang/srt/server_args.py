@@ -2152,7 +2152,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Registered providers include NGRAM_CHAIN.",
         NS("spec"),
     ] = None
     speculative_draft_model_path: A[
@@ -2428,6 +2428,25 @@ class ServerArgs:
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
         NS("spec"),
     ] = 10000000
+
+    # -------------------------------------------------------------------------
+    # Speculative decoding (request-local ngram chain)
+    # -------------------------------------------------------------------------
+    speculative_ngram_chain_min_size: A[
+        int,
+        "Minimum suffix n-gram size for NGRAM_CHAIN.",
+        NS("spec"),
+    ] = 4
+    speculative_ngram_chain_max_size: A[
+        int,
+        "Maximum suffix n-gram size for NGRAM_CHAIN.",
+        NS("spec"),
+    ] = 12
+    speculative_ngram_chain_window_size: A[
+        int,
+        "Maximum request-local history tokens retained by NGRAM_CHAIN.",
+        NS("spec"),
+    ] = 32768
 
     # -------------------------------------------------------------------------
     # Expert parallelism
