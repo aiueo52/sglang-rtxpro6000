@@ -1,4 +1,6 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
@@ -6,6 +8,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.layers.linear import ReplicatedLinear
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
@@ -119,8 +125,11 @@ class GatedResidual(HyperConnectionBase):
         use_mix: bool = True,
         use_combine: bool = True,
         role: Optional[str] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__(config, use_mix, use_combine, role)
+        self._quantized_mix = quant_config is not None
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -135,20 +144,44 @@ class GatedResidual(HyperConnectionBase):
         )
 
         if use_mix:
-            self.input_mix_weight_down = nn.Linear(
-                self.hidden_size * self.hc_count,
-                self.config.hc_lowrank,
-                bias=False,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
-            self.input_mix_weight_up = nn.Linear(
-                self.config.hc_lowrank,
-                self.hc_count * self.hidden_size,
-                bias=False,
-                device=torch.cuda.current_device(),
-                dtype=config.params_dtype,
-            )
+            if quant_config is None:
+                self.input_mix_weight_down = nn.Linear(
+                    self.hidden_size * self.hc_count,
+                    self.config.hc_lowrank,
+                    bias=False,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+                self.input_mix_weight_up = nn.Linear(
+                    self.config.hc_lowrank,
+                    self.hc_count * self.hidden_size,
+                    bias=False,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+            else:
+                self.input_mix_weight_down = ReplicatedLinear(
+                    self.hidden_size * self.hc_count,
+                    self.config.hc_lowrank,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=(
+                        f"{prefix}.input_mix_weight_down"
+                        if prefix
+                        else "input_mix_weight_down"
+                    ),
+                )
+                self.input_mix_weight_up = ReplicatedLinear(
+                    self.config.hc_lowrank,
+                    self.hc_count * self.hidden_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=(
+                        f"{prefix}.input_mix_weight_up"
+                        if prefix
+                        else "input_mix_weight_up"
+                    ),
+                )
             from sglang.srt.environ import envs
 
             lowrank = self.config.hc_lowrank
@@ -162,6 +195,7 @@ class GatedResidual(HyperConnectionBase):
                 and self.hidden_size % 8 == 0
                 and lowrank > 0
                 and lowrank % 8 == 0
+                and not self._quantized_mix
             )
             self._mix_up_weight_padded = None
 
@@ -228,6 +262,21 @@ class GatedResidual(HyperConnectionBase):
         self._mix_compute = torch.compile(_mix_compute)
         self._combine_compute = torch.compile(_combine_compute)
 
+    def _mix_with_quantized_linears(
+        self, hyper_input_normed: torch.Tensor
+    ) -> torch.Tensor:
+        input_mix_weight, _ = self.input_mix_weight_down(hyper_input_normed)
+        input_mix_weight = F.silu(input_mix_weight / self.hc_count)
+        input_mix_weight, _ = self.input_mix_weight_up(input_mix_weight)
+        input_mix_weight = torch.sigmoid(input_mix_weight)
+        input_mix_weight = input_mix_weight.unflatten(
+            -1, (self.hc_count, self.hidden_size)
+        )
+        return (
+            input_mix_weight
+            * hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
+        ).mean(dim=-2)
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -242,7 +291,11 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
-        if (
+        if self._quantized_mix:
+            mixed_input = self._mix_with_quantized_linears(hyper_input_normed).to(
+                self.params_dtype
+            )
+        elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
             and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)

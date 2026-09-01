@@ -343,12 +343,22 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             inplace=not _needs_hidden_after_experts,
         )
 
+        gate_prefix = add_prefix("gate", prefix)
+        gate_quant_config = None
+        if config.model_type == "qwen4_exp_text":
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                qwen4_exp_dense_fp8_quant_config,
+            )
+
+            gate_quant_config = qwen4_exp_dense_fp8_quant_config(
+                quant_config, gate_prefix, "mlp_gates"
+            )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=None,
-            prefix=add_prefix("gate", prefix),
+            quant_config=gate_quant_config,
+            prefix=gate_prefix,
         )
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
@@ -376,13 +386,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        if _is_cpu and _is_cpu_amx_available:
+        shared_gate_prefix = add_prefix("shared_expert_gate", prefix)
+        shared_gate_quant_config = None
+        if config.model_type == "qwen4_exp_text":
+            shared_gate_quant_config = qwen4_exp_dense_fp8_quant_config(
+                quant_config, shared_gate_prefix, "mlp_gates"
+            )
+        self.shared_expert_gate_fp8 = shared_gate_quant_config is not None
+        if (_is_cpu and _is_cpu_amx_available) or self.shared_expert_gate_fp8:
             self.shared_expert_gate = ReplicatedLinear(
                 config.hidden_size,
                 1,
                 bias=False,
-                quant_config=None,
-                prefix=add_prefix("shared_expert_gate", prefix),
+                quant_config=shared_gate_quant_config,
+                prefix=shared_gate_prefix,
             )
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
@@ -461,7 +478,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             fused_append_shared_experts_with_weights,
         )
 
-        if _use_aiter:
+        if _use_aiter and not self.shared_expert_gate_fp8:
             # HIP/aiter: fuse the shared_expert_gate GEMV + sigmoid + scale into
             # the append kernel, eliminating the standalone gate GEMM launch.
             # This subsumes the sigmoid-only fusion: there is no separate gate
@@ -508,7 +525,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None and apply_gate:
-                if use_intel_amx_backend(self.shared_expert_gate):
+                if (
+                    not self.shared_expert_gate_fp8
+                    and use_intel_amx_backend(self.shared_expert_gate)
+                ):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
                         hidden_states,
                         self.shared_expert_gate.weight,
@@ -521,13 +541,17 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         sigmoid_gate_mul_broadcast,
                     )
 
-                    gate = self.shared_expert_gate(hidden_states)
+                    if self.shared_expert_gate_fp8:
+                        gate, _ = self.shared_expert_gate(hidden_states)
+                    else:
+                        gate = self.shared_expert_gate(hidden_states)
                     shared_output = sigmoid_gate_mul_broadcast(shared_output, gate)
                 else:
-                    shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
-                        * shared_output
-                    )
+                    if self.shared_expert_gate_fp8:
+                        gate, _ = self.shared_expert_gate(hidden_states)
+                    else:
+                        gate = self.shared_expert_gate(hidden_states)
+                    shared_output = F.sigmoid(gate) * shared_output
 
         return shared_output
 
@@ -657,6 +681,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         use_fused_gate = (
             self.shared_expert_gate is not None
+            and not self.shared_expert_gate_fp8
             and not use_intel_amx_backend(self.shared_expert_gate)
             and not is_npu()
         )

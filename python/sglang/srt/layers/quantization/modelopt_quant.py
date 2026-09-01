@@ -63,6 +63,12 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.qwen4_exp_dense_fp8 import (
+    QWEN4_EXP_DENSE_FP8_CATEGORIES,
+    parse_qwen4_exp_dense_fp8_categories,
+    select_qwen4_exp_dense_fp8_category,
+)
+from sglang.srt.runtime_context import get_model
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
@@ -279,6 +285,11 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.use_per_token_activation = False
 
+    def _get_excluded_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> LinearMethodBase:
+        return UnquantizedLinearMethod()
+
     def _get_quant_method(
         self,
         layer: torch.nn.Module,
@@ -295,7 +306,7 @@ class ModelOptQuantConfig(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return self._get_excluded_linear_method(layer, prefix)
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -655,6 +666,58 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
+
+
+class Qwen4ExpDenseFp8LinearMethod(Fp8LinearMethod):
+    def __init__(
+        self, quant_config: ModelOptFp4Config, category: str, fp8_config: Fp8Config
+    ) -> None:
+        self.modelopt_quant_config = quant_config
+        self.category = category
+        super().__init__(fp8_config)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        skip_block_quant_check: bool = False,
+        **extra_weight_attrs,
+    ) -> None:
+        super().create_weights(
+            layer=layer,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
+            input_size=input_size,
+            output_size=output_size,
+            params_dtype=params_dtype,
+            skip_block_quant_check=skip_block_quant_check,
+            **extra_weight_attrs,
+        )
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_elements = output_size_per_partition * input_size_per_partition
+        before_bytes = weight_elements * torch.empty(
+            (), dtype=params_dtype
+        ).element_size()
+        per_channel_scale = (
+            self.cutlass_fp8_supported
+            or self.use_marlin
+            or self.use_aiter_fp8_per_token
+        )
+        scale_elements = output_size_per_partition if per_channel_scale else 1
+        after_bytes = weight_elements + scale_elements * 4
+        self.modelopt_quant_config._record_qwen4_exp_dense_fp8_module(
+            category=self.category,
+            before_bytes=before_bytes,
+            after_bytes=after_bytes,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        self.modelopt_quant_config._log_qwen4_exp_dense_fp8_summary_once()
 
 
 class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
@@ -1423,6 +1486,72 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 if use_per_token_activation is None
                 else use_per_token_activation
             )
+        self._qwen4_exp_dense_fp8_config: Optional[Fp8Config] = None
+        self._qwen4_exp_dense_fp8_categories = frozenset()
+        self._qwen4_exp_dense_fp8_stats: Dict[str, List[int]] = {}
+        self._qwen4_exp_dense_fp8_summary_logged = False
+
+    def qwen4_exp_dense_fp8_category(self, prefix: str) -> Optional[str]:
+        if not self.is_checkpoint_nvfp4_serialized:
+            return None
+        if not (
+            is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            )
+            or self.is_layer_excluded(prefix)
+        ):
+            return None
+
+        enabled_categories = parse_qwen4_exp_dense_fp8_categories(
+            get_model().qwen4_exp_dense_fp8
+        )
+        self._qwen4_exp_dense_fp8_categories = enabled_categories
+        return select_qwen4_exp_dense_fp8_category(prefix, enabled_categories)
+
+    def _get_excluded_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> LinearMethodBase:
+        category = self.qwen4_exp_dense_fp8_category(prefix)
+        if category is None:
+            return super()._get_excluded_linear_method(layer, prefix)
+        if self._qwen4_exp_dense_fp8_config is None:
+            self._qwen4_exp_dense_fp8_config = Fp8Config(
+                is_checkpoint_fp8_serialized=False,
+                activation_scheme="dynamic",
+                packed_modules_mapping=self.packed_modules_mapping,
+            )
+        return Qwen4ExpDenseFp8LinearMethod(
+            quant_config=self,
+            category=category,
+            fp8_config=self._qwen4_exp_dense_fp8_config,
+        )
+
+    def _record_qwen4_exp_dense_fp8_module(
+        self, category: str, before_bytes: int, after_bytes: int
+    ) -> None:
+        stats = self._qwen4_exp_dense_fp8_stats.setdefault(category, [0, 0, 0])
+        stats[0] += 1
+        stats[1] += before_bytes
+        stats[2] += after_bytes
+
+    def _log_qwen4_exp_dense_fp8_summary_once(self) -> None:
+        if self._qwen4_exp_dense_fp8_summary_logged:
+            return
+        self._qwen4_exp_dense_fp8_summary_logged = True
+        for category in QWEN4_EXP_DENSE_FP8_CATEGORIES:
+            if category not in self._qwen4_exp_dense_fp8_categories:
+                continue
+            modules, before_bytes, after_bytes = self._qwen4_exp_dense_fp8_stats.get(
+                category, [0, 0, 0]
+            )
+            logger.info(
+                "Qwen4-Exp dense FP8 category=%s modules=%d "
+                "weight_bytes_before=%d weight_bytes_after=%d",
+                category,
+                modules,
+                before_bytes,
+                after_bytes,
+            )
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1618,6 +1747,17 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             ),
             Moe=ModelOptNvFp4FusedMoEMethod,
         )
+
+
+def qwen4_exp_dense_fp8_quant_config(
+    quant_config: Optional[QuantizationConfig], prefix: str, category: str
+) -> Optional[QuantizationConfig]:
+    if not isinstance(quant_config, ModelOptFp4Config):
+        return None
+    if get_model().qwen4_exp_dense_fp8 is None:
+        return None
+    selected_category = quant_config.qwen4_exp_dense_fp8_category(prefix)
+    return quant_config if selected_category == category else None
 
 
 class HybridFp8NvFp4Config(Fp8Config):

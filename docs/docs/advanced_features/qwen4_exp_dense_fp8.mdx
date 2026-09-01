@@ -1,0 +1,43 @@
+---
+title: Qwen4-Exp dense-path FP8
+---
+
+Qwen4-Exp NVFP4 checkpoints store the routed experts in FP4 but leave the
+resident dense path in BF16. `--qwen4-exp-dense-fp8` quantizes selected excluded
+linear weights to FP8 E4M3 while loading. The feature is off by default and only
+changes ModelOpt NVFP4 modules that the checkpoint already excludes from FP4.
+
+The reused SGLang `Fp8LinearMethod` is W8A8: it uses dynamically quantized FP8
+activations and, on CUTLASS-capable NVIDIA GPUs, one FP32 weight scale per output
+channel. It is not a weight-only W8A16 path, but it reuses
+the maintained SGLang FP8 kernels without adding CUDA code. Both paths reduce
+resident weight reads to one byte per element. For the target model, the expected
+decode traffic falls from about 9.8 GB/token to about 5.5 GB/token.
+
+Run with the default categories:
+
+```bash
+python -m sglang.launch_server \
+  --model-path <qwen4-exp-nvfp4-checkpoint> \
+  --qwen4-exp-dense-fp8
+```
+
+The default set is `shared_expert,attn,linear_attn,hyper_connection`. Pass a
+comma-separated list to ablate categories, or use `default,lm_head` to add the
+head. `mlp_gates` and `lm_head` are opt-in. The GDN `in_proj_ba`, Hyper-Connection
+inject projection, norms, embeddings, PLE, MTP, and routed experts stay on their
+existing paths. `indexer` is accepted in a list for experiment compatibility but
+is a hard exclusion and always stays BF16: FP8 for the indexer's QSA top-k
+selection is not validated.
+
+## GPU validation checklist
+
+- Run the 18.5k-token needle test and compare its answer with the BF16-dense
+  baseline.
+- Measure decode tokens/s against the same baseline after warmup.
+- Confirm acceptance length is unchanged with both NEXTN and NGRAM_CHAIN.
+- Ablate in this order: `shared_expert`, `attn`, `linear_attn`,
+  `hyper_connection`, `mlp_gates`, then `lm_head`.
+- Confirm the load log reports the expected module count and before/after weight
+  bytes for every enabled category.
+- Keep `indexer` BF16 in every run, including category-list experiments.

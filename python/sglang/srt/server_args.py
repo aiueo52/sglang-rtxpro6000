@@ -70,6 +70,10 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
+from sglang.srt.qwen4_exp_dense_fp8 import (
+    QWEN4_EXP_DENSE_FP8_DEFAULT,
+    normalize_qwen4_exp_dense_fp8_categories,
+)
 from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
@@ -703,6 +707,22 @@ class ServerArgs:
             help="The quantization method.",
             choices=QUANTIZATION_CHOICES,
             resolvable=True,
+        ),
+        NS("model"),
+    ] = None
+    qwen4_exp_dense_fp8: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Load selected Qwen4-Exp dense modules from an NVFP4 checkpoint "
+                "as FP8 E4M3 with dynamic FP8 activations. Pass no value for "
+                "shared_expert,attn,linear_attn,hyper_connection, or pass a "
+                "comma-separated category list. indexer is accepted for "
+                "ablation compatibility but always remains BF16."
+            ),
+            type_parser=normalize_qwen4_exp_dense_fp8_categories,
+            nargs="?",
+            const=QWEN4_EXP_DENSE_FP8_DEFAULT,
         ),
         NS("model"),
     ] = None

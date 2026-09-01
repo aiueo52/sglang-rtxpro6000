@@ -43,6 +43,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import (
+    qwen4_exp_dense_fp8_quant_config,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -1262,15 +1265,40 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
+        layer_prefix = prefix.replace(".linear_attn", "").replace(
+            ".self_attn", ""
+        )
+        attn_hc_prefix = (
+            f"{layer_prefix}.attn_hyper_connection"
+            if layer_prefix
+            else "attn_hyper_connection"
+        )
+        mlp_hc_prefix = (
+            f"{layer_prefix}.mlp_hyper_connection"
+            if layer_prefix
+            else "mlp_hyper_connection"
+        )
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            quant_config=qwen4_exp_dense_fp8_quant_config(
+                quant_config,
+                f"{attn_hc_prefix}.input_mix_weight_down",
+                "hyper_connection",
+            ),
+            prefix=attn_hc_prefix,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            quant_config=qwen4_exp_dense_fp8_quant_config(
+                quant_config,
+                f"{mlp_hc_prefix}.input_mix_weight_down",
+                "hyper_connection",
+            ),
+            prefix=mlp_hc_prefix,
         )
 
     def _prepare_qwen4_exp_attn(
@@ -1616,7 +1644,21 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        mixer_prefix = (
+            f"{prefix}.hyper_connection_mixer"
+            if prefix
+            else "hyper_connection_mixer"
+        )
+        self.hyper_connection_mixer = GatedResidual(
+            hc_config,
+            use_combine=False,
+            quant_config=qwen4_exp_dense_fp8_quant_config(
+                quant_config,
+                f"{mixer_prefix}.input_mix_weight_down",
+                "hyper_connection",
+            ),
+            prefix=mixer_prefix,
+        )
 
     def forward(
         self,
