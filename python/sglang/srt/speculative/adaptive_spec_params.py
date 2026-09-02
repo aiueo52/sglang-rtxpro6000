@@ -326,6 +326,13 @@ class AdaptiveSpeculativeParams:
             if step in self._slots[self._find_closest_bs(v)].candidate_steps
         ]
 
+    def can_reach_step(self, step: int, max_batch_size: int) -> bool:
+        """Whether any runnable batch size can select *step*."""
+        return any(
+            step in self._route(batch_size).candidate_steps
+            for batch_size in range(1, max_batch_size + 1)
+        )
+
     def _route(self, batch_size: int) -> AdaptiveStepSlot:
         """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
         return self._slots[

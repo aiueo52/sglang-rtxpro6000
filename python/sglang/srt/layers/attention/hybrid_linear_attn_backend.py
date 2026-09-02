@@ -1078,6 +1078,12 @@ class HybridLinearAttnBackend(AttentionBackend):
             self._recovery_event.wait()
             self._recovery_event_pending = False
 
+    def drain_pending_recovery(self) -> None:
+        """Fence all recovery-stream work before this backend is replaced."""
+        self._wait_recovery_if_pending()
+        if self._recovery_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._recovery_stream)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,

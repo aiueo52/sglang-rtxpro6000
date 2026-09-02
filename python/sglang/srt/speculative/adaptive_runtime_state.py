@@ -5,6 +5,9 @@ from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParam
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        QSAMTPSharedSparseIndices,
+    )
     from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
     from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
     from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -41,6 +44,7 @@ class SpecRuntimeState:
     # -- Extend stage: draft model KV cache catch-up after verify --
     draft_extend_attn_backend: "AttentionBackend | None"
     cuda_graph_runner_for_draft_extend: "EAGLEDraftExtendCudaGraphRunner | None"
+    qsa_mtp_shared_sparse_indices: "QSAMTPSharedSparseIndices | None"
 
 
 class AdaptiveSpecWorker(Protocol):
@@ -78,6 +82,7 @@ class AdaptiveController:
             cfg_path=config_path,
         )
         self._states: dict[int, SpecRuntimeState] = {}
+        self._pending_steps: int | None = None
 
     @property
     def candidate_steps(self) -> list[int]:
@@ -91,7 +96,11 @@ class AdaptiveController:
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state
 
-    def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
+    def init_states(
+        self,
+        cuda_graph_bs: list[int] | None = None,
+        max_batch_size: int | None = None,
+    ) -> None:
         """Build and register runtime states for all candidate steps."""
         self.params.set_cuda_graph_bs(cuda_graph_bs)
 
@@ -100,6 +109,14 @@ class AdaptiveController:
                 continue
 
             pruned_bs = self.params.cuda_graph_bs_for_step(steps)
+            if (
+                pruned_bs == []
+                and max_batch_size is not None
+                and not self.params.can_reach_step(
+                    step=steps, max_batch_size=max_batch_size
+                )
+            ):
+                continue
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
@@ -107,23 +124,25 @@ class AdaptiveController:
             )
             self._states[steps] = state
 
-        # Start on the initial step.
-        self._activate(self.worker.speculative_num_steps)
-
     def activate_step_by_batch(self, batch_size: int) -> None:
-        target = self.params.get_steps_for_batch(batch_size)
+        target = (
+            self._pending_steps
+            if self._pending_steps is not None
+            else self.params.get_steps_for_batch(batch_size)
+        )
+        self._pending_steps = None
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
+        """Feed verify results and record any EMA step decision."""
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
         if new_step is not None:
-            self._activate(new_step)
+            self._pending_steps = new_step
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

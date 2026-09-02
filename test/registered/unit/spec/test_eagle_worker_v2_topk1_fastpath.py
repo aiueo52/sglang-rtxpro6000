@@ -248,7 +248,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         existing_backend = object()
         decode_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = False
@@ -270,7 +273,10 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         decode_backend = object()
         draft_extend_backend = object()
         worker.server_args = _fake_server_args()
-        worker.draft_runner = SimpleNamespace(attn_backend=existing_backend)
+        worker.draft_runner = SimpleNamespace(
+            attn_backend=existing_backend,
+            model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+        )
         worker.topk = 1
         worker.speculative_num_steps = 2
         worker.seed_dsa_topk_from_draft_extend = True
@@ -305,10 +311,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             draft_extend_attn_backend=object(),
             cuda_graph_runner=object(),
             cuda_graph_runner_for_draft_extend=object(),
+            qsa_mtp_shared_sparse_indices=None,
             draft_runner=draft_runner,
             # _override_worker_state / apply_runtime_state call this hook; the
             # topk=1 buffers are exercised by the fast-path tests above.
             _rebuild_topk1_chain_buffers=lambda: None,
+            _install_qsa_mtp_index_share=lambda *_args: None,
         )
         worker = object.__new__(EAGLEWorkerV2)
         worker._draft_worker = draft_worker
@@ -356,6 +364,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             target_graph_runner=object(),
             draft_extend_attn_backend=new_extend_backend,
             cuda_graph_runner_for_draft_extend=object(),
+            qsa_mtp_shared_sparse_indices=None,
         )
         worker.apply_runtime_state(state)
 

@@ -384,10 +384,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
-        self._configure_qsa_mtp_index_share()
+        self.qsa_mtp_shared_sparse_indices = self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
 
-    def _configure_qsa_mtp_index_share(self) -> None:
+    def _configure_qsa_mtp_index_share(self):
         """Share the draft-extend's target-aligned QSA selection across the
         MTP decode steps (config-gated: index_share_for_mtp_iteration).
 
@@ -411,15 +411,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             or self.draft_extend_attn_backend is None
         ):
             return
-        if get_spec().speculative_adaptive:
-            # Adaptive candidates rebuild this worker per step count around
-            # one shared draft-extend backend; the shared selection state is
-            # not sized or validated for that regime.
-            logger.warning(
-                "index_share_for_mtp_iteration is disabled under adaptive "
-                "speculative decoding"
-            )
-            return
         layer_ids = sorted(
             {
                 module.layer_id
@@ -433,7 +424,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         extend_backend = resolve_qsa_sparse_backend(self.draft_extend_attn_backend)
         state = getattr(extend_backend, "_mtp_shared_sparse_indices", None)
-        if state is None:
+        if state is None or get_spec().speculative_adaptive:
             pool = self.draft_runner.token_to_kv_pool
             # The expansion emits token_topk + ratio - 1 columns (top-k blocks
             # plus the uncompressed tail of the capture position).
@@ -442,17 +433,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 layer_ids=layer_ids,
                 num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
                 token_topk=expanded_width,
-                tail_width=get_spec().speculative_num_steps + 1,
+                tail_width=self.speculative_num_steps + 1,
                 device=self.draft_runner.device,
             )
-        for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):
-            resolved = resolve_qsa_sparse_backend(backend)
-            assert hasattr(resolved, "set_mtp_shared_sparse_indices"), type(resolved)
-            resolved.set_mtp_shared_sparse_indices(state)
+        self._install_qsa_mtp_index_share(
+            state=state,
+            draft_attn_backend=self.draft_attn_backend,
+            draft_extend_attn_backend=self.draft_extend_attn_backend,
+        )
         logger.info(
             "QSA MTP index sharing enabled: draft decode steps reuse the "
             f"draft-extend selection for layers {layer_ids}"
         )
+        return state
+
+    @staticmethod
+    def _install_qsa_mtp_index_share(
+        *, state, draft_attn_backend, draft_extend_attn_backend
+    ) -> None:
+        from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+
+        for backend in (draft_attn_backend, draft_extend_attn_backend):
+            if backend is None:
+                continue
+            resolved = resolve_qsa_sparse_backend(backend)
+            resolved.set_mtp_shared_sparse_indices(state)
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -1243,24 +1248,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
             ):
+                target_model_runner = self._target_worker.model_runner
                 self.adaptive_controller.register(
                     SpecRuntimeState(
                         speculative_num_steps=self.speculative_num_steps,
                         speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                         draft_attn_backend=self._draft_worker.draft_attn_backend,
                         cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                        target_attn_backend=target_model_runner.attn_backend,
+                        target_graph_runner=(
+                            target_model_runner.decode_cuda_graph_runner
+                        ),
+                        draft_extend_attn_backend=(
+                            self._draft_worker.draft_extend_attn_backend
+                        ),
+                        cuda_graph_runner_for_draft_extend=(
+                            self._draft_worker.cuda_graph_runner_for_draft_extend
+                        ),
+                        qsa_mtp_shared_sparse_indices=(
+                            self._draft_worker.qsa_mtp_shared_sparse_indices
+                        ),
                     )
                 )
                 self.adaptive_controller.init_states(
                     cuda_graph_bs=(
                         None
                         if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
+                        else target_model_runner.decode_cuda_graph_runner.capture_bs
                     ),
+                    max_batch_size=target_model_runner.max_running_requests,
                 )
 
     def forward_batch_generation(
@@ -1502,6 +1518,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_num_steps=speculative_num_steps,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
                 )
+                target_model_runner.maybe_capture_gdn_recovery_graphs(
+                    attn_backend=target_attn_backend,
+                    capture_bs=target_graph_runner.capture_bs,
+                )
                 target_graph_after_mem = get_available_gpu_memory(
                     self.device, self.gpu_id
                 )
@@ -1524,7 +1544,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_attn_backend=target_attn_backend,
                 target_graph_runner=target_graph_runner,
                 draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                cuda_graph_runner_for_draft_extend=(
+                    self._draft_worker.cuda_graph_runner_for_draft_extend
+                ),
+                qsa_mtp_shared_sparse_indices=(
+                    self._draft_worker.qsa_mtp_shared_sparse_indices
+                ),
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1542,6 +1567,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.speculative_num_steps == state.speculative_num_steps:
             return
 
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        dw = self._draft_worker
+        outgoing_backends = (
+            self._target_worker.model_runner.attn_backend,
+            dw.draft_attn_backend,
+            dw.draft_extend_attn_backend,
+            dw.draft_runner.attn_backend,
+        )
+        drained_backend_ids = set()
+        for backend in outgoing_backends:
+            if (
+                isinstance(backend, HybridLinearAttnBackend)
+                and id(backend) not in drained_backend_ids
+            ):
+                backend.drain_pending_recovery()
+                drained_backend_ids.add(id(backend))
+
         log_info_on_rank0(
             logger,
             "Switch adaptive runtime state: "
@@ -1555,7 +1600,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
 
         # Draft side
-        dw = self._draft_worker
         dw.speculative_num_steps = state.speculative_num_steps
         dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
         dw.draft_attn_backend = state.draft_attn_backend
@@ -1569,6 +1613,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if state.draft_extend_attn_backend is not None:
             dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
+        dw.qsa_mtp_shared_sparse_indices = state.qsa_mtp_shared_sparse_indices
+        if state.qsa_mtp_shared_sparse_indices is not None:
+            dw._install_qsa_mtp_index_share(
+                state=state.qsa_mtp_shared_sparse_indices,
+                draft_attn_backend=state.draft_attn_backend,
+                draft_extend_attn_backend=state.draft_extend_attn_backend,
+            )
         dw._rebuild_topk1_chain_buffers()
 
         # Target side
@@ -1604,10 +1655,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.draft_runner.attn_backend,
             dw.cuda_graph_runner,
             dw.cuda_graph_runner_for_draft_extend,
+            dw.qsa_mtp_shared_sparse_indices,
             get_spec().speculative_num_steps,
             get_spec().speculative_num_draft_tokens,
-            get_exec().graph.cuda_graph_bs_decode,
-            get_exec().graph.disable_cuda_graph,
+            get_exec().graph.cuda_graph_config,
         )
 
         self.speculative_num_steps = speculative_num_steps
@@ -1620,14 +1671,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
         if cuda_graph_bs is not None:
-            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
-            # for steps that no BS range uses (e.g. step=1). Disable graph
-            # capture for those steps; restore in finally so subsequent steps
-            # are not affected.
+            graph_config = get_exec().graph.cuda_graph_config
+            decode_config = (
+                replace(graph_config.decode, backend=Backend.DISABLED)
+                if not cuda_graph_bs
+                else replace(graph_config.decode, bs=cuda_graph_bs)
+            )
             get_context().override(
                 "adaptive_spec.capture_override",
-                cuda_graph_bs_decode=cuda_graph_bs,
-                **({"disable_cuda_graph": True} if not cuda_graph_bs else {}),
+                cuda_graph_config=replace(
+                    graph_config,
+                    decode=decode_config,
+                ),
             )
         dw._rebuild_topk1_chain_buffers()
 
@@ -1645,13 +1700,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.draft_runner.attn_backend,
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
-            ) = backup[:10]
+                dw.qsa_mtp_shared_sparse_indices,
+            ) = backup[:11]
+            if dw.qsa_mtp_shared_sparse_indices is not None:
+                dw._install_qsa_mtp_index_share(
+                    state=dw.qsa_mtp_shared_sparse_indices,
+                    draft_attn_backend=dw.draft_attn_backend,
+                    draft_extend_attn_backend=dw.draft_extend_attn_backend,
+                )
             get_context().override(
                 "adaptive_spec.capture_restore",
-                speculative_num_steps=backup[10],
-                speculative_num_draft_tokens=backup[11],
-                cuda_graph_bs_decode=backup[12],
-                disable_cuda_graph=backup[13],
+                speculative_num_steps=backup[11],
+                speculative_num_draft_tokens=backup[12],
+                cuda_graph_config=backup[13],
             )
             dw._rebuild_topk1_chain_buffers()
 

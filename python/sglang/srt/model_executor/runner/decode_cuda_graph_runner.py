@@ -1220,7 +1220,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dsa_variant,
                 )
                 post_warmup_hook = getattr(
-                    self.model_runner.attn_backend,
+                    self.attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )
