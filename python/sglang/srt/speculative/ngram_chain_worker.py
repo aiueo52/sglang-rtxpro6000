@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 
+import logging
+
 import msgspec
 import torch
 from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
@@ -16,6 +18,8 @@ from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import CustomSpecAlgo
 from sglang.srt.speculative.spec_utils import get_plan_stream
+
+logger = logging.getLogger(__name__)
 
 
 class NgramChainMatch(msgspec.Struct, frozen=True):
@@ -142,6 +146,8 @@ class NgramChainDraftWorker(EagleDraftWorker):
         self.ngram_chain_window_size = spec.speculative_ngram_chain_window_size
         self._request_indexes: dict[object, RequestNgramChainIndex] = {}
         self._pending_commits: deque[_PendingCommits] = deque()
+        self._stat_hits = 0
+        self._stat_misses = 0
 
     def clear_request_indexes(self) -> None:
         self._request_indexes.clear()
@@ -245,6 +251,16 @@ class NgramChainDraftWorker(EagleDraftWorker):
     def _draft_mtp_chain(self, batch):
         return super().draft(batch)
 
+    def _maybe_log_stats(self) -> None:
+        total = self._stat_hits + self._stat_misses
+        if total % 200 == 0:
+            logger.info(
+                "NGRAM_CHAIN draft stats: hits=%d misses=%d hit_rate=%.3f",
+                self._stat_hits,
+                self._stat_misses,
+                self._stat_hits / max(1, total),
+            )
+
     def draft(self, batch):
         if batch.forward_mode.is_idle():
             return self._draft_mtp_chain(batch)
@@ -256,7 +272,11 @@ class NgramChainDraftWorker(EagleDraftWorker):
         if matches is None:
             # v0 keeps one tree shape per batch: any miss (including a partial
             # continuation) sends the whole mixed batch through unchanged MTP.
+            self._stat_misses += 1
+            self._maybe_log_stats()
             return self._draft_mtp_chain(batch)
+        self._stat_hits += 1
+        self._maybe_log_stats()
 
         draft_input = batch.spec_info
         # Preserve the normal draft-cache location bookkeeping. No draft model
