@@ -15,6 +15,8 @@ from typing import Dict, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.qsa.config import (
@@ -43,6 +45,41 @@ logger = logging.getLogger(__name__)
 
 
 _TRTLLM_SPARSE_PAGE_SIZE = 64
+
+
+@triton.jit
+def _mtp_shared_sparse_indices_lookup_kernel(
+    indices,
+    captured_len,
+    req_pool_indices,
+    current_positions,
+    out,
+    indices_row_stride,
+    req_pool_indices_stride,
+    current_positions_stride,
+    out_row_stride,
+    num_columns: tl.constexpr,
+    tail_width: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    column_mask = columns < num_columns
+    source_row = tl.load(req_pool_indices + row * req_pool_indices_stride).to(tl.int64)
+    frozen = tl.load(
+        indices + source_row * indices_row_stride + columns,
+        mask=column_mask,
+        other=0,
+    )
+
+    tail_start = num_columns - tail_width
+    tail_offset = columns - tail_start
+    base = tl.load(captured_len + source_row).to(tl.int64)
+    position = tl.load(current_positions + row * current_positions_stride).to(tl.int64)
+    tail_value = base + tail_offset
+    tail_value = tl.where(tail_value <= position, tail_value, -1)
+    value = tl.where(columns >= tail_start, tail_value, frozen)
+    tl.store(out + row * out_row_stride + columns, value, mask=column_mask)
 
 
 @lru_cache(maxsize=1)
@@ -181,6 +218,36 @@ class QSAMTPSharedSparseIndices:
         downstream) where the gap is shorter than the tail width.
         """
         slot = self.layer_slots[int(layer_id)]
+        if self.indices.is_cuda:
+            indices = self.indices[slot]
+            captured_len = self.captured_len[slot]
+            num_rows = req_pool_indices.shape[0]
+            num_columns = indices.shape[1]
+            out = torch.empty(
+                (num_rows, num_columns), dtype=torch.int32, device=indices.device
+            )
+            if num_rows == 0:
+                return out
+            block = 256
+            _mtp_shared_sparse_indices_lookup_kernel[
+                (num_rows, triton.cdiv(num_columns, block))
+            ](
+                indices,
+                captured_len,
+                req_pool_indices,
+                current_positions,
+                out,
+                indices.stride(0),
+                req_pool_indices.stride(0),
+                current_positions.stride(0),
+                out.stride(0),
+                num_columns,
+                self.tail_width,
+                BLOCK=block,
+                num_warps=4,
+            )
+            return out
+
         rows = req_pool_indices.to(torch.long)
         out = self.indices[slot, rows]
         base = self.captured_len[slot, rows].to(torch.int64)

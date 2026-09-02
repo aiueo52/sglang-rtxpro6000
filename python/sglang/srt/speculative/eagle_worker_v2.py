@@ -728,7 +728,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if (
             topk1_chain_fits
             and _is_cuda
-            and self.hot_token_id is None
             and not get_spec().speculative_use_rejection_sampling
         ):
             draft_tokens_topk1 = torch.empty(
@@ -806,6 +805,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             forward_batch.positions,
                             draft_tokens_topk1,
                             i + 1,
+                            hot_token_id=(
+                                self.hot_token_id
+                                if draft_tokens_topk1 is not None
+                                else None
+                            ),
                         )
                     else:
                         topk_index = torch.argmax(
@@ -821,13 +825,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                topk_index_vocab_size = (
+                    self.target_worker.model_config.vocab_size
+                    if draft_tokens_topk1 is not None and self.hot_token_id is not None
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    topk_index_vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={topk_index_vocab_size}",
                 )
-                if self.hot_token_id is not None:
+                if self.hot_token_id is not None and draft_tokens_topk1 is None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
 

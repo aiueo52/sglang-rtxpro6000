@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -44,10 +46,12 @@ def _draft_topk1_finalize_kernel(
     topk_p,
     topk_index,
     positions,
+    hot_token_id,
     draft_tokens,
     draft_tokens_stride,
     draft_token_column,
     num_splits: tl.constexpr,
+    HAS_TOKEN_MAP: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -62,10 +66,11 @@ def _draft_topk1_finalize_kernel(
 
     split = tl.argmax(vals, axis=0)
     index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
-    tl.store(topk_index + row, index)
+    token = tl.load(hot_token_id + index) if HAS_TOKEN_MAP else index
+    tl.store(topk_index + row, token)
     tl.store(topk_p + row, 1.0)
     if WRITE_DRAFT_TOKEN:
-        tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, index)
+        tl.store(draft_tokens + row * draft_tokens_stride + draft_token_column, token)
 
     position = tl.load(positions + row)
     tl.store(positions + row, position + 1)
@@ -76,6 +81,7 @@ def draft_topk1_postprocess(
     positions: torch.Tensor,
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
+    hot_token_id: Optional[torch.Tensor] = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -83,10 +89,11 @@ def draft_topk1_postprocess(
     GLM/DSV4 vocab widths in CUDA graph replay. This split reduction exposes
     the vocab dimension across CTAs, then finalizes one token per row.
 
-    If ``draft_tokens`` is given, the finalize kernel also stores the argmax
-    into ``draft_tokens[:, draft_token_column]``, mutating the caller-owned
-    buffer in place. ``topk_p`` is returned as constant 1.0: topk=1 drafting
-    is greedy and the chain probabilities are unused downstream.
+    If ``hot_token_id`` is given, the argmax is mapped to a full-vocabulary
+    token ID in the finalize kernel. If ``draft_tokens`` is given, that token
+    is also stored into ``draft_tokens[:, draft_token_column]``, mutating the
+    caller-owned buffer in place. ``topk_p`` is returned as constant 1.0:
+    topk=1 drafting is greedy and the chain probabilities are unused downstream.
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
@@ -94,6 +101,13 @@ def draft_topk1_postprocess(
     assert positions.is_contiguous()
     assert positions.shape[0] == next_token_logits.shape[0]
     assert positions.device == next_token_logits.device
+    has_token_map = hot_token_id is not None
+    if has_token_map:
+        assert hot_token_id.ndim == 1
+        assert hot_token_id.dtype == torch.int64
+        assert hot_token_id.is_contiguous()
+        assert hot_token_id.device == next_token_logits.device
+        assert hot_token_id.shape[0] == next_token_logits.shape[1]
     write_draft_token = draft_tokens is not None
     if write_draft_token:
         assert draft_tokens.ndim == 2
@@ -139,10 +153,12 @@ def draft_topk1_postprocess(
         topk_p,
         topk_index,
         positions,
+        hot_token_id if has_token_map else topk_index,
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
         num_splits,
+        HAS_TOKEN_MAP=has_token_map,
         WRITE_DRAFT_TOKEN=write_draft_token,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
