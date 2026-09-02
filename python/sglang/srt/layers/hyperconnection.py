@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
+import os as _os
+
+_HC_MIX_FP8 = _os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -317,11 +320,42 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        elif (
+            _HC_MIX_FP8
+            and getattr(self, "_mix_fp8", None) is not None
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input_normed.shape[0] <= 16
+        ):
+            wd, sd, wu, su = self._mix_fp8
+            mixed_input = fused_hc_mix(
+                hyper_input_normed, wd, wu, self.hc_count, self.hidden_size, sd, su
+            ).to(self.params_dtype)
         elif fused_hc_mix_supported(
             hyper_input_normed,
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
         ):
+            if _HC_MIX_FP8 and getattr(self, "_mix_fp8", None) is None:
+                # Lazily build the FP8 mix weights once (first eager forward)
+                # and route later decode-width calls through the FP8 kernel.
+                from sglang.srt.layers.hc_mix_triton import (
+                    quantize_hc_mix_weights_fp8,
+                )
+
+                w_up_padded = self._mix_up_weight_padded
+                if w_up_padded is None:
+                    from sglang.kernels.ops.elementwise.hc_mix import (
+                        permute_pad_up_weight,
+                    )
+
+                    w_up_padded = permute_pad_up_weight(
+                        self.input_mix_weight_up.weight, self.hc_count
+                    )
+                    self._mix_up_weight_padded = w_up_padded
+                self._mix_fp8 = quantize_hc_mix_weights_fp8(
+                    self.input_mix_weight_down.weight.data, w_up_padded
+                )
             mixed_input = fused_hc_mix(
                 hyper_input_normed,
                 self.input_mix_weight_down.weight,

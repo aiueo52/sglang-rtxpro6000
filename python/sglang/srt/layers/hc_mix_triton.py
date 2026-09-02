@@ -54,12 +54,15 @@ def _hc_mix_persistent_kernel(
     num_rows,
     num_ctas,
     inv_hc,
+    s_down_ptr,
+    s_up_ptr,
     ROWS: tl.constexpr,
     HC: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    W_FP8: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -92,7 +95,13 @@ def _hc_mix_persistent_kernel(
             mask=mask_n[:, None],
             other=0.0,
         )
-        acc = tl.dot(xt, tl.trans(w))
+        if W_FP8:
+            # Weight-only FP8 (E4M3) with one FP32 scale per output row.
+            acc = tl.dot(xt, tl.trans(w.to(x_ptr.dtype.element_ty)))
+            s_down = tl.load(s_down_ptr + n, mask=mask_n, other=0.0)
+            acc = acc * s_down[None, :]
+        else:
+            acc = tl.dot(xt, tl.trans(w))
         tl.atomic_add(
             t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
             acc,
@@ -130,7 +139,13 @@ def _hc_mix_persistent_kernel(
                 mask=mask_gj[:, None] & mask_r[None, :],
                 other=0.0,
             )
-            acc = tl.dot(t, tl.trans(w), acc)
+            if W_FP8:
+                acc = tl.dot(t, tl.trans(w.to(x_ptr.dtype.element_ty)), acc)
+            else:
+                acc = tl.dot(t, tl.trans(w), acc)
+        if W_FP8:
+            s_up = tl.load(s_up_ptr + gj_flat, mask=mask_gj, other=0.0)
+            acc = acc * s_up[None, :]
         gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
         xg = tl.load(
             x_ptr
@@ -203,14 +218,41 @@ def fused_hc_mix_supported(
     )
 
 
+def quantize_hc_mix_weights_fp8(
+    w_down: torch.Tensor, w_up_padded: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-output-row FP8 E4M3 quantization of the HC mix weights.
+
+    Returns (w_down_fp8, s_down, w_up_fp8, s_up) with fp32 scales; the up
+    weight must already be permuted/padded to the kernel layout."""
+
+    def _q(w: torch.Tensor):
+        wf = w.float()
+        amax = wf.abs().amax(dim=1).clamp(min=1e-12)
+        scale = amax / 448.0
+        q = (wf / scale[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return q.contiguous(), scale.contiguous()
+
+    wd, sd = _q(w_down)
+    wu, su = _q(w_up_padded)
+    return wd, sd, wu, su
+
+
 def fused_hc_mix(
     hyper_input_normed: torch.Tensor,
     w_down: torch.Tensor,
     w_up: torch.Tensor,
     hc: int,
     hs: int,
+    s_down: torch.Tensor | None = None,
+    s_up: torch.Tensor | None = None,
 ) -> torch.Tensor:
     rows, k = hyper_input_normed.shape
+    w_fp8 = w_down.dtype == torch.float8_e4m3fn
+    if w_fp8:
+        assert s_down is not None and s_up is not None
+    else:
+        s_down = s_up = torch.empty(0, dtype=torch.float32, device=hyper_input_normed.device)
     lowrank = w_down.shape[0]
     rows_pad = 16
     device = hyper_input_normed.device
@@ -232,12 +274,15 @@ def fused_hc_mix(
         rows,
         num_ctas,
         1.0 / hc,
+        s_down,
+        s_up,
         ROWS=rows_pad,
         HC=hc,
         BLOCK_N=32,
         BLOCK_K=256,
         BLOCK_J=32,
         BLOCK_R=64,
+        W_FP8=w_fp8,
         num_warps=8,
     )
     return out
