@@ -57,6 +57,18 @@ def _mtp_quant_config(quant_config):
     # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
     # BF16. Disable quantization for those checkpoints; non-serialized
     # modelopt_fp4 still converts MoE expert weights on load.
+    if (
+        quant_config
+        and quant_config.get_name() == "modelopt_fp4"
+        and not getattr(quant_config, "is_checkpoint_nvfp4_serialized", True)
+    ):
+        # Non-serialized modelopt_fp4 (the in-model MTP draft built with
+        # --speculative-draft-model-quantization modelopt_fp4): mark the config
+        # so ModelOptFp4Config.get_quant_method can route the draft's dense
+        # projections to the opt-in `mtp_dense` FP8 category. The draft's
+        # module prefixes do not carry an "mtp" segment.
+        quant_config._qwen4_exp_mtp_draft = True
+        logger.info("mtp quant config: non-serialized modelopt_fp4 draft config")
     if quant_config and (
         quant_config.get_name() == "modelopt_mixed"
         or (
@@ -77,8 +89,15 @@ def _mtp_quant_config(quant_config):
             categories = parse_qwen4_exp_dense_fp8_categories(
                 get_model().qwen4_exp_dense_fp8
             )
-        except Exception:
+        except Exception as exc:  # pragma: no cover - diagnostic
+            logger.info("mtp quant config: dense-FP8 categories unavailable (%r)", exc)
             categories = frozenset()
+        logger.info(
+            "mtp quant config: checkpoint=%s categories=%s -> %s",
+            quant_config.get_name(),
+            sorted(categories),
+            "modelopt(mtp_dense)" if "mtp_dense" in categories else "None(bf16)",
+        )
         if "mtp_dense" in categories:
             return quant_config
         return None

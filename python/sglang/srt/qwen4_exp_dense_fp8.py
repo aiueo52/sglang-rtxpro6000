@@ -102,7 +102,10 @@ def select_qwen4_exp_dense_fp8_category(
         # The MTP draft layer's dense projections (attn q/k/v/o, fc_embedding,
         # fc_hidden, shared expert, router) are one opt-in category; its
         # hyper-connection mix stays on the fused BF16 kernel.
-        if category in {"attn", "shared_expert", "mlp_gates", "mtp_dense"}:
+        # The MTP router (`mlp.gate`) stays BF16: FP8 routing flips expert
+        # choices and lowers draft acceptance (as it did for the target's
+        # `mlp_gates` category).
+        if category in {"attn", "shared_expert", "mtp_dense"}:
             category = "mtp_dense"
         else:
             return None

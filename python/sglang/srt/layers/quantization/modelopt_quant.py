@@ -1508,12 +1508,26 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         self._qwen4_exp_dense_fp8_categories = enabled_categories
         return select_qwen4_exp_dense_fp8_category(prefix, enabled_categories)
 
-    def _get_excluded_linear_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> LinearMethodBase:
-        category = self.qwen4_exp_dense_fp8_category(prefix)
-        if category is None:
-            return super()._get_excluded_linear_method(layer, prefix)
+    def _qwen4_exp_mtp_dense_category(self, prefix: str) -> Optional[str]:
+        """`mtp_dense` category for the non-serialized MTP draft config.
+
+        The draft registers its modules without an "mtp" prefix segment
+        (weights are remapped mtp.* -> model.*), so one is prepended for the
+        category selector's MTP rules.
+        """
+        try:
+            enabled = get_model().qwen4_exp_dense_fp8
+        except Exception:
+            return None
+        if enabled is None:
+            return None
+        enabled_categories = parse_qwen4_exp_dense_fp8_categories(enabled)
+        self._qwen4_exp_dense_fp8_categories = enabled_categories
+        if "mtp" not in prefix.split("."):
+            prefix = f"mtp.{prefix}"
+        return select_qwen4_exp_dense_fp8_category(prefix, enabled_categories)
+
+    def _qwen4_exp_dense_fp8_linear_method(self, category: str) -> LinearMethodBase:
         if self._qwen4_exp_dense_fp8_config is None:
             self._qwen4_exp_dense_fp8_config = Fp8Config(
                 is_checkpoint_fp8_serialized=False,
@@ -1525,6 +1539,14 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             category=category,
             fp8_config=self._qwen4_exp_dense_fp8_config,
         )
+
+    def _get_excluded_linear_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> LinearMethodBase:
+        category = self.qwen4_exp_dense_fp8_category(prefix)
+        if category is None:
+            return super()._get_excluded_linear_method(layer, prefix)
+        return self._qwen4_exp_dense_fp8_linear_method(category)
 
     def _record_qwen4_exp_dense_fp8_module(
         self, category: str, before_bytes: int, after_bytes: int
@@ -1729,7 +1751,17 @@ class ModelOptFp4Config(ModelOptQuantConfig):
 
         if not self.is_checkpoint_nvfp4_serialized:
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                # Load-time quantization applies only to MoE weights.
+                # Load-time quantization applies only to MoE weights -- except
+                # the opt-in Qwen4-Exp `mtp_dense` category: the in-model MTP
+                # draft is built with a non-serialized modelopt_fp4 config
+                # (--speculative-draft-model-quantization modelopt_fp4), so
+                # its dense projections would otherwise stay BF16 cuBLAS.
+                if isinstance(layer, LinearBase) and getattr(
+                    self, "_qwen4_exp_mtp_draft", False
+                ):
+                    category = self._qwen4_exp_mtp_dense_category(prefix)
+                    if category is not None:
+                        return self._qwen4_exp_dense_fp8_linear_method(category)
                 return UnquantizedLinearMethod()
             if isinstance(layer, FusedMoE):
                 if self.is_layer_excluded(prefix):

@@ -167,6 +167,33 @@ class _ModelOptFp4OnlineConfig(NvFp4OnlineConfig):
     is_nvfp4_online = False
     _use_per_token_activation = False
 
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from sglang.srt.layers.linear import LinearBase
+
+        # Qwen4-Exp in-model MTP draft (marked by qwen3_5_mtp._mtp_quant_config):
+        # route its dense projections to the opt-in `mtp_dense` weight-only FP8
+        # category instead of leaving them BF16. Weight stats/summary live on a
+        # host ModelOptFp4Config so the FP8 method's bookkeeping is unchanged.
+        if isinstance(layer, LinearBase) and getattr(
+            self, "_qwen4_exp_mtp_draft", False
+        ):
+            host = getattr(self, "_qwen4_exp_dense_fp8_host", None)
+            if host is None:
+                from sglang.srt.layers.quantization.modelopt_quant import (
+                    ModelOptFp4Config,
+                )
+
+                host = ModelOptFp4Config(
+                    is_checkpoint_nvfp4_serialized=False,
+                    packed_modules_mapping=self.packed_modules_mapping,
+                )
+                host._qwen4_exp_mtp_draft = True
+                self._qwen4_exp_dense_fp8_host = host
+            category = host._qwen4_exp_mtp_dense_category(prefix)
+            if category is not None:
+                return host._qwen4_exp_dense_fp8_linear_method(category)
+        return super().get_quant_method(layer, prefix)
+
     @classmethod
     def get_name(cls) -> str:
         return "modelopt_fp4"
