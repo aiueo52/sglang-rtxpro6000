@@ -20,6 +20,9 @@ from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
+import os as _os
+
+_GDN_BA_TRITON_GEMV = _os.environ.get("SGLANG_GDN_BA_TRITON_GEMV", "0") == "1"
 import torch.nn as nn
 import triton
 
@@ -675,7 +678,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = self._in_proj_ba_skinny(hidden_states)
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -688,8 +691,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = self._in_proj_ba_skinny(hidden_states)
         return projected_states_qkvz, projected_states_ba
+
+    def _in_proj_ba_skinny(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # in_proj_ba is a [2*num_v_heads, hidden] (tiny-N) BF16 GEMM; cuBLAS picks a
+        # ~40us kernel for it at decode/verify widths. Route it through the Triton
+        # skinny GEMV when SGLANG_GDN_BA_TRITON_GEMV=1 (same BF16 math).
+        if (
+            _GDN_BA_TRITON_GEMV
+            and hidden_states.dim() == 2
+            and hidden_states.shape[0] <= 16
+            and hidden_states.dtype == torch.bfloat16
+            and self.in_proj_ba.weight.dtype == torch.bfloat16
+            and getattr(self.in_proj_ba, "bias", None) is None
+        ):
+            from sglang.srt.layers.quantization.w8a16_gemv import bf16_gemv
+
+            return bf16_gemv(hidden_states, self.in_proj_ba.weight)
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
         """AMD-only variant for the fused AR+RMSNorm+per-group-quant path.
@@ -717,11 +738,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hs_bf16)
+                projected_states_ba = self._in_proj_ba_skinny(hs_bf16)
             current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
-            projected_states_ba, _ = self.in_proj_ba(hs_bf16)
+            projected_states_ba = self._in_proj_ba_skinny(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
     def _forward_xpu(

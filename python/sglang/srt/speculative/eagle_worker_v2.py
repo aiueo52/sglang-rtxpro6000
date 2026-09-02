@@ -333,17 +333,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if self.hot_token_id is not None:
                 self.hot_token_id = self.hot_token_id.to(head.device)
                 if head.dtype == torch.float8_e4m3fn:
-                    # Target lm_head is FP8 (per-channel, stored transposed [K, V]):
-                    # gather the hot rows and dequantize them into a BF16 draft head.
+                    # Target lm_head is FP8 (per-channel, stored transposed [K, V]).
+                    # Gather the hot rows and keep them FP8 in the same layout so the
+                    # draft head runs through the target's Fp8LinearMethod (W8A16 GEMV).
                     weight_scale = target_lm_head.weight_scale.reshape(-1).float()
-                    hot_rows = head.t()[self.hot_token_id]
-                    hot_scale = weight_scale[self.hot_token_id].unsqueeze(1)
-                    head = torch.nn.Parameter(
-                        (hot_rows.float() * hot_scale).to(torch.bfloat16),
-                        requires_grad=False,
+                    hot_rows = head.t()[self.hot_token_id].contiguous()  # [H, K] fp8
+                    hot_scale = weight_scale[self.hot_token_id].unsqueeze(1).contiguous()
+                    head = torch.nn.Parameter(hot_rows.t(), requires_grad=False)  # [K, H]
+                    self._draft_fp8_head_scale = torch.nn.Parameter(
+                        hot_scale, requires_grad=False
                     )
+                    self._draft_fp8_head_method = target_lm_head.quant_method
                     logger.info(
-                        "Draft lm_head: dequantized %d hot rows from FP8 target head",
+                        "Draft lm_head: %d hot FP8 rows sliced from the FP8 target head",
                         self.hot_token_id.numel(),
                     )
                 else:
@@ -353,6 +355,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+            if getattr(self, "_draft_fp8_head_method", None) is not None:
+                draft_lm_head = self.draft_runner.model.lm_head
+                draft_lm_head.weight_scale = self._draft_fp8_head_scale
+                draft_lm_head.input_scale = None
+                draft_lm_head.quant_method = self._draft_fp8_head_method
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
