@@ -13,6 +13,7 @@ QWEN4_EXP_DENSE_FP8_CATEGORIES = (
     *DEFAULT_QWEN4_EXP_DENSE_FP8_CATEGORIES,
     "mlp_gates",
     "lm_head",
+    "mtp_dense",
     "indexer",
 )
 QWEN4_EXP_DENSE_FP8_DEFAULT = ",".join(
@@ -59,14 +60,14 @@ def select_qwen4_exp_dense_fp8_category(
 
     parts = tuple(part for part in prefix.split(".") if part)
     if (
-        "mtp" in parts
-        or "ple" in parts
+        "ple" in parts
         or "indexer" in parts
         or "experts" in parts
         or "embed_tokens" in parts
         or "ngram_embedding" in parts
     ):
         return None
+    is_mtp = "mtp" in parts
 
     category = None
     if len(parts) >= 3 and parts[-3:-1] == ("mlp", "shared_expert"):
@@ -94,5 +95,16 @@ def select_qwen4_exp_dense_fp8_category(
             category = "mlp_gates"
     elif parts and parts[-1] == "lm_head":
         category = "lm_head"
+    elif is_mtp and parts and parts[-1] in {"fc_embedding", "fc_hidden"}:
+        category = "mtp_dense"
+
+    if is_mtp:
+        # The MTP draft layer's dense projections (attn q/k/v/o, fc_embedding,
+        # fc_hidden, shared expert, router) are one opt-in category; its
+        # hyper-connection mix stays on the fused BF16 kernel.
+        if category in {"attn", "shared_expert", "mlp_gates", "mtp_dense"}:
+            category = "mtp_dense"
+        else:
+            return None
 
     return category if category in enabled_categories else None

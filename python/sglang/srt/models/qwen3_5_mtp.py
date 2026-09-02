@@ -64,6 +64,23 @@ def _mtp_quant_config(quant_config):
             and quant_config.is_checkpoint_nvfp4_serialized
         )
     ):
+        # Qwen4-Exp opt-in: with the `mtp_dense` dense-FP8 category enabled,
+        # keep the ModelOpt config so the checkpoint's `mtp.*` exclusion routes
+        # the MTP dense projections through the FP8 (W8A16) path; experts and
+        # every other excluded MTP module stay unquantized.
+        try:
+            from sglang.srt.qwen4_exp_dense_fp8 import (
+                parse_qwen4_exp_dense_fp8_categories,
+            )
+            from sglang.srt.runtime_context import get_model
+
+            categories = parse_qwen4_exp_dense_fp8_categories(
+                get_model().qwen4_exp_dense_fp8
+            )
+        except Exception:
+            categories = frozenset()
+        if "mtp_dense" in categories:
+            return quant_config
         return None
     if is_npu() and get_spec().speculative_draft_model_quantization is None:
         return None
