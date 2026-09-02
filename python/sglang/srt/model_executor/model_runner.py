@@ -1030,11 +1030,8 @@ class ModelRunner:
         # final addresses. Self-guards (no-op in full mode / non-recovery paths).
         self.maybe_capture_gdn_recovery_graphs(
             attn_backend=self.attn_backend,
-            capture_bs=(
-                None
-                if self.decode_cuda_graph_runner is None
-                else self.decode_cuda_graph_runner.capture_bs
-            ),
+            # Draft workers use an EagerRunner without capture_bs.
+            capture_bs=getattr(self.decode_cuda_graph_runner, "capture_bs", None),
         )
 
     def maybe_capture_gdn_recovery_graphs(self, attn_backend, capture_bs):
