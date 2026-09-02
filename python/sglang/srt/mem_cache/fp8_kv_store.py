@@ -16,6 +16,8 @@ def _fp8_kv_store_kernel(
     loc_ptr,
     k_scale,
     v_scale,
+    k_stride_tok,
+    v_stride_tok,
     row_size: tl.constexpr,
     HAS_K_SCALE: tl.constexpr,
     HAS_V_SCALE: tl.constexpr,
@@ -26,10 +28,9 @@ def _fp8_kv_store_kernel(
     token = tl.program_id(0)
     offset = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = offset < row_size
-    src = token * row_size + offset
     dst = tl.load(loc_ptr + token).to(tl.int64) * row_size + offset
-    k = tl.load(k_ptr + src, mask=mask).to(tl.float32)
-    v = tl.load(v_ptr + src, mask=mask).to(tl.float32)
+    k = tl.load(k_ptr + token * k_stride_tok + offset, mask=mask).to(tl.float32)
+    v = tl.load(v_ptr + token * v_stride_tok + offset, mask=mask).to(tl.float32)
     # Match ``cache.div_(scale)`` exactly: a true fp32 division (not a
     # multiply by the reciprocal), rounded to BF16, then cast to FP8.
     # A 0-d scale *tensor* is first cast to the BF16 common dtype by torch's
@@ -81,8 +82,13 @@ def fp8_kv_store(
         raise ValueError("K/V destination buffers must have the same 3-D shape")
     if k_buffer.shape[1:] != (heads, head_dim):
         raise ValueError("source and destination KV row shapes must match")
-    if any(not tensor.is_contiguous() for tensor in tensors):
-        raise ValueError("all fused FP8 KV store tensors must be contiguous")
+    if any(not tensor.is_contiguous() for tensor in (k_buffer, v_buffer, loc)):
+        raise ValueError("fused FP8 KV store destinations and loc must be contiguous")
+    for name, src in (("cache_k", cache_k), ("cache_v", cache_v)):
+        # Sources may be strided along the token axis (views of a fused
+        # qkv buffer); each [H, D] row itself must be contiguous.
+        if src.stride(2) != 1 or src.stride(1) != head_dim:
+            raise ValueError(f"{name} rows must be contiguous [H, D]")
 
     def _check_scale(scale, name: str) -> None:
         if isinstance(scale, torch.Tensor):
@@ -110,6 +116,8 @@ def fp8_kv_store(
         loc,
         k_arg,
         v_arg,
+        cache_k.stride(0),
+        cache_v.stride(0),
         row_size=row_size,
         HAS_K_SCALE=k_scale is not None,
         HAS_V_SCALE=v_scale is not None,

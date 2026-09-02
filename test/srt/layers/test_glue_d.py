@@ -50,11 +50,18 @@ def test_router_gemv_optional_bias_and_zero_bias_cache():
 
 @pytest.mark.parametrize("tokens", [1, 16])
 @pytest.mark.parametrize("scale_kind", ["none", "float", "tensor"])
-def test_fp8_kv_store_matches_reference(tokens: int, scale_kind: str):
+@pytest.mark.parametrize("strided", [False, True])
+def test_fp8_kv_store_matches_reference(tokens: int, scale_kind: str, strided: bool):
     torch.manual_seed(2000 + tokens)
     shape = (tokens, 4, 128)
-    cache_k = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-    cache_v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+    if strided:
+        # k/v as token-strided views of one fused [N, 3*H*D] buffer
+        fused = torch.randn((tokens, 3 * 4 * 128), device="cuda", dtype=torch.bfloat16)
+        cache_k = fused[:, : 4 * 128].view(tokens, 4, 128)
+        cache_v = fused[:, 4 * 128 : 2 * 4 * 128].view(tokens, 4, 128)
+    else:
+        cache_k = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        cache_v = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
     loc = torch.randperm(64, device="cuda", dtype=torch.int64)[:tokens].contiguous()
     k_buffer = torch.zeros(
         (64, 4, 128), device="cuda", dtype=torch.float8_e4m3fn

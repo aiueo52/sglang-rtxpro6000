@@ -2548,8 +2548,10 @@ class MHATokenToKVPool(KVCache):
             and 1 <= cache_k.shape[0] <= 64
             and cache_k.dtype == torch.bfloat16
             and cache_v.dtype == torch.bfloat16
-            and cache_k.is_contiguous()
-            and cache_v.is_contiguous()
+            and cache_k.stride(2) == 1
+            and cache_k.stride(1) == cache_k.shape[2]
+            and cache_v.stride(2) == 1
+            and cache_v.stride(1) == cache_v.shape[2]
             and loc.dim() == 1
             and loc.shape[0] == cache_k.shape[0]
             and loc.dtype in (torch.int32, torch.int64)
