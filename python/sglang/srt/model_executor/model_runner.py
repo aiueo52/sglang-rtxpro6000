@@ -820,6 +820,14 @@ class ModelRunner:
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
         num_tokens_per_req = self.decode_num_tokens_per_req()
+        # Adaptive speculative decoding swaps runtime states whose draft width
+        # can exceed the static speculative_num_draft_tokens; size the shared
+        # logits buffer for the widest candidate so every runner fits.
+        max_spec_tokens = getattr(
+            self.server_args, "max_speculative_num_draft_tokens", None
+        )
+        if max_spec_tokens is not None and max_spec_tokens > num_tokens_per_req:
+            num_tokens_per_req = max_spec_tokens
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 

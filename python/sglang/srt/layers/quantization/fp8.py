@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
+
+import os as _os
+
+_W8A16_GEMV_ENABLED = _os.environ.get("SGLANG_FP8_W8A16_GEMV", "0") == "1"
+_W8A16_GEMV_MAX_M = int(_os.environ.get("SGLANG_FP8_W8A16_GEMV_MAX_M", "16"))
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -970,6 +975,26 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        # Weight-only FP8 (W8A16) Triton GEMV for skinny decode/verify shapes.
+        # Opt-in via SGLANG_FP8_W8A16_GEMV=1; requires the per-channel cutlass
+        # weight layout (weight stored transposed [K, N], weight_scale [N, 1]).
+        if (
+            _W8A16_GEMV_ENABLED
+            and not self.block_quant
+            and not self.use_mxfp8
+            and x.dim() == 2
+            and x.shape[0] <= _W8A16_GEMV_MAX_M
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and layer.weight_scale.numel() == layer.weight.shape[1]
+        ):
+            from sglang.srt.layers.quantization.w8a16_gemv import w8a16_gemv
+
+            y = w8a16_gemv(x, layer.weight.t(), layer.weight_scale)
+            if bias is not None:
+                y = y + bias
+            return y
 
         if self.use_mxfp8:
             backend = self.mxfp8_dense_backend

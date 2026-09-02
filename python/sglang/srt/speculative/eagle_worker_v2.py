@@ -331,9 +331,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None:
-                head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                if head.dtype == torch.float8_e4m3fn:
+                    # Target lm_head is FP8 (per-channel, stored transposed [K, V]):
+                    # gather the hot rows and dequantize them into a BF16 draft head.
+                    weight_scale = target_lm_head.weight_scale.reshape(-1).float()
+                    hot_rows = head.t()[self.hot_token_id]
+                    hot_scale = weight_scale[self.hot_token_id].unsqueeze(1)
+                    head = torch.nn.Parameter(
+                        (hot_rows.float() * hot_scale).to(torch.bfloat16),
+                        requires_grad=False,
+                    )
+                    logger.info(
+                        "Draft lm_head: dequantized %d hot rows from FP8 target head",
+                        self.hot_token_id.numel(),
+                    )
+                else:
+                    head = head.clone()
+                    head.data = head.data[self.hot_token_id]
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
