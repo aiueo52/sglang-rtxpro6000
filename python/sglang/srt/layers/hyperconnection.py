@@ -12,6 +12,7 @@ from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.layers.linear import ReplicatedLinear
 
 _HC_FUSED = os.environ.get("SGLANG_HC_FUSED", "0") == "1"
+_HC_MIX2 = os.environ.get("SGLANG_HC_MIX2", "0") == "1"
 _HC_MIX_FP8 = os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 
 if TYPE_CHECKING:
@@ -281,6 +282,27 @@ class GatedResidual(HyperConnectionBase):
             * hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
         ).mean(dim=-2)
 
+    def _mix2_supported(self, hyper_input: torch.Tensor) -> bool:
+        if not (
+            _HC_MIX2
+            and self.config.hc_per_branch_norm
+            and not self._quantized_mix
+            and hyper_input.dim() == 2
+            and 1 <= hyper_input.shape[0] <= 16
+            and hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        ):
+            return False
+        from sglang.srt.layers.hc_mix2_triton import hc_norm_mix2_supported
+
+        return hc_norm_mix2_supported(
+            hyper_input,
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            self.hc_count,
+            self.hidden_size,
+        )
+
     def _fused_mix_supported(self, hyper_input: torch.Tensor) -> bool:
         if not (
             _HC_FUSED
@@ -316,6 +338,20 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input)
+
+        if self._mix2_supported(hyper_input):
+            from sglang.srt.layers.hc_mix2_triton import hc_norm_mix2
+
+            mixed_input, hyper_input_normed = hc_norm_mix2(
+                hyper_input,
+                self.hc_norm.weight,
+                self.hc_norm.variance_epsilon,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+            return mixed_input, (hyper_input, hyper_input_normed)
 
         if self._fused_mix_supported(hyper_input):
             from sglang.srt.layers.hc_fused_triton import hc_fused_norm_mix
