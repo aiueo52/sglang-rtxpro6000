@@ -140,6 +140,9 @@ _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
 _gdn_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
 )
+# SGLANG_GDN_ALT_STREAM=0 forces the in_proj_ba projection onto the main stream
+# (no multi-stream branch inside the CUDA graph).
+_gdn_use_alt_stream = _gdn_use_alt_stream and _os.environ.get("SGLANG_GDN_ALT_STREAM", "1") == "1"
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
