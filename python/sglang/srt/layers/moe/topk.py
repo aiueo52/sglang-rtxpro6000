@@ -137,6 +137,19 @@ _is_musa = is_musa()
 # computes the whole gate in fp32); the epsilon underflows to zero in float16.
 _RENORMALIZE_SUM_EPSILON = 1e-20
 
+# The softmax router treats this as a read-only correction bias. Reuse one
+# device allocation instead of launching torch.zeros for every MoE layer.
+_ZERO_BIAS_CACHE: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _get_zero_bias(num_experts: int, device: torch.device) -> torch.Tensor:
+    key = (num_experts, device)
+    zero_bias = _ZERO_BIAS_CACHE.get(key)
+    if zero_bias is None:
+        zero_bias = torch.zeros(num_experts, dtype=torch.float32, device=device)
+        _ZERO_BIAS_CACHE[key] = zero_bias
+    return zero_bias
+
 # Experimental: skip the HIP padded-token routing-weight masking entirely.
 # Padded (CUDA-graph) rows are discarded downstream and the MoE combine is
 # per-token, so zeroing their weights is in principle unnecessary. Gated off by
@@ -881,10 +894,8 @@ def fused_topk(
                 moe_fused_gate as _jit_moe_fused_gate,
             )
 
-            zero_bias = torch.zeros(
-                gating_output.shape[1],
-                dtype=torch.float32,
-                device=gating_output.device,
+            zero_bias = _get_zero_bias(
+                gating_output.shape[1], gating_output.device
             )
             topk_weights, topk_ids = _jit_moe_fused_gate(
                 gating_output,

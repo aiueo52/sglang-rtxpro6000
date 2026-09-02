@@ -360,6 +360,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             quant_config=gate_quant_config,
             prefix=gate_prefix,
         )
+        self._router_gemv_enabled = (
+            envs.SGLANG_ROUTER_GEMV.get()
+            and config.model_type in ("qwen4_exp_text", "qwen3_5_moe_text")
+            and gate_quant_config is None
+        )
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
@@ -574,7 +579,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            router_logits = self._forward_router_logits(hidden_states)
             if enable_dual_stream:
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
@@ -616,9 +621,35 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return final_hidden_states
 
+    def _forward_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self.gate, "weight", None)
+        bias = getattr(self.gate, "bias", None)
+        if (
+            self._router_gemv_enabled
+            and weight is not None
+            and hidden_states.dim() == 2
+            and 1 <= hidden_states.shape[0] <= 16
+            and hidden_states.dtype == torch.bfloat16
+            and weight.dtype == torch.bfloat16
+            and hidden_states.shape[1] % 128 == 0
+            and weight.shape[0] % 32 == 0
+            and weight.shape[1] == hidden_states.shape[1]
+            and hidden_states.is_contiguous()
+            and weight.is_contiguous()
+            and (
+                bias is None
+                or (bias.dtype == torch.bfloat16 and bias.is_contiguous())
+            )
+        ):
+            from sglang.srt.layers.moe.router_gemv import router_gemv
+
+            return router_gemv(hidden_states, weight, bias)
+        router_logits, _ = self.gate(hidden_states)
+        return router_logits
+
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = self._forward_router_logits(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output

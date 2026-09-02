@@ -299,6 +299,10 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Low-row Qwen3.5/Qwen4-Exp MoE router projection via a BF16 Triton GEMV.
+    SGLANG_ROUTER_GEMV = EnvBool(False)
+    # Fuse the W16 Qwen4-Exp MTP entry norms, projections, and residual add.
+    SGLANG_MTP_ENTRY_FUSED = EnvBool(False)
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
@@ -831,6 +835,8 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Fuse BF16 scale, E4M3 cast, and NHD KV-cache scatter for small batches.
+    SGLANG_KV_FP8_FUSED_STORE = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")

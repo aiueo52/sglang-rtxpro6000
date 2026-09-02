@@ -105,6 +105,35 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def _fuse_residual_linear_shared(
         self, input_embeds: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        fused_tensors = (
+            input_embeds,
+            hidden_states,
+            self.pre_fc_norm_embedding.weight,
+            self.pre_fc_norm_hidden.weight,
+            self.fc_embedding.weight,
+            self.fc_hidden.weight,
+        )
+        if (
+            envs.SGLANG_MTP_ENTRY_FUSED.get()
+            and self.hc_count == 4
+            and self.hidden_size == 2560
+            and input_embeds.dim() == 2
+            and hidden_states.shape == (input_embeds.shape[0], 4 * self.hidden_size)
+            and 1 <= input_embeds.shape[0] <= 16
+            and all(tensor.dtype == torch.bfloat16 for tensor in fused_tensors)
+            and all(tensor.is_contiguous() for tensor in fused_tensors)
+        ):
+            from sglang.srt.layers.mtp_entry import mtp_entry_fused
+
+            return mtp_entry_fused(
+                input_embeds,
+                hidden_states,
+                self.pre_fc_norm_embedding.weight,
+                self.pre_fc_norm_hidden.weight,
+                self.fc_embedding.weight,
+                self.fc_hidden.weight,
+                self.pre_fc_norm_embedding.variance_epsilon,
+            )
         input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
