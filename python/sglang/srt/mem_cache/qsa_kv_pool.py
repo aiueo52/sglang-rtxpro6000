@@ -8,15 +8,30 @@ Qwen3Next-DSA) adds only the flat per-token index-K cache.
 
 from __future__ import annotations
 
+import logging
 from typing import List, Optional
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool import GB, HybridLinearKVPool, MambaPool
 
+logger = logging.getLogger(__name__)
+
 
 def _index_k_bytes(*, kv_heads: int, head_dim: int, dtype: torch.dtype) -> int:
     return kv_heads * head_dim * dtype.itemsize
+
+
+def get_qsa_pending_ring_size(compress_ratio: int, max_draft_tokens: int) -> int:
+    """Return the per-request pending-ring width for a verify window."""
+
+    ratio = int(compress_ratio)
+    window = max(1, int(max_draft_tokens))
+    if ratio <= 0:
+        raise ValueError(f"QSA compress ratio must be positive, got {ratio}")
+    if window <= 1:
+        return ratio
+    return ratio * ((window + ratio - 1) // ratio + 1)
 
 
 class QSATokenToKVPool(HybridLinearKVPool):
@@ -41,11 +56,10 @@ class QSATokenToKVPool(HybridLinearKVPool):
     ) -> int:
         """Per-token cost of the QSA index caches: the compressed keys only.
 
-        Pre-compression state is a per-request ring of ``compress_ratio``
-        slots (the pending group's members), not a per-token cache, so it
-        does not price per token; its total is bounded by the request-slot
-        count and stays outside this budget like the other per-request
-        buffers.
+        Pre-compression state is a per-request ring sized for the maximum
+        speculative verify window, not a per-token cache, so it does not
+        price per token; its total is bounded by the request-slot count and
+        stays outside this budget like the other per-request buffers.
         """
         index_k_bytes = _index_k_bytes(
             kv_heads=kv_heads, head_dim=head_dim, dtype=cls.index_state_dtype
@@ -68,6 +82,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         qsa_compress_ratio: int,
         qsa_token_topk: int,
         num_request_slots: int,
+        qsa_ring_size: Optional[int] = None,
         enable_memory_saver: bool = False,
         enable_kv_cache_copy: bool = False,
         start_layer: Optional[int] = None,
@@ -120,6 +135,19 @@ class QSATokenToKVPool(HybridLinearKVPool):
         if qsa_token_topk % qsa_compress_ratio != 0:
             raise ValueError("qsa_token_topk must be divisible by qsa_compress_ratio")
         self.qsa_compress_ratio = int(qsa_compress_ratio)
+        if qsa_ring_size is None:
+            qsa_ring_size = self.qsa_compress_ratio
+        qsa_ring_size = int(qsa_ring_size)
+        if (
+            qsa_ring_size < self.qsa_compress_ratio
+            or qsa_ring_size % self.qsa_compress_ratio != 0
+        ):
+            raise ValueError(
+                "qsa_ring_size must be a multiple of qsa_compress_ratio and "
+                f"at least the ratio: ring={qsa_ring_size}, "
+                f"ratio={self.qsa_compress_ratio}"
+            )
+        self.qsa_ring_size = qsa_ring_size
         self.qsa_index_head_dim = int(qsa_index_head_dim)
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
@@ -129,21 +157,25 @@ class QSATokenToKVPool(HybridLinearKVPool):
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
         self.qsa_compressed_capacity = -(state_size // -self.qsa_compress_ratio)
-        # Pre-compression index-K state is a per-request RING, not a
+        # Pre-compression index-K state is a per-request ring, not a
         # per-token cache: once a group's compressed key is written, its raw
         # members are never read again, and page-granular prefix sharing
-        # keeps every extend chunk group-aligned, so the only state that
-        # must survive a forward is the pending group's members -- at most
-        # ``ratio`` tokens per request, addressed as
-        # ``req_pool_idx * ratio + position % ratio``. Request slot 0 is
-        # never allocated, so ring rows [0, ratio) double as the inert dump
-        # for tokens whose group already compressed in the same forward.
+        # keeps every extend chunk group-aligned. The ring is wide enough for
+        # the maximum verify window plus the oldest group that can complete,
+        # addressed as ``req_pool_idx * ring + position % ring``. Request
+        # slot 0 is never allocated, so rows [0, ring) double as the inert
+        # dump for tokens whose group already compressed in the same forward.
         if num_request_slots <= 0:
             raise ValueError(
                 f"QSA pending ring needs request slots, got {num_request_slots}"
             )
         self.qsa_num_request_slots = int(num_request_slots)
-        ring_slots = self.qsa_num_request_slots * self.qsa_compress_ratio
+        ring_slots = self.qsa_num_request_slots * self.qsa_ring_size
+        logger.info_once(
+            "QSA pending index-key ring allocation: "
+            f"{self.qsa_num_request_slots} request slots x "
+            f"{self.qsa_ring_size} rows = {ring_slots} rows"
+        )
         self.qsa_key_state_buffer_pool = [
             torch.zeros(
                 (ring_slots, self.qsa_index_kv_heads, self.qsa_index_head_dim),

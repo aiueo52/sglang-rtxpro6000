@@ -1608,6 +1608,7 @@ class KVCacheConfigurator:
         from sglang.srt.mem_cache.qsa_kv_pool import (
             QSATokenToKVPool,
             QwenDSATokenToKVPool,
+            get_qsa_pending_ring_size,
         )
 
         qsa_profile = parse_qsa_profile(self.model_config.hf_text_config)
@@ -1623,10 +1624,17 @@ class KVCacheConfigurator:
             )
         else:
             pool_class = QSATokenToKVPool
+            max_draft_tokens = max(1, max_speculative_num_draft_tokens() or 1)
+            # A verify write must not alias the oldest group it can complete:
+            # R >= ratio + Wmax - 1. Round R up by whole ratio-sized groups.
+            qsa_ring_size = get_qsa_pending_ring_size(
+                qsa_profile.compress_ratio, max_draft_tokens
+            )
             extra_args.update(
                 qsa_index_kv_heads=qsa_profile.kv_heads,
                 qsa_index_head_dim=qsa_profile.head_dim,
                 qsa_compress_ratio=qsa_profile.compress_ratio,
+                qsa_ring_size=qsa_ring_size,
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )

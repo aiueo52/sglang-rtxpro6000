@@ -262,16 +262,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             return
         if int(getattr(spec_info, "topk", 1) or 1) != 1:
             raise NotImplementedError(
-                "Qwen QSA target verification supports only " "speculative_eagle_topk=1"
+                "Qwen QSA target verification supports only speculative_eagle_topk=1"
             )
         draft_tokens = int(getattr(spec_info, "draft_token_num", 0) or 0)
-        if draft_tokens > self.compress_ratio:
-            # The pending-group ring keys state by position % ratio; a verify
-            # window wider than the ratio would collide within one forward.
+        ring_size = self.token_to_kv_pool.qsa_ring_size
+        max_draft_tokens = ring_size - self.compress_ratio + 1
+        if draft_tokens > max_draft_tokens:
             raise NotImplementedError(
-                "Qwen QSA requires speculative_num_draft_tokens <= the QSA "
-                f"compress ratio ({self.compress_ratio}): the pending "
-                f"index-key ring holds one group; got {draft_tokens}"
+                "Qwen QSA speculative_num_draft_tokens="
+                f"{draft_tokens} exceeds the pending-ring maximum "
+                f"{max_draft_tokens} (ring_size={ring_size}, "
+                f"compress_ratio={self.compress_ratio})"
             )
 
     @staticmethod
@@ -297,6 +298,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _speculative_row_to_request(forward_batch, num_rows: int) -> torch.Tensor:
+        """Map speculative token rows directly to request-pool slots."""
+
         batch_size = int(forward_batch.req_pool_indices.numel())
         if batch_size == 0:
             if num_rows == 0:
@@ -314,8 +317,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             # Draft-extend carries the accepted length per request.  DP batch
             # padding appends zero-length request rows, and DP token padding
             # appends trailing token rows that belong to no request; alias
-            # those tail rows to request row 0, mirroring the CUDA-graph
-            # speculative layout padding, so gathers stay in bounds.
+            # those tail rows to reserved request-pool slot 0, mirroring the
+            # CUDA-graph speculative layout padding, so gathers stay in bounds.
             repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
             real_rows = int(repeats.sum().item())
             if real_rows > num_rows:
@@ -324,11 +327,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     f"mapping: rows={num_rows}, mapped={real_rows}"
                 )
             row_to_request = torch.repeat_interleave(
-                torch.arange(
-                    batch_size,
-                    dtype=torch.long,
-                    device=forward_batch.req_pool_indices.device,
-                ),
+                forward_batch.req_pool_indices[:batch_size].long(),
                 repeats,
             )
             padding = num_rows - real_rows
@@ -345,11 +344,11 @@ class QwenSparseAttnBackend(AttentionBackend):
                 "QSA speculative query rows cannot be mapped to requests: "
                 f"rows={num_rows}, batch={batch_size}"
             )
-        return torch.arange(
-            batch_size,
-            dtype=torch.long,
-            device=forward_batch.req_pool_indices.device,
-        ).repeat_interleave(num_rows // batch_size)
+        return (
+            forward_batch.req_pool_indices[:batch_size]
+            .long()
+            .repeat_interleave(num_rows // batch_size)
+        )
 
     @staticmethod
     def _as_cpu_int_tensor(values, size: int) -> torch.Tensor:
@@ -442,10 +441,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             row_prefix_lengths = torch.cat(
                 [row_prefix_lengths, torch.zeros(padding, dtype=torch.int32)]
             )
-            dummy_req = (
-                req_pool_indices[0]
-                if req_pool_indices.numel()
-                else torch.zeros((), dtype=torch.int32, device=req_pool_indices.device)
+            dummy_req = torch.zeros(
+                (), dtype=torch.int32, device=req_pool_indices.device
             )
             row_req_pool_indices = torch.cat(
                 [
@@ -473,6 +470,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
+            ring_size=self.token_to_kv_pool.qsa_ring_size,
         )
         return QwenSparseAttnMetadata(
             sequence_lengths=sequence_lengths,
@@ -626,11 +624,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 logical_positions = logical_positions[0]
             logical_positions = logical_positions.flatten()
             sequence_lengths = (logical_positions + 1).to(torch.int32)
-            row_to_request = self._speculative_row_to_request(
+            row_req_pool_indices = self._speculative_row_to_request(
                 forward_batch, logical_positions.numel()
-            )
-            row_req_pool_indices = forward_batch.req_pool_indices.index_select(
-                0, row_to_request
             )
             max_length = self._speculative_max_row_length(
                 forward_batch, sequence_lengths
@@ -745,6 +740,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     sequence_lengths=sequence_lengths,
                     logical_positions=ring_logical_positions,
                     compress_ratio=self.compress_ratio,
+                    ring_size=self.token_to_kv_pool.qsa_ring_size,
                     is_extend=group_member_rows is not None,
                 )
                 if write_locs.numel():
@@ -763,6 +759,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                             group_end_positions=group_positions.long(),
                             sequence_ids=group_sequence_ids.long(),
                             compress_ratio=self.compress_ratio,
+                            ring_size=self.token_to_kv_pool.qsa_ring_size,
                         )
         indexer_metadata = QSAIndexerMetadata(
             sequence_lengths=sequence_lengths,
@@ -772,6 +769,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_kv_pool=self.token_to_kv_pool,
             compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
             block_topk=self.token_to_kv_pool.qsa_block_topk,
+            ring_size=self.token_to_kv_pool.qsa_ring_size,
             req_pool_indices=row_req_pool_indices,
             write_locs=write_locs,
             compress_group_positions=group_positions,
@@ -970,6 +968,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_kv_pool=pool,
             compress_ratio=pool.qsa_compress_ratio,
             block_topk=pool.qsa_block_topk,
+            ring_size=pool.qsa_ring_size,
             req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
             graph_write_locs=self._graph_write_locs[:metadata_rows],
@@ -1190,6 +1189,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lengths=metadata.sequence_lengths,
                 logical_positions=current_positions,
                 compress_ratio=ratio,
+                ring_size=metadata.ring_size,
                 is_extend=False,
             )
         )
@@ -1199,6 +1199,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 group_end_positions=current_positions,
                 sequence_ids=metadata.token_to_batch_idx.long(),
                 compress_ratio=ratio,
+                ring_size=metadata.ring_size,
             ).to(torch.int32)
         )
 

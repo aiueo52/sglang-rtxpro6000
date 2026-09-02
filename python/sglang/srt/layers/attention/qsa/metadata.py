@@ -66,6 +66,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     token_to_kv_pool: object
     compress_ratio: int
     block_topk: int
+    ring_size: int = 0
     req_pool_indices: Optional[torch.Tensor] = None
     # One entry per compressed group to (re)write this forward: the
     # slot, the group-end token position (sequence-local) and the metadata
@@ -241,25 +242,26 @@ def build_pending_ring_slots(
     sequence_lengths: torch.Tensor,
     logical_positions: torch.Tensor,
     compress_ratio: int,
+    ring_size: int,
     is_extend: bool,
 ) -> torch.Tensor:
     """Per-token slots in the per-request pending ring.
 
-    ``req_pool_idx * ratio + position % ratio``: four consecutive positions
-    occupy four distinct slots, which is exactly the pending group. On extend
-    forwards only that pending tail must survive the forward (compression
+    ``req_pool_idx * ring_size + position % ring_size`` keeps a whole verify
+    window plus its oldest completing group live without aliasing. On extend
+    forwards only the pending tail must survive the forward (compression
     sources members from the chunk itself), so older tokens dump into ring
-    rows [0, ratio) -- request slot 0 is never allocated. Pure tensor
+    rows [0, ring_size) -- request slot 0 is never allocated. Pure tensor
     arithmetic, CUDA-graph safe.
     """
     rows = token_to_batch_idx.long()[: logical_positions.numel()]
     requests = req_pool_indices.long()[rows]
     positions = logical_positions.long()
-    slots = requests * compress_ratio + positions % compress_ratio
+    slots = requests * ring_size + positions % ring_size
     if is_extend:
         lengths = sequence_lengths.long()[rows]
         pending = positions >= (lengths // compress_ratio) * compress_ratio
-        slots = torch.where(pending, slots, positions % compress_ratio)
+        slots = torch.where(pending, slots, positions % ring_size)
     return slots
 
 
@@ -269,6 +271,7 @@ def build_group_ring_slots(
     group_end_positions: torch.Tensor,
     sequence_ids: torch.Tensor,
     compress_ratio: int,
+    ring_size: int,
 ) -> torch.Tensor:
     """Ring slots of a planned group's members, oldest first."""
     requests = req_pool_indices.long()[sequence_ids]
@@ -280,7 +283,7 @@ def build_group_ring_slots(
         dtype=torch.long,
     )
     positions = (group_end_positions[:, None] - offsets[None, :]).clamp_min(0)
-    return requests[:, None] * compress_ratio + positions % compress_ratio
+    return requests[:, None] * ring_size + positions % ring_size
 
 
 def build_rope_position_matrix(
