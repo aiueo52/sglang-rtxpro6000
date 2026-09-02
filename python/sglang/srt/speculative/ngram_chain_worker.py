@@ -358,6 +358,34 @@ class NgramChainAlgorithm(CustomSpecAlgo):
     def is_eagle(self) -> bool:
         return True
 
+    def create_future_map(
+        self,
+        device,
+        req_to_token_pool,
+        needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
+    ):
+        from sglang.srt.managers.overlap_utils import FutureMap
+
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
+
+    def __getattr__(self, name: str):
+        # The SpeculativeAlgorithm enum grows helper methods over time; NGRAM_CHAIN
+        # is EAGLE-shaped, so fall back to EAGLE's implementation for anything the
+        # custom-algorithm base class does not define.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        eagle_attr = getattr(SpeculativeAlgorithm.EAGLE, name)
+        if callable(eagle_attr):
+            return eagle_attr
+        return eagle_attr
+
     def supports_grammar_overlap(self) -> bool:
         return True
 
