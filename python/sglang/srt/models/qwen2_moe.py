@@ -641,6 +641,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 or (bias.dtype == torch.bfloat16 and bias.is_contiguous())
             )
         ):
+            # Tuned skinny BF16 GEMV (split-K, M<=16); bf16 logits like the
+            # ReplicatedLinear path. The bias-free case is the only one here.
+            if bias is None:
+                from sglang.srt.layers.quantization.w8a16_gemv import bf16_gemv
+
+                return bf16_gemv(hidden_states, weight)
             from sglang.srt.layers.moe.router_gemv import router_gemv
 
             return router_gemv(hidden_states, weight, bias)

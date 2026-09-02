@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp MTP speculative decoding."""
 
 import copy
+import os
 import logging
 from contextlib import ExitStack
 from typing import Optional
@@ -23,6 +24,10 @@ from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
+
+# Route the MTP entry projections through the tuned skinny BF16 GEMV at
+# decode sizes (SGLANG_MTP_FC_GEMV=1).
+_MTP_FC_GEMV = os.environ.get("SGLANG_MTP_FC_GEMV", "0") == "1"
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
@@ -134,13 +139,33 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 self.fc_hidden.weight,
                 self.pre_fc_norm_embedding.variance_epsilon,
             )
-        input_embeds = self.fc_embedding(self.pre_fc_norm_embedding(input_embeds))
+        normed_embeds = self.pre_fc_norm_embedding(input_embeds)
         orig_shape = hidden_states.shape
         hidden_states = self.pre_fc_norm_hidden(hidden_states)
         decoder_view = hidden_states.view(
             *hidden_states.shape[:-1], self.hc_count, self.hidden_size
         )
-        encoder_inputs = self.fc_hidden(decoder_view)
+        if (
+            _MTP_FC_GEMV
+            and normed_embeds.dim() == 2
+            and normed_embeds.shape[0] * self.hc_count <= 16
+            and normed_embeds.dtype == torch.bfloat16
+            and self.fc_embedding.weight.dtype == torch.bfloat16
+            and self.fc_embedding.bias is None
+            and self.fc_hidden.bias is None
+        ):
+            # Decode-size draft steps: cuBLAS picks slow kernels for these
+            # [<=16, 2560] x [2560, 2560] BF16 GEMMs; use the tuned skinny GEMV.
+            from sglang.srt.layers.quantization.w8a16_gemv import bf16_gemv
+
+            input_embeds = bf16_gemv(normed_embeds, self.fc_embedding.weight)
+            rows = decoder_view.reshape(-1, self.hidden_size).contiguous()
+            encoder_inputs = bf16_gemv(rows, self.fc_hidden.weight).view(
+                decoder_view.shape
+            )
+        else:
+            input_embeds = self.fc_embedding(normed_embeds)
+            encoder_inputs = self.fc_hidden(decoder_view)
         return (input_embeds.unsqueeze(-2) + encoder_inputs).view(orig_shape)
 
     def _fuse_standard(
