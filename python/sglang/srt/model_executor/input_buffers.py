@@ -11,6 +11,17 @@ from sglang.srt.utils import is_npu
 # Process-wide pool keyed by (name, numel, dtype, device); see share_input_buffer.
 _PoolKey = Tuple[str, int, torch.dtype, torch.device]
 _forward_input_buffer_pool: Dict[_PoolKey, torch.Tensor] = {}
+# When set, share_input_buffer hands back private allocations instead of
+# aliasing the pool (used while building extra adaptive runtime states so their
+# graph capture cannot clobber buffers the initial state's graphs already own).
+_private_input_buffers: bool = False
+
+
+def set_private_input_buffers(enabled: bool) -> bool:
+    global _private_input_buffers
+    previous = _private_input_buffers
+    _private_input_buffers = enabled
+    return previous
 
 
 def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
@@ -33,6 +44,8 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     filled immediately before each replay and the forwards that use them are
     sequential / mutually exclusive.
     """
+    if _private_input_buffers:
+        return new_buffer
     key: _PoolKey = (name, new_buffer.numel(), new_buffer.dtype, new_buffer.device)
     canonical = _forward_input_buffer_pool.get(key, None)
     if canonical is None:

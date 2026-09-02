@@ -1490,8 +1490,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            # Extra runtime states must not share the draft runner's global
+            # FlashInfer/attention workspace: plans captured into a shared
+            # workspace by this state's graphs would overwrite the plan data
+            # the initial state's graphs read at replay.
+            draft_runner = self._draft_worker.draft_runner
+            backup_draft_ws = getattr(draft_runner, "init_new_workspace", False)
+            draft_runner.init_new_workspace = True
+            from sglang.srt.model_executor.input_buffers import (
+                set_private_input_buffers,
+            )
+
+            backup_private = set_private_input_buffers(True)
+            try:
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
+            finally:
+                draft_runner.init_new_workspace = backup_draft_ws
+                set_private_input_buffers(backup_private)
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
@@ -1512,6 +1528,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     self.device, self.gpu_id
                 )
                 target_graph_tic = time.perf_counter()
+                from sglang.srt.model_executor.input_buffers import (
+                    set_private_input_buffers as _set_private,
+                )
+
+                _backup_private_t = _set_private(True)
                 target_graph_runner = TargetGraphRunnerCls(
                     target_model_runner,
                     attn_backend=target_attn_backend,
@@ -1522,6 +1543,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     attn_backend=target_attn_backend,
                     capture_bs=target_graph_runner.capture_bs,
                 )
+                _set_private(_backup_private_t)
                 target_graph_after_mem = get_available_gpu_memory(
                     self.device, self.gpu_id
                 )
