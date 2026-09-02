@@ -229,6 +229,22 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         logger.info("Using FlashInfer GDN kernels")
 
+        # Per-layer constant views (A_log fp32 / dt_bias) cached by source object:
+        # ``A_log.detach().float()`` per call creates a new tensor object every
+        # verify, which defeats FlashInfer's identity-keyed bf16 cast cache and
+        # re-launches the cast kernel once per layer per step.
+        self._const_cache: dict = {}
+
+    def _const(self, t: torch.Tensor, as_float: bool = False) -> torch.Tensor:
+        key = (id(t), as_float)
+        hit = self._const_cache.get(key)
+        if hit is not None and hit[0] is t:
+            return hit[1]
+        view = t.detach()
+        if as_float:
+            view = view.float()
+        self._const_cache[key] = (t, view)
+        return view
     def can_target_verify(self, cache_mode: str) -> bool:
         """Whether this instance may drive target verification in ``cache_mode``.
 
@@ -467,9 +483,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 )
 
                 output_wy = gated_delta_rule_mtp_wy_output_only(
-                    A_log=A_log.detach().float(),
+                    A_log=self._const(A_log, as_float=True),
                     a=a_mtp,
-                    dt_bias=dt_bias.detach(),
+                    dt_bias=self._const(dt_bias),
                     q=query_mtp,
                     k=key_mtp,
                     v=value_mtp,
@@ -493,9 +509,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             v=value_mtp,
             initial_state=ssm_states,
             initial_state_indices=cache_indices,
-            A_log=A_log.detach(),
+            A_log=self._const(A_log),
             a=a_mtp,
-            dt_bias=dt_bias.detach(),
+            dt_bias=self._const(dt_bias),
             b=b_mtp,
             scale=None,
             output=None,
