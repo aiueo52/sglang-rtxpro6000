@@ -35,6 +35,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.hyperconnection import (
+    _HC_FUSED,
     GatedResidual,
     HyperConnectionConfig,
 )
@@ -1340,6 +1341,10 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
+        if _HC_FUSED and get_parallel().attn_tp_size == 1:
+            return self.attn_hyper_connection.combine_then_mix(
+                hidden_states, residual, self.mlp_hyper_connection
+            )
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)

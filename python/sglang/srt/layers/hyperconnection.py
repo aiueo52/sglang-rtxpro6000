@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
-import os as _os
-
-_HC_MIX_FP8 = _os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.layers.linear import ReplicatedLinear
+
+_HC_FUSED = os.environ.get("SGLANG_HC_FUSED", "0") == "1"
+_HC_MIX_FP8 = os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -280,6 +281,34 @@ class GatedResidual(HyperConnectionBase):
             * hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
         ).mean(dim=-2)
 
+    def _fused_mix_supported(self, hyper_input: torch.Tensor) -> bool:
+        if not (
+            _HC_FUSED
+            and self.config.hc_per_branch_norm
+            and not self._quantized_mix
+            and hyper_input.is_cuda
+            and hyper_input.dtype == torch.bfloat16
+            and hyper_input.dim() == 2
+            and 1 <= hyper_input.shape[0] <= 16
+            and hyper_input.shape[1] == self.hc_count * self.hidden_size
+            and hyper_input.shape[1] % 2048 == 0
+            and self.config.hc_lowrank % 64 == 0
+            and hyper_input.is_contiguous()
+        ):
+            return False
+        weights = (
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+        )
+        return all(
+            w.is_cuda
+            and w.device == hyper_input.device
+            and w.dtype == torch.bfloat16
+            and w.is_contiguous()
+            for w in weights
+        )
+
     def mix(self, hyper_input: torch.Tensor):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
@@ -287,6 +316,20 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input)
+
+        if self._fused_mix_supported(hyper_input):
+            from sglang.srt.layers.hc_fused_triton import hc_fused_norm_mix
+
+            mixed_input, hyper_input_normed = hc_fused_norm_mix(
+                hyper_input,
+                self.hc_norm.weight,
+                self.hc_norm.variance_epsilon,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+            return mixed_input, (hyper_input, hyper_input_normed)
 
         if self.config.hc_per_branch_norm:
             hyper_input_normed = self.hc_norm(hyper_input)
@@ -421,6 +464,49 @@ class GatedResidual(HyperConnectionBase):
             self.hidden_size,
         ).to(self.params_dtype)
         return updated_residuals
+
+    def combine_then_mix(
+        self,
+        block_output: torch.Tensor,
+        residuals,
+        next_hc: "GatedResidual",
+    ):
+        """Combine this boundary and norm/mix the next one in one launch."""
+        hyper_input, hyper_input_normed = residuals
+        inject_w = self.block_inject_weight.weight
+        if (
+            next_hc._fused_mix_supported(hyper_input)
+            and self.hc_count == next_hc.hc_count
+            and self.hidden_size == next_hc.hidden_size
+            and block_output.shape == (hyper_input.shape[0], self.hidden_size)
+            and hyper_input_normed.shape == hyper_input.shape
+            and block_output.is_cuda
+            and block_output.device == hyper_input.device
+            and hyper_input_normed.device == hyper_input.device
+            and inject_w.device == hyper_input.device
+            and block_output.dtype == torch.bfloat16
+            and hyper_input_normed.dtype == torch.bfloat16
+            and inject_w.dtype == torch.bfloat16
+            and block_output.is_contiguous()
+            and hyper_input_normed.is_contiguous()
+            and inject_w.is_contiguous()
+        ):
+            from sglang.srt.layers.hc_fused_triton import hc_fused_combine_norm_mix
+
+            mixed, new_residual, normed = hc_fused_combine_norm_mix(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                inject_w,
+                next_hc.hc_norm.weight,
+                next_hc.hc_norm.variance_epsilon,
+                next_hc.input_mix_weight_down.weight,
+                next_hc.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+            return mixed, (new_residual, normed)
+        return next_hc.mix(self.combine(block_output, residuals))
 
 
 HYPERCONNECTION_CLASS_DICT = {
