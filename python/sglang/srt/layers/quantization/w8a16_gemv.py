@@ -3,10 +3,12 @@ Targets decode/verify shapes (M <= 16). Weight-only FP8: no activation quantizat
 
 Two properties of the decode shapes decide throughput here:
 
-- Weight layout. Fp8LinearMethod stores the weight [K, N] and hands over the [N, K]
-  transpose, so N is the contiguous axis and the natural tile is [BLOCK_K, BLOCK_N],
-  which tl.dot takes as its B operand with no transpose. bf16_gemv passes an [N, K]
-  contiguous weight, where [BLOCK_N, BLOCK_K] is natural and the transpose is needed.
+- Weight layout. Every caller hands over an [N, K]-CONTIGUOUS weight, stride (K, 1).
+  Fp8LinearMethod quantizes to [N, K], stores the [K, N] transposed view on the layer,
+  and transposes it back at the call site; bf16_gemv passes linear.weight directly.
+  So K is the contiguous axis, the natural weight tile is [BLOCK_N, BLOCK_K], and
+  tl.dot needs it transposed (W_KN False). The W_KN True path is for a genuinely
+  [K, N]-contiguous weight, which no caller produces today.
 - Grid size. One CTA per N block owning the whole K reduction launches 3..80 CTAs for
   the small-N linears (in_proj_ba, shared-expert gate_up/down, GDN out_proj, o_proj) on
   a 188-SM part, so those calls run at a few hundred GB/s no matter how well the inner
@@ -15,6 +17,10 @@ Two properties of the decode shapes decide throughput here:
   whoever observes the last increment sums the partials, scales, and writes bf16 y. The
   counter is reset to 0 by that same CTA, so no memset is needed and the kernel is safe
   to capture in a CUDA graph and replay.
+
+M == 1 additionally wants USE_DOT False on every shape measured (2-23% faster): the
+broadcast-multiply path keeps M_PAD at 1 instead of padding to a 16-row mma, which
+shrinks both the accumulator and the split-K partials 16-fold.
 
 The split-K scratch is one buffer per device, so two split-K calls must not overlap;
 that holds for the decode path, which issues every linear on one stream.
@@ -64,8 +70,9 @@ def _w8a16_gemv_kernel(
     for k0 in range(pid_k * BLOCK_K, K, SPLITS * BLOCK_K):
         kk = k0 + offs_k
         k_mask = kk < K
-        # W_KN: the [N,K] view has stride (1, N), so the [BLOCK_K, BLOCK_N] tile is the
+        # W_KN: the weight is [K, N] contiguous, so the [BLOCK_K, BLOCK_N] tile is the
         # contiguous one and tl.dot takes it directly instead of transposing in smem.
+        # Every current caller is [N, K] contiguous and takes the else branch.
         if W_KN:
             wp = w_ptr + kk[:, None] * stride_wk + offs_n[None, :] * stride_wn
             if EVEN_K:
@@ -166,33 +173,59 @@ def _m_bucket(M: int) -> int:
 
 
 # Measured on RTX PRO 6000 Blackwell Max-Q (sm_120, 188 SMs) with
-# bench/w8a16v2/tune_w8a16v2.py; re-run it after a kernel or hardware change.
-# key:   (weight element bytes, N is the contiguous weight axis, M bucket, N, K)
+# bench/w8a16v2/tune_v3.py + the head-to-head re-check in bench/w8a16v2/final_v3.py;
+# the metric is the CUPTI kernel-duration median over a CUDA-graph replay whose
+# weight working set is several times the 128 MB L2, i.e. the number the serving
+# torch profile reports. Re-run it after a kernel or hardware change.
+#
+# key:   (weight element bytes, N is the contiguous weight axis, N, K)
 # value: (BLOCK_N, BLOCK_K, SPLITS, USE_DOT, W_KN, num_warps, num_stages)
-# W_KN None derives the tile orientation from the weight strides, which is what every
-# real layout wants. These shapes are memory bound, so one entry serves every M bucket.
+# W_KN None derives the tile orientation from the weight strides.
+#
+# `N is the contiguous weight axis` is False on every row: both callers pass an
+# [N, K]-contiguous weight (see the module docstring). The pre-v3 table keyed the
+# fp8 rows True, which no call ever matched, so the server silently ran _plan's
+# fallback for all of them; the "vs" ratios below are against that fallback.
 _BY_SHAPE = {
-    # fp8 weight stored [K, N] (Fp8LinearMethod passes layer.weight.t())
-    (1, True, 2560, 6144): (128, 64, 8, True, None, 8, 3),    # GDN out_proj, attn o_proj
-    (1, True, 2560, 640): (32, 64, 4, True, None, 4, 3),      # shared-expert down
-    (1, True, 1280, 2560): (64, 128, 5, True, None, 8, 3),    # shared-expert gate_up
-    (1, True, 13312, 2560): (128, 128, 1, True, None, 8, 3),  # attention qkv + output gate
-    (1, True, 16384, 2560): (128, 128, 1, True, None, 8, 3),  # GDN in_proj_qkvz
-    # draft head: the wide-N tile measured slower in the server (64 vs 56us);
-    # keep the original narrow config for it.
-    (1, True, 32768, 2560): (32, 256, 1, True, False, 4, 3),
-    (1, True, 248320, 2560): (128, 128, 1, True, None, 8, 3),  # lm_head
-    # bf16 weight stored [N, K] (bf16_gemv passes linear.weight)
-    # GDN in_proj_ba: split-K measured slower in the server (14.8 vs 9.4us);
-    # keep the original single-launch config.
-    (2, False, 96, 2560): (32, 512, 1, True, None, 4, 3),
-    (2, False, 512, 2560): (16, 128, 8, True, None, 4, 3),    # MoE router gate
+    # fp8, w8a16_gemv
+    (1, False, 2560, 640): (32, 128, 1, True, None, 4, 4),  # shared-expert down, 1.16x
+    (1, False, 1280, 2560): (16, 128, 10, True, None, 2, 2),  # shared gate_up, 1.08x
+    (1, False, 32768, 2560): (128, 256, 1, True, None, 8, 3),  # draft lm_head, 1.14x
+    (1, False, 248320, 2560): (128, 256, 1, True, None, 8, 3),  # lm_head, 1.02x
+    # bf16, bf16_gemv
+    (2, False, 96, 2560): (16, 256, 10, True, None, 2, 4),  # GDN in_proj_ba, 2.0-2.2x
+    (2, False, 512, 2560): (16, 128, 10, True, None, 2, 4),  # MoE router gate, 1.04x
+    # The 2560x6144 out_proj/o_proj and the 13312x2560 attention qkv are absent at
+    # M > 1 because _plan's fallback already emits the fastest tile measured for them.
 }
-_TUNED = {
-    (wb, cn, m, N, K): cfg
-    for (wb, cn, N, K), cfg in _BY_SHAPE.items()
-    for m in (1, 4, 16)
+_BY_SHAPE_M16 = {
+    # The _BY_SHAPE gate_up tile loses 12% at M=16; the qkvz tile below loses 1% at M=4.
+    (1, False, 1280, 2560): (16, 64, 10, True, None, 4, 3),  # shared gate_up, 1.03x
+    (1, False, 16384, 2560): (64, 128, 1, True, None, 4, 3),  # GDN in_proj_qkvz, 1.04x
 }
+_BY_SHAPE_M1 = {
+    # USE_DOT False (the broadcast path, M_PAD 1) is only legal at M == 1.
+    (1, False, 2560, 640): (16, 256, 3, False, None, 4, 3),  # shared-expert down, 1.20x
+    (1, False, 1280, 2560): (16, 128, 10, False, None, 2, 3),  # shared gate_up, 1.23x
+    (1, False, 2560, 6144): (16, 256, 6, False, None, 4, 3),  # out_proj/o_proj, 1.05x
+    (1, False, 13312, 2560): (32, 256, 1, False, None, 4, 3),  # attention qkv, 1.02x
+    (1, False, 32768, 2560): (32, 256, 1, False, None, 4, 3),  # draft lm_head, 1.17x
+    (2, False, 512, 2560): (16, 256, 10, False, None, 4, 3),  # MoE router gate, 1.15x
+    (2, False, 2560, 2560): (16, 256, 5, False, None, 4, 2),  # MTP fc_*, 1.06x
+}
+
+
+def _expand(table, buckets):
+    return {
+        (wb, cn, m, N, K): cfg
+        for (wb, cn, N, K), cfg in table.items()
+        for m in buckets
+    }
+
+
+_TUNED = _expand(_BY_SHAPE, (1, 4, 16))
+_TUNED.update(_expand(_BY_SHAPE_M16, (16,)))
+_TUNED.update(_expand(_BY_SHAPE_M1, (1,)))
 
 
 def _prev_pow2(v: int) -> int:
@@ -205,20 +238,30 @@ def _plan(M: int, N: int, K: int, contig_n: bool, w_bytes: int, sms: int):
     tuned = _TUNED.get((w_bytes, contig_n, _m_bucket(M), N, K))
     if tuned is not None:
         return _fit(M, N, tuned)
-    # A [K, N]-contiguous weight wants the widest N block it can keep the grid full
-    # with: 32 fp8 columns is one 32 B sector per k, and going to 128 roughly doubles
-    # the achieved bandwidth. A [N, K]-contiguous weight already reads BLOCK_K bytes
-    # per row, so N stays narrow and the grid stays wide.
     if contig_n:
+        # A [K, N]-contiguous weight wants the widest N block it can keep the grid
+        # full with, since 32 fp8 columns is only one 32 B sector per k. Untuned:
+        # no caller produces this layout.
         block_n = 128 if N >= 2048 else (64 if N >= 512 else 32)
-        block_k, warps = 128, 8
-    else:
-        block_n, block_k, warps = 32, 128, 4
-    n_blocks = triton.cdiv(N, block_n)
-    if n_blocks >= sms:
-        return (block_n, block_k, 1, True, None, warps, 3)
-    # Aim for ~2 CTAs per SM; shrink BLOCK_K if K does not hold enough blocks for that.
-    want = min(_MAX_SPLITS, max(1, (2 * sms) // n_blocks))
+        return _fit(M, N, (block_n, 128, 1, True, None, 8, 3))
+    # [N, K] contiguous. When N alone fills the machine, a long BLOCK_K keeps more
+    # bytes in flight: 1.15x on the 32768x2560 draft head, 1.01-1.04x on the other
+    # three big shapes. The M == 4 bucket is the exception -- there the wide tile
+    # measured 1-2% slower than the [32, 128] one on both 2560-K shapes.
+    if triton.cdiv(N, 128) * 2 >= sms and _m_bucket(M) != 4:
+        if M == 1:
+            return (32, 256, 1, False, None, 4, 3)
+        # A [128, 256] bf16 tile needs 144 KB of smem, over the 99 KB sm_120 limit.
+        return (128 if w_bytes == 1 else 64, 256, 1, True, None, 8, 3)
+    use_dot = M > 1
+    block_n = 16 if M == 1 else 32
+    block_k, warps = 128, 4
+    if triton.cdiv(N, 32) >= sms:
+        return (block_n, block_k, 1, use_dot, None, warps, 3)
+    # Aim for ~2 CTAs per SM, ~5 at M == 1 where an M_PAD 1 partial is 16x cheaper;
+    # shrink BLOCK_K if K does not hold enough blocks for that.
+    per_sm = 5 if M == 1 else 2
+    want = min(_MAX_SPLITS, max(1, (per_sm * sms) // triton.cdiv(N, block_n)))
     block_k = min(block_k, max(64, _prev_pow2(max(1, K // want))))
     n_kb = triton.cdiv(K, block_k)
     splits = min(want, n_kb)
@@ -227,7 +270,7 @@ def _plan(M: int, N: int, K: int, contig_n: bool, w_bytes: int, sms: int):
         if n_kb % cand == 0 and cand <= _MAX_SPLITS:
             splits = cand
             break
-    return _fit(M, N, (block_n, block_k, splits, True, None, warps, 3))
+    return _fit(M, N, (block_n, block_k, splits, use_dot, None, warps, 3))
 
 
 def _fit(M: int, N: int, cfg):
