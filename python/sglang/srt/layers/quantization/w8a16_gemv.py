@@ -161,15 +161,50 @@ _WS = {}
 _ONES = {}
 
 
-def _workspace(device):
-    ws = _WS.get(device)
+# Split-K scratch slots. The decode path issues most linears on one stream, but the
+# MoE block overlaps the shared expert with the router/routed experts on an alt
+# stream (qwen2_moe.py), and two split-K launches that share one scratch and one
+# counter array while running concurrently corrupt each other's partials (seen as
+# garbage generations with SGLANG_ROUTER_GEMV=1). Work issued inside
+# ``with scratch_slot(1):`` uses a second, independent scratch.
+_N_SLOTS = 2
+_SLOT = 0
+
+
+class scratch_slot:
+    """Context manager selecting the split-K scratch slot for launches inside it."""
+
+    def __init__(self, slot: int):
+        assert 0 <= slot < _N_SLOTS
+        self.slot = slot
+        self.prev = 0
+
+    def __enter__(self):
+        global _SLOT
+        self.prev = _SLOT
+        _SLOT = self.slot
+        return self
+
+    def __exit__(self, *exc):
+        global _SLOT
+        _SLOT = self.prev
+        return False
+
+
+def _workspace_slot(device, slot: int):
+    key = (device, slot)
+    ws = _WS.get(key)
     if ws is None:
         ws = (
             torch.empty(_WS_FLOATS, dtype=torch.float32, device=device),
             torch.zeros(_WS_COUNTERS, dtype=torch.int32, device=device),
         )
-        _WS[device] = ws
+        _WS[key] = ws
     return ws
+
+
+def _workspace(device):
+    return _workspace_slot(device, _SLOT)
 
 
 def prealloc(device) -> None:
@@ -180,7 +215,8 @@ def prealloc(device) -> None:
     first be allocated inside a capture and would live in that graph's private
     memory pool. Called from ``Fp8LinearMethod.process_weights_after_loading``.
     """
-    _workspace(device)
+    for slot in range(_N_SLOTS):
+        _workspace_slot(device, slot)
     if device not in _ONES:
         _ONES[device] = torch.ones(1, dtype=torch.float32, device=device)
 

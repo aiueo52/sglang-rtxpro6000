@@ -41,6 +41,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.quantization.w8a16_gemv import scratch_slot as _gemv_scratch_slot
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -657,7 +658,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             elif enable_cuda_shared_overlap:
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                with torch.cuda.stream(self.alt_stream):
+                with torch.cuda.stream(self.alt_stream), _gemv_scratch_slot(1):
                     shared_output = self._forward_shared_experts(hidden_states)
                     shared_output.record_stream(self.alt_stream)
                     shared_event = self.alt_stream.record_event()
@@ -764,7 +765,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        with torch.cuda.stream(self.alt_stream), _gemv_scratch_slot(1):
             router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
