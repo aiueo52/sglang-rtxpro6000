@@ -9,15 +9,20 @@ that only moves ~1 MB.  This module does the same math in one launch:
     a[m, c] = 2 * sigmoid(dot(normed_residual[m, :], inject_weight[c, :]) / HC)
     out[m, c*HS + i] = residual[m, c*HS + i] + a[m, c] * block_output[m, i]
 
-Geometry.  The row (HC*HS = 10240 elements for hc_count 4 / hidden 2560) is cut
-into ``NPROG`` contiguous power-of-two chunks; program ``(m, p)`` owns chunk ``p``
-of row ``m`` for both phases.  Phase 1 accumulates that chunk's contribution to all
-HC gate dots into a persistent fp32 ``partials`` buffer, a grid barrier publishes
-them, phase 2 reduces the NPROG partials per branch, forms the gates and writes the
-chunk of the output row.  A chunk may straddle a branch boundary, so the gate is
-selected per element rather than per CTA.
+Geometry.  Programs are indexed by (row m, column slice q): slice q is the same
+``SUB``-wide column window in every one of the HC branches, with SUB a power of two
+dividing the per-branch hidden size, so every access is a contiguous, 16 B-vectorised
+block and the ``block_output`` row is read once per program instead of once per
+branch.  Phase 1 accumulates the slice's contribution to all HC gate dots into a
+persistent fp32 ``partials`` buffer; a grid barrier publishes them; phase 2 reduces
+the Q partials per branch, forms the gates and writes the slice of all HC branches.
 
-Grid barrier safety.  ``rows * NPROG`` is kept <= the SM count, so every CTA of the
+That layout also cuts traffic relative to the CUDA pair: the normed row and the
+block output are each read exactly once (the reference gate kernel reads the normed
+row once per branch, and its apply kernel re-reads the block output once per branch),
+~3.6 MB -> ~2.4 MB per 16-row call.
+
+Grid barrier safety.  ``rows * Q`` is kept <= the SM count, so every CTA of the
 launch is resident before the barrier is reached (a CUDA-graph replay serialises the
 stream, and PDL only lets a successor start once this grid is fully launched).  The
 wrapper falls back to the two-kernel path whenever that does not hold.  The two
@@ -48,9 +53,11 @@ try:  # __nv_expf, matching the reference's math::exp -> expf
 except Exception:  # pragma: no cover - older Triton
     _exp_f32 = tl.exp
 
-# Chunk counts tried from the most parallel down; the first one whose grid fits the
-# machine wins. ROW // NPROG must be a power of two >= 256 for a clean 16 B access.
-_NPROG_CANDIDATES = (40, 20, 10, 5)
+# Column-slice widths tried from the narrowest (most parallel) up; the first whose
+# grid fits the machine wins. SUB must be a power of two dividing the per-branch
+# hidden size so a slice never straddles a branch, and >= 128 so each thread still
+# moves at least 4 elements.
+_SUB_CANDIDATES = (128, 256, 512)
 _MAX_ROWS = 32
 _MAX_CTAS = 256  # partials/counters are sized for this many programs
 
@@ -62,8 +69,8 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Bench hooks: pin the chunk count / warp count instead of letting _plan choose.
-_FORCE_NPROG = _env_int("SGLANG_HC_COMBINE_FUSED_NPROG", 0)
+# Bench hooks: pin the slice width / warp count instead of letting _plan choose.
+_FORCE_SUB = _env_int("SGLANG_HC_COMBINE_FUSED_SUB", 0)
 _FORCE_WARPS = _env_int("SGLANG_HC_COMBINE_FUSED_WARPS", 0)
 
 
@@ -74,28 +81,32 @@ def _hc_combine_fused_kernel(
     n_ptr,  # normed_residual   [M, HC*HS]
     w_ptr,  # inject_weight     [HC, HC*HS]
     o_ptr,  # out               [M, HC*HS]
-    part_ptr,  # fp32           [>= M*NPROG, HC]
+    part_ptr,  # fp32           [>= M*Q, HC]
     cnt_ptr,  # int32           [2]
     n_ctas,
     HC: tl.constexpr,
     HS: tl.constexpr,
-    NPROG: tl.constexpr,
-    BLK: tl.constexpr,
+    Q: tl.constexpr,
+    QP: tl.constexpr,  # Q rounded up to a power of two (tl.arange needs one)
+    SUB: tl.constexpr,
 ):
     ROW: tl.constexpr = HC * HS
     pid = tl.program_id(0)
-    m = pid // NPROG
-    p = pid % NPROG
+    m = pid // Q
+    q = pid % Q
 
-    offs = p * BLK + tl.arange(0, BLK)
-    n = tl.load(n_ptr + m * ROW + offs).to(tl.float32)
+    # [HC, SUB] tile: the same column window in each of the HC branches. SUB divides
+    # HS, so a tile never straddles a branch and each row is a contiguous 16 B-aligned
+    # run (HS is a multiple of 8).
+    tile = tl.arange(0, HC)[:, None] * HS + (q * SUB + tl.arange(0, SUB))[None, :]
+    nb = tl.load(n_ptr + m * ROW + tile).to(tl.float32)
 
-    # ---- phase 1: this chunk's contribution to each branch's gate dot ----
+    # ---- phase 1: this slice's contribution to each branch's gate dot ----
     for c in tl.static_range(HC):
-        w = tl.load(w_ptr + c * ROW + offs).to(tl.float32)
+        wb = tl.load(w_ptr + c * ROW + tile).to(tl.float32)
         tl.store(
             part_ptr + pid * HC + c,
-            tl.sum(n * w, axis=0),
+            tl.sum(tl.sum(nb * wb, axis=1), axis=0),
             cache_modifier=".cg",
         )
 
@@ -105,23 +116,22 @@ def _hc_combine_fused_kernel(
     while tl.atomic_add(cnt_ptr, 0, sem="acq_rel", scope="gpu") < n_ctas:
         pass
 
-    # ---- phase 2: reduce the gate dots and stream the chunk ----
-    branch = offs // HS
-    col = offs - branch * HS
-    r = tl.load(r_ptr + m * ROW + offs).to(tl.float32)
-    yv = tl.load(y_ptr + m * HS + col).to(tl.float32)
-
-    a_vec = tl.zeros([BLK], tl.float32)
-    base = m * NPROG
-    for c in tl.static_range(HC):
-        total = tl.load(part_ptr + base * HC + c, cache_modifier=".cg")
-        for s in tl.static_range(1, NPROG):
-            total += tl.load(part_ptr + (base + s) * HC + c, cache_modifier=".cg")
-        # 2 * sigmoid(dot / HC), the reference's `2.0f / (1.0f + expf(-total / HC))`.
-        a_c = 2.0 / (1.0 + _exp_f32(-total / HC))
-        a_vec = tl.where(branch == c, a_c, a_vec)
-
-    tl.store(o_ptr + m * ROW + offs, (r + a_vec * yv).to(o_ptr.dtype.element_ty))
+    # ---- phase 2: reduce the gate dots and stream this slice of every branch ----
+    qi = tl.arange(0, QP)
+    part = tl.load(
+        part_ptr + (m * Q + qi)[:, None] * HC + tl.arange(0, HC)[None, :],
+        mask=(qi < Q)[:, None],
+        other=0.0,
+        cache_modifier=".cg",
+    )
+    # 2 * sigmoid(dot / HC), the reference's `2.0f / (1.0f + expf(-total / HC))`.
+    a = 2.0 / (1.0 + _exp_f32(-tl.sum(part, axis=0) / HC))  # [HC]
+    yv = tl.load(y_ptr + m * HS + q * SUB + tl.arange(0, SUB)).to(tl.float32)
+    rb = tl.load(r_ptr + m * ROW + tile).to(tl.float32)
+    tl.store(
+        o_ptr + m * ROW + tile,
+        (rb + a[:, None] * yv[None, :]).to(o_ptr.dtype.element_ty),
+    )
 
     # ---- restore the counters for the next launch / graph replay ----
     ticket = tl.atomic_add(cnt_ptr + 1, 1, sem="acq_rel", scope="gpu")
@@ -153,20 +163,20 @@ def _state(device, hc_count: int):
     return st
 
 
-def _plan(rows: int, row_size: int, sms: int):
-    """(NPROG, BLK, num_warps) or None when no chunking fits the grid barrier."""
-    for nprog in _NPROG_CANDIDATES:
-        if _FORCE_NPROG and nprog != _FORCE_NPROG:
+def _plan(rows: int, hidden_size: int, hc_count: int, sms: int):
+    """(Q, SUB, num_warps) or None when no slicing fits the grid barrier."""
+    if hc_count < 1 or hc_count & (hc_count - 1):
+        return None  # the [HC, SUB] tile needs a power-of-two branch count
+    for sub in _SUB_CANDIDATES:
+        if _FORCE_SUB and sub != _FORCE_SUB:
             continue
-        if row_size % nprog:
+        if hidden_size % sub:  # a slice must stay inside one branch
             continue
-        blk = row_size // nprog
-        if blk < 256 or (blk & (blk - 1)):  # power of two, >= 8 elems/thread
+        q = hidden_size // sub
+        if rows * q > sms:  # every CTA must be resident at the barrier
             continue
-        if rows * nprog > sms:
-            continue
-        warps = _FORCE_WARPS or max(1, min(8, blk // 256))
-        return nprog, blk, warps
+        warps = _FORCE_WARPS or max(1, min(8, sub // 256))
+        return q, sub, warps
     return None
 
 
@@ -200,7 +210,7 @@ def hc_combine_fused_supported(
         return False
     if normed_residual.numel() != residual.numel():
         return False
-    return _plan(rows, row_size, _num_sms(residual.device)) is not None
+    return _plan(rows, hidden_size, hc_count, _num_sms(residual.device)) is not None
 
 
 def hc_combine_fused(
@@ -220,13 +230,13 @@ def hc_combine_fused(
     o = torch.empty_like(r) if out is None else out.reshape(-1, row_size)
     rows = r.shape[0]
 
-    plan = _plan(rows, row_size, _num_sms(r.device))
+    plan = _plan(rows, hidden_size, hc_count, _num_sms(r.device))
     if plan is None:
         raise ValueError(
-            f"hc_combine_fused: no chunking fits rows={rows} row_size={row_size}"
+            f"hc_combine_fused: no slicing fits rows={rows} hidden_size={hidden_size}"
         )
-    nprog, blk, warps = plan
-    n_ctas = rows * nprog
+    q, sub, warps = plan
+    n_ctas = rows * q
     partials, counters = _state(r.device, hc_count)
 
     _hc_combine_fused_kernel[(n_ctas,)](
@@ -240,8 +250,9 @@ def hc_combine_fused(
         n_ctas,
         HC=hc_count,
         HS=hidden_size,
-        NPROG=nprog,
-        BLK=blk,
+        Q=q,
+        QP=triton.next_power_of_2(q),
+        SUB=sub,
         num_warps=warps,
         num_stages=1,
     )

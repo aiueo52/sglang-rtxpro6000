@@ -62,21 +62,21 @@ class TestHcCombineFusedPlan(unittest.TestCase):
         from sglang.srt.layers.hc_combine_fused_triton import _plan
 
         for rows in range(1, 33):
-            plan = _plan(rows, ROW, 188)
+            plan = _plan(rows, HS, HC, 188)
             if plan is None:
                 continue
-            nprog, blk, warps = plan
-            self.assertEqual(nprog * blk, ROW)
-            self.assertEqual(blk & (blk - 1), 0, "chunk must be a power of two")
-            self.assertGreaterEqual(blk, 256)
-            self.assertLessEqual(rows * nprog, 188, "grid barrier would not be resident")
-            self.assertEqual(blk // (32 * warps), 8, "want 8 elements per thread")
+            q, sub, warps = plan
+            self.assertEqual(q * sub, HS, "slices must tile one branch exactly")
+            self.assertEqual(sub & (sub - 1), 0, "slice must be a power of two")
+            self.assertGreaterEqual(sub, 128)
+            self.assertLessEqual(rows * q, 188, "grid barrier would not be resident")
+            self.assertGreaterEqual(sub // (32 * warps), 4, "want >= 4 elems/thread")
 
     def test_plan_rejects_grids_that_cannot_barrier(self):
         from sglang.srt.layers.hc_combine_fused_triton import _plan
 
-        # 5 chunks is the coarsest option, so a machine with < 5*rows SMs has none.
-        self.assertIsNone(_plan(rows=16, row_size=ROW, sms=8))
+        # 5 slices is the coarsest option, so a machine with < 5*rows SMs has none.
+        self.assertIsNone(_plan(rows=16, hidden_size=HS, hc_count=HC, sms=8))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
