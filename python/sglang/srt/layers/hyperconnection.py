@@ -12,6 +12,10 @@ from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.layers.linear import ReplicatedLinear
 
 _HC_FUSED = os.environ.get("SGLANG_HC_FUSED", "0") == "1"
+# Single-launch combine (gate + apply in one Triton kernel), see
+# sglang.srt.layers.hc_combine_fused_triton. Replaces the sgl-kernel
+# hc_combine_gate + hc_combine_apply pair (2 launches x 96 boundaries per step).
+_HC_COMBINE_FUSED = os.environ.get("SGLANG_HC_COMBINE_FUSED", "0") == "1"
 _HC_MIX2 = os.environ.get("SGLANG_HC_MIX2", "0") == "1"
 _HC_MIX_FP8 = os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 
@@ -228,6 +232,10 @@ class GatedResidual(HyperConnectionBase):
                 and vecs % (8 * 160) == 0
                 and (self.hidden_size // 8) % (vecs // 8) == 0
             )
+            # The one-launch Triton combine only needs a chunking of the row that
+            # fits its grid barrier; the per-call row count decides that, so the
+            # rest of the check lives in hc_combine_fused_supported.
+            self._fused_combine_ok = _HC_COMBINE_FUSED and torch.cuda.is_available()
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -467,6 +475,23 @@ class GatedResidual(HyperConnectionBase):
             and hyper_input_normed.dtype == block_output.dtype
             and self.block_inject_weight.weight.dtype == block_output.dtype
         ):
+            if self._fused_combine_ok:
+                from sglang.srt.layers.hc_combine_fused_triton import (
+                    hc_combine_fused,
+                    hc_combine_fused_supported,
+                )
+
+                if hc_combine_fused_supported(
+                    block_output, hyper_input, self.hc_count, self.hidden_size
+                ):
+                    return hc_combine_fused(
+                        block_output,
+                        hyper_input,
+                        hyper_input_normed,
+                        self.block_inject_weight.weight.data,
+                        self.hc_count,
+                        self.hidden_size,
+                    )
             if self._split_combine_ok and block_output.shape[0] <= 32:
                 from sglang.kernels.ops.elementwise.hc_combine import (
                     hc_combine_split,
