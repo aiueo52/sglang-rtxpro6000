@@ -173,19 +173,34 @@ def _plan(rows: int, row_size: int, sms: int):
 def hc_combine_fused_supported(
     block_output: torch.Tensor,
     residual: torch.Tensor,
+    normed_residual: torch.Tensor,
+    inject_weight: torch.Tensor,
     hc_count: int,
     hidden_size: int,
 ) -> bool:
-    if not (block_output.is_cuda and residual.is_cuda):
+    """Whether `hc_combine_fused` can serve this call (else use the two-kernel path).
+
+    The kernel addresses every tensor with compact strides and needs its whole grid
+    resident at the barrier, so anything non-contiguous or too wide falls back.
+    """
+    row_size = hc_count * hidden_size
+    tensors = (block_output, residual, normed_residual, inject_weight)
+    if not all(t.is_cuda and t.is_contiguous() for t in tensors):
         return False
     if residual.dtype not in (torch.bfloat16, torch.float16):
         return False
-    rows = residual.numel() // (hc_count * hidden_size)
-    if rows < 1 or rows > _MAX_ROWS:
+    if not all(t.dtype == residual.dtype for t in tensors):
         return False
-    if not (block_output.is_contiguous() and residual.is_contiguous()):
+    if tuple(inject_weight.shape) != (hc_count, row_size):
         return False
-    return _plan(rows, hc_count * hidden_size, _num_sms(residual.device)) is not None
+    rows = residual.numel() // row_size
+    if rows < 1 or rows > _MAX_ROWS or rows * row_size != residual.numel():
+        return False
+    if block_output.numel() != rows * hidden_size:
+        return False
+    if normed_residual.numel() != residual.numel():
+        return False
+    return _plan(rows, row_size, _num_sms(residual.device)) is not None
 
 
 def hc_combine_fused(

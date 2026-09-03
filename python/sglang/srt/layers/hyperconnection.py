@@ -482,7 +482,12 @@ class GatedResidual(HyperConnectionBase):
                 )
 
                 if hc_combine_fused_supported(
-                    block_output, hyper_input, self.hc_count, self.hidden_size
+                    block_output,
+                    hyper_input,
+                    hyper_input_normed,
+                    self.block_inject_weight.weight.data,
+                    self.hc_count,
+                    self.hidden_size,
                 ):
                     return hc_combine_fused(
                         block_output,

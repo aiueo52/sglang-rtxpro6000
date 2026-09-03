@@ -92,7 +92,7 @@ class TestHcCombineFused(unittest.TestCase):
         )
 
         y, r, n, w = make(rows, seed)
-        self.assertTrue(hc_combine_fused_supported(y, r, HC, HS))
+        self.assertTrue(hc_combine_fused_supported(y, r, n, w, HC, HS))
         single = hc_combine(y, r, n, w, HC, HS)
         split = hc_combine_split(y, r, n, w, HC, HS)
         fused = hc_combine_fused(y, r, n, w, HC, HS)

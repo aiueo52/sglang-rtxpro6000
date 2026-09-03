@@ -57,7 +57,7 @@ def main(rows_list):
     for rows in rows_list:
         w, args = build(rows)
         print(f"\n=== rows={rows}  hc={HC} hidden={HS}  working set x{len(args)}")
-        if not hc_combine_fused_supported(args[0][0], args[0][1], HC, HS):
+        if not hc_combine_fused_supported(args[0][0], args[0][1], args[0][2], w, HC, HS):
             print("  fused path unsupported at this row count")
             continue
 
