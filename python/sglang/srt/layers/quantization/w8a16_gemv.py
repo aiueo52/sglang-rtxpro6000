@@ -188,7 +188,9 @@ def _m_bucket(M: int) -> int:
 # fallback for all of them; the "vs" ratios below are against that fallback.
 _BY_SHAPE = {
     # fp8, w8a16_gemv
-    (1, False, 2560, 640): (32, 128, 1, True, None, 4, 4),  # shared-expert down, 1.16x
+    # shared-expert down: the single-split (32,128,1,...,4,4) bench winner measured 5.2us
+    # in the W4 server (M=4) vs 4.0us for the split-5 fallback; M=16 keeps the winner below.
+    (1, False, 2560, 640): (32, 128, 5, True, None, 4, 3),
     (1, False, 1280, 2560): (16, 128, 10, True, None, 2, 2),  # shared gate_up, 1.08x
     (1, False, 32768, 2560): (128, 256, 1, True, None, 8, 3),  # draft lm_head, 1.14x
     (1, False, 248320, 2560): (128, 256, 1, True, None, 8, 3),  # lm_head, 1.02x
@@ -204,6 +206,7 @@ _BY_SHAPE_M16 = {
     # The _BY_SHAPE gate_up tile loses 12% at M=16; the qkvz tile below loses 1% at M=4.
     (1, False, 1280, 2560): (16, 64, 10, True, None, 4, 3),  # shared gate_up, 1.03x
     (1, False, 16384, 2560): (64, 128, 1, True, None, 4, 3),  # GDN in_proj_qkvz, 1.04x
+    (1, False, 2560, 640): (32, 128, 1, True, None, 4, 4),  # shared-expert down (W16 server 4.1->3.8us)
     # attention qkv at M=16: both the wide (128,256,8w) tile and the (64,128) qkvz tile
     # measured 27.5us in the server vs 25.6us for the narrow single-split tile; pin it.
     (1, False, 13312, 2560): (32, 128, 1, True, None, 4, 3),
