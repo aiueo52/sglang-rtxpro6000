@@ -38,6 +38,17 @@ ulp.  A CPU emulation of both reduction orders puts that at ~2e-5 of elements at
 rows and 0 at 4 rows; ``test/srt/layers/test_hc_combine_fused.py`` asserts the <= 1
 ulp bound on device and prints the measured rate.
 
+MEASURED RESULT: this is a REGRESSION on RTX PRO 6000 Blackwell -- keep the flag off.
+CUPTI medians over graph replay (bench/glue_e/bench_hc_combine.py, 96-deep rotating
+working set): the CUDA pair is 2.14 us/call at 1 row and 2.85 us at 16 rows; this
+kernel is 3.26 us and 3.74 us, i.e. +1.3 us/call or ~+130 us/step over 96 combines.
+Removing the barrier entirely (diagnostic build) still leaves 2.53 us / 2.88 us, so
+the Triton body alone already costs as much as BOTH hand-written CUDA kernels: the
+pair is not paying two full launches, because sgl-kernel launches the apply kernel
+with PDL so its prologue overlaps the gate kernel's tail. There is no launch overhead
+left here for a fusion to reclaim. Kept, flag-gated and off, as the recorded negative
+result; it would need a Triton-side PDL equivalent (or a CUDA rewrite) to win.
+
 Enable with ``SGLANG_HC_COMBINE_FUSED=1``.
 """
 
@@ -114,9 +125,13 @@ def _hc_combine_fused_kernel(
 
     # ---- grid barrier ----
     tl.debug_barrier()
-    tl.atomic_add(cnt_ptr, 1, sem="acq_rel", scope="gpu")
-    while tl.atomic_add(cnt_ptr, 0, sem="acq_rel", scope="gpu") < n_ctas:
+    tl.atomic_add(cnt_ptr, 1, sem="release", scope="gpu")
+    # Poll with a volatile load, not an atomic RMW: every spinning CTA hammering one
+    # address with read-modify-writes serialises in L2, which cost more than the
+    # launch this kernel saves. A volatile load can be served from L2 without it.
+    while tl.load(cnt_ptr, volatile=True) < n_ctas:
         pass
+    tl.debug_barrier()
 
     # ---- phase 2: reduce the gate dots and stream this slice of every branch ----
     qi = tl.arange(0, QP)
