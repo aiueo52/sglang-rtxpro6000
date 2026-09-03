@@ -33,20 +33,17 @@ L2 = 128 << 20
 
 
 def build(B: int, T: int, copies: int):
-    sets = []
-    for i in range(copies):
-        sets.append(_make_inputs(B, T, seed=i))
-    return sets
+    # pool=B so the allocated bytes equal the touched bytes: the kernel only reads
+    # the B state slots it is indexed at, and the working set has to be real.
+    return [_make_inputs(B, T, seed=i, pool=B) for i in range(copies)]
 
 
 def main(cases):
     ref, pat = _load_modules()
     print(clocks_note())
     for B, T in cases:
-        one = _make_inputs(B, T)
-        h0_bytes = one["initial_state_source"].numel() * 2
-        per_call = h0_bytes // one["initial_state_source"].shape[0] * B + B * T * CONV_DIM * 2
-        copies = max(8, min(160, -(-4 * L2 // max(per_call, 1))))
+        per_call = B * (HV * V_DIM * K_DIM * 2 + T * CONV_DIM * 2)
+        copies = max(8, min(320, -(-4 * L2 // max(per_call, 1))))
         sets = build(B, T, copies)
         ws_mb = copies * per_call / (1 << 20)
         print(f"\n=== B={B} T={T}  working set x{copies} (~{ws_mb:.0f} MB, L2 is 128 MB)")

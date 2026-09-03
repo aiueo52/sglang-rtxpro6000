@@ -87,7 +87,7 @@ def _load_modules():
     return ref, pat
 
 
-def _make_inputs(B: int, T: int, seed: int = 0):
+def _make_inputs(B: int, T: int, seed: int = 0, pool: int = POOL):
     """Post-conv fused row plus the strided q/k/v column slices the backend passes."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     conv_out = torch.randn(
@@ -107,7 +107,7 @@ def _make_inputs(B: int, T: int, seed: int = 0):
     dt_bias = torch.randn(HV, dtype=torch.float32, device="cuda", generator=g)
     h0 = (
         torch.randn(
-            POOL, HV, V_DIM, K_DIM, dtype=torch.float32, device="cuda", generator=g
+            pool, HV, V_DIM, K_DIM, dtype=torch.float32, device="cuda", generator=g
         )
         .mul_(0.05)
         .to(torch.bfloat16)
