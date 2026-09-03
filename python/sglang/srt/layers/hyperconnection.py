@@ -17,6 +17,11 @@ _HC_FUSED = os.environ.get("SGLANG_HC_FUSED", "0") == "1"
 # hc_combine_gate + hc_combine_apply pair (2 launches x 96 boundaries per step).
 _HC_COMBINE_FUSED = os.environ.get("SGLANG_HC_COMBINE_FUSED", "0") == "1"
 _HC_MIX2 = os.environ.get("SGLANG_HC_MIX2", "0") == "1"
+_HC_MIX2_FP8 = os.environ.get("SGLANG_HC_MIX2_FP8", "0") == "1"
+# The bf16 mix weights are only needed by the prefill / fallback GEMM path; with
+# this on they are dropped after quantization (-13 MB per GatedResidual) and that
+# path dequantizes on the fly instead.
+_HC_MIX2_FP8_DROP_BF16 = os.environ.get("SGLANG_HC_MIX2_FP8_DROP_BF16", "0") == "1"
 _HC_MIX_FP8 = os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 
 if TYPE_CHECKING:
@@ -139,6 +144,13 @@ class GatedResidual(HyperConnectionBase):
     ):
         super().__init__(config, use_mix, use_combine, role)
         self._quantized_mix = quant_config is not None
+        # (w_down_fp8, s_down, w_up_fp8, s_up), built once when both mix
+        # weights have been loaded (SGLANG_HC_MIX2_FP8=1); see
+        # _maybe_build_mix2_fp8. `_mix2_loaded` tracks the two weight_loader
+        # callbacks so a weight *update* rebuilds the fp8 copies too.
+        self._mix2_fp8 = None
+        self._mix2_bf16_dropped = False
+        self._mix2_loaded: set = set()
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -207,6 +219,15 @@ class GatedResidual(HyperConnectionBase):
                 and not self._quantized_mix
             )
             self._mix_up_weight_padded = None
+            if _HC_MIX2 and _HC_MIX2_FP8 and quant_config is None:
+                # Quantize at weight-load time: the first eager forward is not
+                # guaranteed to precede CUDA-graph capture, and quantizing
+                # inside a capture would bake the quantizer into the graph.
+                for linear in (
+                    self.input_mix_weight_down,
+                    self.input_mix_weight_up,
+                ):
+                    linear.weight.weight_loader = self._mix2_weight_loader
 
         if use_combine:
             self.block_inject_weight = nn.Linear(
@@ -290,6 +311,65 @@ class GatedResidual(HyperConnectionBase):
             * hyper_input_normed.unflatten(-1, (self.hc_count, self.hidden_size))
         ).mean(dim=-2)
 
+    def _mix2_weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor):
+        assert param.size() == loaded_weight.size()
+        param.data.copy_(loaded_weight)
+        self._mix2_loaded.add(id(param))
+        if len(self._mix2_loaded) == 2:
+            self._mix2_loaded.clear()
+            self._mix2_fp8 = None
+            self._maybe_build_mix2_fp8()
+
+    def _maybe_build_mix2_fp8(self) -> None:
+        """Quantize the mix weights to fp8 once, outside CUDA-graph capture."""
+        if (
+            not _HC_MIX2_FP8
+            or self._mix2_fp8 is not None
+            or self._quantized_mix
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return
+        w_down = self.input_mix_weight_down.weight
+        w_up = self.input_mix_weight_up.weight
+        if not (
+            w_down.is_cuda
+            and w_down.dtype == torch.bfloat16
+            and w_up.dtype == torch.bfloat16
+        ):
+            return
+        from sglang.srt.layers.hc_mix2_triton import quantize_hc_mix2_weights_fp8
+
+        self._mix2_fp8 = quantize_hc_mix2_weights_fp8(w_down.data, w_up.data)
+        if _HC_MIX2_FP8_DROP_BF16:
+            empty = torch.empty(0, dtype=w_down.dtype, device=w_down.device)
+            self.input_mix_weight_down.weight.data = empty
+            self.input_mix_weight_up.weight.data = empty
+            self._mix2_bf16_dropped = True
+
+    def _mix2_weights(self):
+        """(w_down, w_up, s_down, s_up) for the three-kernel path."""
+        if self._mix2_fp8 is not None:
+            wd, sd, wu, su = self._mix2_fp8
+            return wd, wu, sd, su
+        return (
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+            None,
+            None,
+        )
+
+    def _bf16_mix_weights(self):
+        """The bf16 mix weights, dequantized if the originals were dropped."""
+        if not self._mix2_bf16_dropped:
+            return (
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+            )
+        from sglang.srt.layers.hc_mix2_triton import dequantize_hc_mix2_weight
+
+        wd, sd, wu, su = self._mix2_fp8
+        return dequantize_hc_mix2_weight(wd, sd), dequantize_hc_mix2_weight(wu, su)
+
     def _mix2_supported(self, hyper_input: torch.Tensor) -> bool:
         if not (
             _HC_MIX2
@@ -302,11 +382,12 @@ class GatedResidual(HyperConnectionBase):
             return False
         from sglang.srt.layers.hc_mix2_triton import hc_norm_mix2_supported
 
+        w_down, w_up, _, _ = self._mix2_weights()
         return hc_norm_mix2_supported(
             hyper_input,
             self.hc_norm.weight,
-            self.input_mix_weight_down.weight,
-            self.input_mix_weight_up.weight,
+            w_down,
+            w_up,
             self.hc_count,
             self.hidden_size,
         )
@@ -316,6 +397,7 @@ class GatedResidual(HyperConnectionBase):
             _HC_FUSED
             and self.config.hc_per_branch_norm
             and not self._quantized_mix
+            and not self._mix2_bf16_dropped
             and hyper_input.is_cuda
             and hyper_input.dtype == torch.bfloat16
             and hyper_input.dim() == 2
@@ -347,17 +429,24 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed_input, (hyper_input, hyper_input)
 
+        if _HC_MIX2_FP8 and _HC_MIX2 and self._mix2_fp8 is None:
+            self._maybe_build_mix2_fp8()
+
         if self._mix2_supported(hyper_input):
             from sglang.srt.layers.hc_mix2_triton import hc_norm_mix2
 
+            w_down, w_up, s_down, s_up = self._mix2_weights()
             mixed_input, hyper_input_normed = hc_norm_mix2(
                 hyper_input,
                 self.hc_norm.weight,
                 self.hc_norm.variance_epsilon,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                w_down,
+                w_up,
                 self.hc_count,
                 self.hidden_size,
+                None,
+                s_down,
+                s_up,
             )
             return mixed_input, (hyper_input, hyper_input_normed)
 
@@ -385,6 +474,17 @@ class GatedResidual(HyperConnectionBase):
             mixed_input = self._mix_with_quantized_linears(hyper_input_normed).to(
                 self.params_dtype
             )
+        elif self._mix2_bf16_dropped:
+            # The bf16 originals are gone; only the dequantizing _mix_compute
+            # fallback below can serve this (prefill-width) call.
+            w_down_bf16, w_up_bf16 = self._bf16_mix_weights()
+            mixed_input = self._mix_compute(
+                hyper_input_normed,
+                w_down_bf16,
+                w_up_bf16,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
         elif (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
@@ -451,10 +551,11 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             ).to(self.params_dtype)
         else:
+            w_down_bf16, w_up_bf16 = self._bf16_mix_weights()
             mixed_input = self._mix_compute(
                 hyper_input_normed,
-                self.input_mix_weight_down.weight,
-                self.input_mix_weight_up.weight,
+                w_down_bf16,
+                w_up_bf16,
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)

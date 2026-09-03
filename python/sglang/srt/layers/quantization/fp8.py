@@ -958,6 +958,21 @@ class Fp8LinearMethod(LinearMethodBase):
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
+            return
+
+        if (
+            _W8A16_GEMV_ENABLED
+            and not self.block_quant
+            and not self.use_mxfp8
+            and layer.weight.dtype == torch.float8_e4m3fn
+        ):
+            # Materialize the GEMV's per-device scratch here, before any CUDA
+            # graph is captured: warm-up runs at prefill widths where `apply`
+            # never reaches the GEMV, so the first split-K call would otherwise
+            # allocate inside a capture and land in that graph's private pool.
+            from sglang.srt.layers.quantization.w8a16_gemv import prealloc
+
+            prealloc(layer.weight.device)
 
     def _w8a16_gemv_ok(self, layer: torch.nn.Module, x: torch.Tensor) -> bool:
         """Whether `apply` would route this call through the W8A16 Triton GEMV."""

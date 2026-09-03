@@ -157,6 +157,8 @@ _WS_FLOATS = 1 << 21
 _WS_COUNTERS = 4096
 _MAX_SPLITS = 32
 _WS = {}
+# The scalar "scale" bf16_gemv passes for its (unquantized) weights.
+_ONES = {}
 
 
 def _workspace(device):
@@ -168,6 +170,19 @@ def _workspace(device):
         )
         _WS[device] = ws
     return ws
+
+
+def prealloc(device) -> None:
+    """Materialize the per-device scratch before any CUDA graph is captured.
+
+    Warm-up runs at prefill widths, where every caller falls back to cuBLAS, so
+    without this the split-K scratch (and ``bf16_gemv``'s scale-of-one) would
+    first be allocated inside a capture and would live in that graph's private
+    memory pool. Called from ``Fp8LinearMethod.process_weights_after_loading``.
+    """
+    _workspace(device)
+    if device not in _ONES:
+        _ONES[device] = torch.ones(1, dtype=torch.float32, device=device)
 
 
 _NUM_SMS = None
@@ -386,9 +401,6 @@ def w8a16_gemv(
     return _launch(x, w, s, y, M, N, K, s.numel() > 1, cfg)
 
 
-_ONES = {}
-
-
 def bf16_gemv(
     x: torch.Tensor, w: torch.Tensor, cfg=None, out: Optional[torch.Tensor] = None
 ):
@@ -405,3 +417,229 @@ def bf16_gemv(
     if cfg is None:
         cfg = _plan(M, N, K, w.stride(0) == 1, w.element_size(), _num_sms(x.device))
     return _launch(x, w, one, y, M, N, K, False, cfg)
+
+
+# ---------------------------------------------------------------------------
+# Fused gate_up + SiLU-and-mul (SGLANG_SHARED_GATEUP_FUSED=1)
+#
+# The shared expert issues w8a16_gemv for gate_up ([N=2H, K] fp8, N = [gate H |
+# up H]) and then act_and_mul over the [M, 2H] result -- 48 extra launches per
+# decode step (+14 in the W16 draft) whose only job is to read 2H bf16 values
+# and write H. Giving one CTA both column n and n + H lets the same k loop fill
+# two accumulators, so the activation becomes an epilogue: the [M, 2H]
+# intermediate is never written and the act kernel disappears.
+#
+# The weight bytes are unchanged (each column is still read once), so this is a
+# launch/traffic win on the activation, not on the GEMV itself.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _w8a16_gemv_silu_kernel(
+    x_ptr,
+    w_ptr,
+    s_ptr,
+    y_ptr,
+    ws_ptr,
+    cnt_ptr,
+    M,
+    H,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    stride_ym,
+    stride_yn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    M_PAD: tl.constexpr,
+    SPLITS: tl.constexpr,
+    EVEN_K: tl.constexpr,
+    USE_DOT: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_m = tl.arange(0, M_PAD)
+    offs_k = tl.arange(0, BLOCK_K)
+    n_mask = offs_n < H
+    m_mask = offs_m < M
+    acc_g = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+    acc_u = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+    wg_base = w_ptr + offs_n[:, None] * stride_wn
+    wu_base = w_ptr + (offs_n + H)[:, None] * stride_wn
+    for k0 in range(pid_k * BLOCK_K, K, SPLITS * BLOCK_K):
+        kk = k0 + offs_k
+        koff = kk[None, :] * stride_wk
+        if EVEN_K:
+            wmask = n_mask[:, None]
+        else:
+            wmask = n_mask[:, None] & (kk < K)[None, :]
+        wg = tl.load(wg_base + koff, mask=wmask, other=0.0)
+        wu = tl.load(wu_base + koff, mask=wmask, other=0.0)
+        if USE_DOT:
+            xp = x_ptr + offs_m[:, None] * stride_xm + kk[None, :] * stride_xk
+            if EVEN_K:
+                x = tl.load(xp, mask=m_mask[:, None], other=0.0)
+            else:
+                x = tl.load(xp, mask=m_mask[:, None] & (kk < K)[None, :], other=0.0)
+            acc_g += tl.dot(x, tl.trans(wg.to(tl.bfloat16)), out_dtype=tl.float32)
+            acc_u += tl.dot(x, tl.trans(wu.to(tl.bfloat16)), out_dtype=tl.float32)
+        else:
+            if EVEN_K:
+                xv = tl.load(x_ptr + kk * stride_xk).to(tl.float32)
+            else:
+                xv = tl.load(x_ptr + kk * stride_xk, mask=kk < K, other=0.0).to(
+                    tl.float32
+                )
+            acc_g += tl.sum(wg.to(tl.float32) * xv[None, :], axis=1)[None, :]
+            acc_u += tl.sum(wu.to(tl.float32) * xv[None, :], axis=1)[None, :]
+
+    tile = M_PAD * BLOCK_N
+    if SPLITS == 1:
+        g = acc_g * tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        u = acc_u * tl.load(s_ptr + offs_n + H, mask=n_mask, other=0.0)[None, :]
+        out = (g * tl.sigmoid(g)) * u
+        y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        tl.store(y_ptrs, out.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+        return
+
+    # Same in-launch split-K fixup as _w8a16_gemv_kernel, with two partials per
+    # (n block, split) instead of one.
+    slot = offs_m[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
+    base = ws_ptr + (pid_n * SPLITS) * (2 * tile)
+    part = base + pid_k * (2 * tile)
+    tl.store(part + slot, acc_g, cache_modifier=".cg")
+    tl.store(part + tile + slot, acc_u, cache_modifier=".cg")
+    tl.debug_barrier()
+    done = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+    if done == SPLITS - 1:
+        tot_g = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+        tot_u = tl.zeros((M_PAD, BLOCK_N), dtype=tl.float32)
+        for s in tl.static_range(SPLITS):
+            p = base + s * (2 * tile)
+            tot_g += tl.load(p + slot, cache_modifier=".cg")
+            tot_u += tl.load(p + tile + slot, cache_modifier=".cg")
+        g = tot_g * tl.load(s_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+        u = tot_u * tl.load(s_ptr + offs_n + H, mask=n_mask, other=0.0)[None, :]
+        out = (g * tl.sigmoid(g)) * u
+        y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
+        tl.store(y_ptrs, out.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+        tl.store(cnt_ptr + pid_n, 0)
+
+
+# Tiles for the fused variant, keyed (M bucket, N=2H, K). A CTA owns two weight
+# tiles, so the right geometry is NOT the _BY_SHAPE* one: at M >= 4 the unfused
+# [16, 64] x 10-split tile measured 6.5 us fused, and halving the split while
+# doubling the n block (each CTA already carries two accumulators, so 5 splits
+# still fills the machine) took it to 5.0. Measured with
+# bench/w8a16v2/bench_gateup_fused.py --sweep (CUPTI medians, 164 weight copies
+# = 512 MB working set, RTX PRO 6000 Blackwell Max-Q).
+#
+#   M    inherited tile    tuned tile                     plain gemv + act
+#    1   4.64 us           4.42 us  (16, 256, 10, w4, s4)   4.26 + 1.66
+#    4   6.21 us           4.99 us  (32,  64,  5, w4, s4)   4.93 + 1.82
+#   16   6.53 us           4.96 us  (32,  64,  5, w4, s4)   5.09 + 1.98
+_FUSED_BY_SHAPE = {
+    (1, 1280, 2560): (16, 256, 10, False, None, 4, 4),
+    (4, 1280, 2560): (32, 64, 5, True, None, 4, 4),
+    (16, 1280, 2560): (32, 64, 5, True, None, 4, 4),
+}
+
+
+def _fused_plan(M: int, N: int, K: int, sms: int):
+    tuned = _FUSED_BY_SHAPE.get((_m_bucket(M), N, K))
+    if tuned is not None:
+        return _fit_fused(M, N // 2, tuned)
+    # Fall back to the unfused tile for the same shape, halving the n-block count
+    # (each CTA covers two columns now) and keeping its split-K choice.
+    cfg = _plan(M, N, K, False, 1, sms)
+    block_n, block_k, splits, use_dot, _w_kn, warps, stages = cfg
+    return _fit_fused(M, N // 2, (block_n, block_k, splits, use_dot, None, warps, stages))
+
+
+def _fit_fused(M: int, H: int, cfg):
+    block_n, block_k, splits, use_dot, w_kn, warps, stages = cfg
+    if splits == 1:
+        return cfg
+    m_pad = 16 if (use_dot or M > 1) else 1
+    n_blocks = triton.cdiv(H, block_n)
+    if (
+        splits > _MAX_SPLITS
+        or n_blocks > _WS_COUNTERS
+        or 2 * n_blocks * splits * m_pad * block_n > _WS_FLOATS
+    ):
+        return (block_n, block_k, 1, use_dot, w_kn, warps, stages)
+    return cfg
+
+
+def w8a16_gemv_silu_mul(
+    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, cfg=None
+):
+    """silu(x @ w[:H].T * s[:H]) * (x @ w[H:].T * s[H:]) in one launch.
+
+    x: [M,K] bf16 (M<=16); w: [N,K] fp8_e4m3 with N = 2H and the gate half first
+    (the MergedColumnParallelLinear [gate|up] layout); scale: [N] or [N,1] fp32.
+    Returns [M, H] bf16. The activation is evaluated in fp32 on the unrounded
+    accumulators, so the result is at least as accurate as gemv-then-act_and_mul.
+    """
+    M, K = x.shape
+    N = w.shape[0]
+    assert w.shape[1] == K and M <= 16 and N % 2 == 0
+    H = N // 2
+    y = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
+    s = scale.reshape(-1)
+    if s.dtype != torch.float32 or not s.is_contiguous():
+        s = s.contiguous().float()
+    assert s.numel() == N, "fused gate_up needs a per-channel scale"
+    if cfg is None:
+        cfg = _fused_plan(M, N, K, _num_sms(x.device))
+    block_n, block_k, splits, use_dot, _w_kn, num_warps, num_stages = cfg
+    use_dot = use_dot or M > 1
+    m_pad = 16 if use_dot else 1
+    ws, cnt = _workspace(x.device)
+    _w8a16_gemv_silu_kernel[(triton.cdiv(H, block_n), splits)](
+        x,
+        w,
+        s,
+        y,
+        ws,
+        cnt,
+        M,
+        H,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(0),
+        w.stride(1),
+        y.stride(0),
+        y.stride(1),
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        M_PAD=m_pad,
+        SPLITS=splits,
+        EVEN_K=K % block_k == 0,
+        USE_DOT=use_dot,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return y
+
+
+def w8a16_gemv_silu_mul_supported(
+    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, max_m: int = 16
+) -> bool:
+    """Whether this (x, [N, K] fp8 weight, per-channel scale) can take the fused path."""
+    return (
+        x.is_cuda
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and 1 <= x.shape[0] <= max_m
+        and w.dtype == torch.float8_e4m3fn
+        and w.dim() == 2
+        and w.shape[1] == x.shape[1]
+        and w.shape[0] % 2 == 0
+        and w.stride(1) == 1
+        and scale.numel() == w.shape[0]
+    )

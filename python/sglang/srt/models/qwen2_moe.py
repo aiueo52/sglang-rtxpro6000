@@ -19,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -122,6 +123,43 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
+# Fuse the shared expert's gate_up GEMV with its SiLU-and-mul epilogue: one CTA
+# owns columns n and n + intermediate_size, so the [M, 2*inter] intermediate is
+# never materialized and the separate act_and_mul launch disappears (48/step at
+# W4, 62 at W16). Requires the W8A16 Triton GEMV path (SGLANG_FP8_W8A16_GEMV=1).
+_SHARED_GATEUP_FUSED = os.environ.get("SGLANG_SHARED_GATEUP_FUSED", "0") == "1"
+_SHARED_GATEUP_FUSED_MAX_M = int(os.environ.get("SGLANG_FP8_W8A16_GEMV_MAX_M", "16"))
+
+
+def _gateup_fused_layer_ok(layer: MergedColumnParallelLinear) -> bool:
+    """True when `layer` is exactly the plain per-channel FP8 linear the unfused
+    path would have routed through w8a16_gemv (same math, same scales).
+
+    Anything else -- block-quantized, marlin, mxfp8, a bias, a non-FP8 quant
+    method, or the W8A16 GEMV path being off -- keeps the two-kernel path.
+    """
+    from sglang.srt.layers.quantization.fp8 import (
+        _W8A16_GEMV_ENABLED,
+        Fp8LinearMethod,
+    )
+
+    if not _W8A16_GEMV_ENABLED or not isinstance(layer, MergedColumnParallelLinear):
+        return False
+    # MergedColumnParallelLinear([inter] * 2): the local shard is
+    # [gate_local | up_local], so column n pairs with n + N/2.
+    if len(layer.output_sizes) != 2 or layer.output_sizes[0] != layer.output_sizes[1]:
+        return False
+    if layer.bias is not None or layer.skip_bias_add:
+        return False
+    method = layer.quant_method
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and not method.block_quant
+        and not method.use_marlin
+        and not method.use_mxfp8
+    )
+
+
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -219,6 +257,9 @@ class Qwen2MoeMLP(nn.Module):
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
+        # Tri-state: None = not probed yet (the quant method's post-load state
+        # is not final at construction time), then True/False.
+        self._gateup_fused_ok = None
 
     def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
@@ -246,10 +287,39 @@ class Qwen2MoeMLP(nn.Module):
         y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
         return y_fp4, y_sf
 
+    def _gateup_silu_fused(self, x: torch.Tensor):
+        """silu(gate) * up in the gate_up GEMV, or None if this call cannot use it."""
+        if not (
+            _SHARED_GATEUP_FUSED
+            and not self._enable_silu_fp4_quant_fusion
+            and isinstance(x, torch.Tensor)
+        ):
+            return None
+        if self._gateup_fused_ok is None:
+            self._gateup_fused_ok = _gateup_fused_layer_ok(self.gate_up_proj)
+        if not self._gateup_fused_ok:
+            return None
+        from sglang.srt.layers.quantization.w8a16_gemv import (
+            w8a16_gemv_silu_mul,
+            w8a16_gemv_silu_mul_supported,
+        )
+
+        # Fp8LinearMethod keeps the [K, N] transposed view on the layer; .t() is
+        # the [N, K]-contiguous weight the GEMV wants.
+        w = self.gate_up_proj.weight.t()
+        scale = self.gate_up_proj.weight_scale
+        if not w8a16_gemv_silu_mul_supported(x, w, scale, _SHARED_GATEUP_FUSED_MAX_M):
+            return None
+        return w8a16_gemv_silu_mul(x, w, scale)
+
     def forward(
         self,
         x,
     ):
+        fused = self._gateup_silu_fused(x)
+        if fused is not None:
+            out, _ = self.down_proj(fused)
+            return out
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))

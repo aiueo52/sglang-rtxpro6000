@@ -25,6 +25,13 @@ far slower at M=16. See bench/hc_mix2 for the numbers.
 
 A CTA's whole column range must lie inside one branch, hence the
 ``hs % (BLOCK_K * BLOCK_G) == 0`` requirement: one ``inv_rms`` per row suffices.
+
+The two mix weights (6.5 MB each in bf16) are the whole cost of K1 and K2 at
+decode widths, so they can be carried as fp8 e4m3 with one fp32 scale per output
+row (``quantize_hc_mix2_weights_fp8``); K1 scales its fp32 partial by the per-n
+scale before the atomic add and K2 scales the finished accumulator by the per-j
+scale, both exact w.r.t. the split. ``SGLANG_HC_MIX2_FP8=1`` turns it on in
+``GatedResidual``; ``normed`` is unaffected (bit-identical) either way.
 """
 
 from __future__ import annotations
@@ -62,30 +69,60 @@ class HCMix2Config(msgspec.Struct, frozen=True):
     stats_warps: int = 8
 
 
-def _env_config() -> HCMix2Config:
-    def _int(name: str, default: int) -> int:
-        return int(os.environ.get(name, str(default)))
+# FP8 (e4m3) weights halve the bytes each K1/K2 tile streams, so the geometry
+# that was bandwidth-optimal for bf16 is not optimal here. Swept with
+# bench/hc_mix2/bench_hc_mix2_fp8.py --sweep down/up (CUPTI medians, 82 weight
+# copies = 512 MB working set, RTX PRO 6000 Blackwell Max-Q):
+#
+#   K1  bf16 default tile (16,128,2,w8,s2) on fp8 weights   5.31 us
+#       [64, 128] x 4 k-groups, 8 warps, 4 stages           3.81 us   <- pinned
+#   K2  the bf16 tile is still the winner (16, 64, w4, s4)  4.64 us
+#
+# The wide n block is what fp8 buys: the same 2 KB tile now spans 64 lowrank
+# columns instead of 16, so K1 needs a quarter of the CTAs and each one keeps
+# four k-chunks in flight.
+_FP8_BASE = HCMix2Config(
+    block_n=64,
+    block_k=128,
+    block_g=4,
+    down_warps=8,
+    down_stages=4,
+    block_j=16,
+    block_r=64,
+    up_warps=4,
+    up_stages=4,
+)
 
-    default = HCMix2Config()
+
+def _env_config(
+    default: HCMix2Config | None = None, prefix: str = "SGLANG_HC_MIX2_"
+) -> HCMix2Config:
+    def _int(name: str, value: int) -> int:
+        return int(os.environ.get(prefix + name, str(value)))
+
+    if default is None:
+        default = HCMix2Config()
     return HCMix2Config(
-        block_n=_int("SGLANG_HC_MIX2_BLOCK_N", default.block_n),
-        block_k=_int("SGLANG_HC_MIX2_BLOCK_K", default.block_k),
-        block_g=_int("SGLANG_HC_MIX2_BLOCK_G", default.block_g),
-        block_s=_int("SGLANG_HC_MIX2_BLOCK_S", default.block_s),
-        down_warps=_int("SGLANG_HC_MIX2_DOWN_WARPS", default.down_warps),
-        down_stages=_int("SGLANG_HC_MIX2_DOWN_STAGES", default.down_stages),
-        block_j=_int("SGLANG_HC_MIX2_BLOCK_J", default.block_j),
-        block_r=_int("SGLANG_HC_MIX2_BLOCK_R", default.block_r),
-        up_warps=_int("SGLANG_HC_MIX2_UP_WARPS", default.up_warps),
-        up_stages=_int("SGLANG_HC_MIX2_UP_STAGES", default.up_stages),
-        stats_mode=os.environ.get("SGLANG_HC_MIX2_STATS_MODE", default.stats_mode),
-        stats_block=_int("SGLANG_HC_MIX2_STATS_BLOCK", default.stats_block),
-        stats_warps=_int("SGLANG_HC_MIX2_STATS_WARPS", default.stats_warps),
+        block_n=_int("BLOCK_N", default.block_n),
+        block_k=_int("BLOCK_K", default.block_k),
+        block_g=_int("BLOCK_G", default.block_g),
+        block_s=_int("BLOCK_S", default.block_s),
+        down_warps=_int("DOWN_WARPS", default.down_warps),
+        down_stages=_int("DOWN_STAGES", default.down_stages),
+        block_j=_int("BLOCK_J", default.block_j),
+        block_r=_int("BLOCK_R", default.block_r),
+        up_warps=_int("UP_WARPS", default.up_warps),
+        up_stages=_int("UP_STAGES", default.up_stages),
+        stats_mode=os.environ.get(prefix + "STATS_MODE", default.stats_mode),
+        stats_block=_int("STATS_BLOCK", default.stats_block),
+        stats_warps=_int("STATS_WARPS", default.stats_warps),
     )
 
 
 _DEFAULT_CONFIG = _env_config()
-
+# `SGLANG_HC_MIX2_FP8_BLOCK_N` etc. override the fp8 geometry only; the bare
+# `SGLANG_HC_MIX2_FP8` flag (read in hyperconnection.py) turns the path on.
+_DEFAULT_CONFIG_FP8 = _env_config(_FP8_BASE, "SGLANG_HC_MIX2_FP8_")
 
 @triton.jit
 def _hc_branch_stats_kernel(
@@ -165,6 +202,7 @@ def _hc_down_kernel(
     inv_rms_ptr,
     normed_ptr,
     t_raw_ptr,
+    s_down_ptr,
     num_rows,
     K,
     HS,
@@ -179,6 +217,7 @@ def _hc_down_kernel(
     NUM_STAGES: tl.constexpr,
     REDUNDANT_STATS: tl.constexpr,
     READ_NORMED: tl.constexpr,
+    W_FP8: tl.constexpr,
 ):
     kg = tl.program_id(0)
     nb = tl.program_id(1)
@@ -236,7 +275,14 @@ def _hc_down_kernel(
         w_down = tl.load(
             w_down_ptr + n[:, None] * K + k[None, :], mask=mask_n[:, None], other=0.0
         )
-        acc = tl.dot(normed, tl.trans(w_down), acc)
+        if W_FP8:
+            acc = tl.dot(normed, tl.trans(w_down.to(tl.bfloat16)), acc)
+        else:
+            acc = tl.dot(normed, tl.trans(w_down), acc)
+    if W_FP8:
+        # One fp32 scale per output row n. The split-K partials are summed with
+        # atomics, and scaling is linear, so applying it here is exact.
+        acc = acc * tl.load(s_down_ptr + n, mask=mask_n, other=0.0)[None, :]
     tl.atomic_add(
         t_raw_ptr + offs_m[:, None] * LOWRANK + n[None, :],
         acc,
@@ -252,6 +298,7 @@ def _hc_up_kernel(
     w_up_ptr,
     t_raw_ptr,
     out_ptr,
+    s_up_ptr,
     num_rows,
     K,
     HS,
@@ -262,6 +309,7 @@ def _hc_up_kernel(
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
     NUM_STAGES: tl.constexpr,
+    W_FP8: tl.constexpr,
 ):
     jb = tl.program_id(0)
     offs_m = tl.arange(0, ROWS)
@@ -292,8 +340,16 @@ def _hc_up_kernel(
             mask=mask_cj[:, None] & mask_r[None, :],
             other=0.0,
         )
-        acc = tl.dot(t, tl.trans(w), acc)
+        if W_FP8:
+            acc = tl.dot(t, tl.trans(w.to(tl.bfloat16)), acc)
+        else:
+            acc = tl.dot(t, tl.trans(w), acc)
 
+    if W_FP8:
+        # One fp32 scale per output column (the flattened c*HS + j row of w_up);
+        # the whole r reduction for that column lives in this CTA, so scaling the
+        # finished accumulator is exact.
+        acc = acc * tl.load(s_up_ptr + cj, mask=mask_cj, other=0.0)[None, :]
     gate = tl.sigmoid(tl.reshape(acc, (ROWS, HC, BLOCK_J)))
     xg = tl.load(
         normed_ptr
@@ -311,6 +367,34 @@ def _hc_up_kernel(
     )
 
 
+def quantize_hc_mix2_weights_fp8(
+    w_down: torch.Tensor, w_up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-output-row FP8 E4M3 quantization of the mix2 weights.
+
+    Mirrors ``hc_mix_triton.quantize_hc_mix_weights_fp8`` but takes ``w_up`` in
+    the natural ``[hc * hs, lowrank]`` nn.Linear layout the three-kernel path
+    reads (no permute/pad). Returns ``(w_down_fp8[320, K], s_down[320],
+    w_up_fp8[K, 320], s_up[K])`` with fp32 scales.
+    """
+
+    def _q(w: torch.Tensor):
+        wf = w.float()
+        amax = wf.abs().amax(dim=1).clamp(min=1e-12)
+        scale = amax / 448.0
+        q = (wf / scale[:, None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return q.contiguous(), scale.contiguous()
+
+    wd, sd = _q(w_down)
+    wu, su = _q(w_up)
+    return wd, sd, wu, su
+
+
+def dequantize_hc_mix2_weight(w_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """bf16 view of an fp8 mix2 weight (for the prefill / fallback GEMM paths)."""
+    return (w_fp8.float() * scale[:, None]).to(torch.bfloat16)
+
+
 def hc_norm_mix2_supported(
     hyper_input: torch.Tensor,
     norm_w: torch.Tensor,
@@ -318,8 +402,14 @@ def hc_norm_mix2_supported(
     w_up: torch.Tensor,
     hc: int,
     hs: int,
-    config: HCMix2Config = _DEFAULT_CONFIG,
+    config: HCMix2Config | None = None,
 ) -> bool:
+    if config is None:
+        config = (
+            _DEFAULT_CONFIG_FP8
+            if w_down.dtype == torch.float8_e4m3fn
+            else _DEFAULT_CONFIG
+        )
     if not (
         hyper_input.is_cuda
         and hyper_input.dim() == 2
@@ -331,12 +421,24 @@ def hc_norm_mix2_supported(
         and w_down.shape[0] % config.block_n == 0
     ):
         return False
+    if not (
+        norm_w.is_cuda
+        and norm_w.device == hyper_input.device
+        and norm_w.dtype == torch.bfloat16
+        and norm_w.is_contiguous()
+    ):
+        return False
+    # The mix weights are either both bf16 or both fp8 e4m3 (weight-only, with
+    # per-output-row fp32 scales supplied by the caller).
+    w_dtype = w_down.dtype
+    if w_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        return False
     return all(
         w.is_cuda
         and w.device == hyper_input.device
-        and w.dtype == torch.bfloat16
+        and w.dtype == w_dtype
         and w.is_contiguous()
-        for w in (norm_w, w_down, w_up)
+        for w in (w_down, w_up)
     )
 
 
@@ -348,14 +450,32 @@ def hc_norm_mix2(
     w_up: torch.Tensor,
     hc: int,
     hs: int,
-    config: HCMix2Config = _DEFAULT_CONFIG,
+    config: HCMix2Config | None = None,
+    s_down: torch.Tensor | None = None,
+    s_up: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-branch Gemma RMSNorm followed by the gated low-rank mix.
 
     Returns ``(mixed[M, hs], normed[M, hc * hs])`` in the input dtype. ``t_raw``
     is accumulated with device-scope atomics, so the summation order of the
     down projection is not reproducible across launches.
+
+    ``w_down``/``w_up`` may be fp8 e4m3 (weight-only), in which case ``s_down``
+    (one fp32 scale per lowrank row) and ``s_up`` (one per hc*hs row) are
+    required; ``normed`` is bit-identical to the bf16 path either way.
     """
+    w_fp8 = w_down.dtype == torch.float8_e4m3fn
+    if config is None:
+        config = _DEFAULT_CONFIG_FP8 if w_fp8 else _DEFAULT_CONFIG
+    if w_fp8:
+        assert s_down is not None and s_up is not None
+        assert w_up.dtype == torch.float8_e4m3fn
+    else:
+        # W_FP8 is a constexpr, so the scale loads are not even traced on the
+        # bf16 path; pass the weights themselves rather than allocating a dummy
+        # buffer here (an allocation inside a CUDA-graph capture would come from
+        # the graph's private pool).
+        s_down, s_up = w_down, w_up
     rows, k = hyper_input.shape
     lowrank = w_down.shape[0]
     device = hyper_input.device
@@ -402,6 +522,7 @@ def hc_norm_mix2(
         inv_rms,
         normed,
         t_raw,
+        s_down,
         rows,
         k,
         hs,
@@ -416,6 +537,7 @@ def hc_norm_mix2(
         NUM_STAGES=config.down_stages,
         REDUNDANT_STATS=redundant_stats,
         READ_NORMED=read_normed,
+        W_FP8=w_fp8,
         num_warps=config.down_warps,
     )
 
@@ -424,6 +546,7 @@ def hc_norm_mix2(
         w_up,
         t_raw,
         mixed,
+        s_up,
         rows,
         k,
         hs,
@@ -434,6 +557,7 @@ def hc_norm_mix2(
         BLOCK_J=config.block_j,
         BLOCK_R=config.block_r,
         NUM_STAGES=config.up_stages,
+        W_FP8=w_fp8,
         num_warps=config.up_warps,
     )
     return mixed, normed
