@@ -959,6 +959,49 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
+    def _w8a16_gemv_ok(self, layer: torch.nn.Module, x: torch.Tensor) -> bool:
+        """Whether `apply` would route this call through the W8A16 Triton GEMV."""
+        return (
+            _W8A16_GEMV_ENABLED
+            and not self.use_marlin
+            and not self.block_quant
+            and not self.use_mxfp8
+            and x.dim() == 2
+            and x.shape[0] <= _W8A16_GEMV_MAX_M
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and layer.weight_scale.numel() == layer.weight.shape[1]
+        )
+
+    def apply_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """`apply` writing straight into `out`, or None when that is not possible.
+
+        Only the W8A16 GEMV path can do this; every other backend allocates its
+        own output, so the caller must fall back to `apply` when this returns
+        None. `out` may be fp32 (the shared next-token logits buffer) — the GEMV
+        still rounds its fp32 accumulator to bf16 first, so the values are
+        bit-identical to `apply` followed by `out.copy_(...)`.
+        """
+        if bias is not None or not self._w8a16_gemv_ok(layer, x):
+            return None
+        from sglang.srt.layers.quantization.w8a16_gemv import w8a16_gemv
+
+        w = layer.weight.t()
+        if (
+            tuple(out.shape) != (x.shape[0], w.shape[0])
+            or out.dtype not in (torch.bfloat16, torch.float32)
+            or out.device != x.device
+            or out.stride(1) != 1
+        ):
+            return None
+        return w8a16_gemv(x, w, layer.weight_scale, out=out)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -979,16 +1022,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # Weight-only FP8 (W8A16) Triton GEMV for skinny decode/verify shapes.
         # Opt-in via SGLANG_FP8_W8A16_GEMV=1; requires the per-channel cutlass
         # weight layout (weight stored transposed [K, N], weight_scale [N, 1]).
-        if (
-            _W8A16_GEMV_ENABLED
-            and not self.block_quant
-            and not self.use_mxfp8
-            and x.dim() == 2
-            and x.shape[0] <= _W8A16_GEMV_MAX_M
-            and x.dtype == torch.bfloat16
-            and layer.weight.dtype == torch.float8_e4m3fn
-            and layer.weight_scale.numel() == layer.weight.shape[1]
-        ):
+        if self._w8a16_gemv_ok(layer, x):
             from sglang.srt.layers.quantization.w8a16_gemv import w8a16_gemv
 
             y = w8a16_gemv(x, layer.weight.t(), layer.weight_scale)

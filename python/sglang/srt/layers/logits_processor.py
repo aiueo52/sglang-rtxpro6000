@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -65,6 +66,12 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+
+# Let the lm_head GEMV write straight into the shared next-token logits buffer
+# instead of producing a bf16 result that `_copy_logits_to_buffer` then widens
+# with a separate elementwise kernel (14 launches / ~38 us per W16 decode step).
+# Bit-identical: the GEMV still rounds its fp32 accumulator to bf16 first.
+_DRAFT_LOGITS_OUT = os.environ.get("SGLANG_DRAFT_LOGITS_OUT", "0") == "1"
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -669,7 +676,14 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        logits = self._compute_lm_head(
+            hidden_states,
+            lm_head,
+            embedding_bias,
+            out=self._direct_logits_buffer(
+                logits_metadata, embedding_bias, use_logits_buffer
+            ),
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -705,17 +719,58 @@ class LogitsProcessor(nn.Module):
 
         return logits
 
+    def _direct_logits_buffer(
+        self,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor],
+        use_logits_buffer: bool,
+    ) -> Optional[torch.Tensor]:
+        """The next-token logits buffer, iff the lm_head may write it directly.
+
+        Only valid when every step `_get_logits` performs between the lm_head and
+        `_copy_logits_to_buffer` is a no-op for this batch, because writing the
+        buffer up front skips them all:
+          * `logit_scale` would scale in fp32 instead of bf16,
+          * the TP gather / DP scatter replace the tensor entirely,
+          * `_copy_logits_to_buffer` narrows a too-wide head to `vocab_size`.
+        `final_logit_softcapping` is unaffected: it already ran in place on the
+        buffer.
+        """
+        if not (_DRAFT_LOGITS_OUT and use_logits_buffer):
+            return None
+        buf = logits_metadata.next_token_logits_buffer
+        if buf is None or embedding_bias is not None:
+            return None
+        if (
+            self.logit_scale is not None
+            or self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            return None
+        if buf.dim() != 2 or buf.dtype != torch.float32 or buf.stride(1) != 1:
+            return None
+        if buf.shape[1] > self.vocab_size:
+            return None
+        return buf
+
     def _compute_lm_head(
         self,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
         elif should_apply_lm_head_quant_method(lm_head, quant_method):
+            if out is not None:
+                apply_into = getattr(quant_method, "apply_into", None)
+                if apply_into is not None:
+                    written = apply_into(lm_head, hidden_states, out, embedding_bias)
+                    if written is not None:
+                        return written
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
@@ -879,6 +934,10 @@ class LogitsProcessor(nn.Module):
         use_buffer: bool = True,
     ) -> torch.Tensor:
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
+        if logits_buffer is not None and logits is logits_buffer:
+            # The lm_head GEMV wrote the buffer directly (see
+            # `_direct_logits_buffer`); the copy would be a self-copy.
+            return logits
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
         logits_width = logits.shape[-1]

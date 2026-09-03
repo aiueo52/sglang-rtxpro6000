@@ -27,6 +27,7 @@ that holds for the decode path, which issues every linear on one stream.
 """
 
 import functools
+from typing import Optional
 
 import torch
 import triton
@@ -112,7 +113,14 @@ def _w8a16_gemv_kernel(
         else:
             acc = acc * tl.load(s_ptr)
         y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
-        tl.store(y_ptrs, acc.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+        # Round to bf16 first even when `y` is fp32: an fp32 destination is only
+        # ever the shared logits buffer, whose old contents were a bf16 result
+        # widened by `.copy_()`. Rounding here keeps that bit-identical.
+        tl.store(
+            y_ptrs,
+            acc.to(tl.bfloat16).to(y_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & n_mask[None, :],
+        )
         return
 
     # Split-K fixup, in this same launch. `.cg` keeps the partials out of the
@@ -131,7 +139,11 @@ def _w8a16_gemv_kernel(
         else:
             tot = tot * tl.load(s_ptr)
         y_ptrs = y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn
-        tl.store(y_ptrs, tot.to(tl.bfloat16), mask=m_mask[:, None] & n_mask[None, :])
+        tl.store(
+            y_ptrs,
+            tot.to(tl.bfloat16).to(y_ptr.dtype.element_ty),
+            mask=m_mask[:, None] & n_mask[None, :],
+        )
         # Every increment for this N block has happened, so a plain store is enough to
         # leave the counter at 0 for the next launch / graph replay.
         tl.store(cnt_ptr + pid_n, 0)
@@ -332,12 +344,40 @@ def _launch(x, w, s, y, M, N, K, per_channel, cfg):
     return y
 
 
-def w8a16_gemv(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, cfg=None):
+def _out_or_new(out, M: int, N: int, device):
+    """Validate an optional destination, else allocate the usual bf16 one.
+
+    `out` may be fp32 (the shared next-token logits buffer): the kernel still
+    rounds the fp32 accumulator to bf16 before widening it, so writing straight
+    into that buffer is bit-identical to the bf16 result plus `buffer.copy_()`.
+    """
+    if out is None:
+        return torch.empty((M, N), dtype=torch.bfloat16, device=device)
+    if (
+        tuple(out.shape) != (M, N)
+        or out.dtype not in (torch.bfloat16, torch.float32)
+        or out.device != device
+        or out.stride(1) != 1
+    ):
+        raise ValueError(
+            f"w8a16 gemv out= must be a [{M}, {N}] row-contiguous bf16/fp32 CUDA "
+            f"tensor on {device}; got {tuple(out.shape)} {out.dtype} {out.device}"
+        )
+    return out
+
+
+def w8a16_gemv(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    cfg=None,
+    out: Optional[torch.Tensor] = None,
+):
     """x: [M,K] bf16; w: [N,K] fp8_e4m3 (any strides); scale: [N] or [N,1] or scalar fp32."""
     M, K = x.shape
     N = w.shape[0]
     assert w.shape[1] == K and M <= 16
-    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    y = _out_or_new(out, M, N, x.device)
     s = scale.reshape(-1)
     if s.dtype != torch.float32 or not s.is_contiguous():
         s = s.contiguous().float()
@@ -349,13 +389,15 @@ def w8a16_gemv(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, cfg=None):
 _ONES = {}
 
 
-def bf16_gemv(x: torch.Tensor, w: torch.Tensor, cfg=None):
+def bf16_gemv(
+    x: torch.Tensor, w: torch.Tensor, cfg=None, out: Optional[torch.Tensor] = None
+):
     """Skinny BF16 GEMM y = x @ w^T for tiny-N linears where cuBLAS picks a poor kernel.
     x: [M,K] bf16 (M<=16); w: [N,K] bf16."""
     M, K = x.shape
     N = w.shape[0]
     assert w.shape[1] == K and M <= 16
-    y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    y = _out_or_new(out, M, N, x.device)
     one = _ONES.get(x.device)
     if one is None:
         one = torch.ones(1, dtype=torch.float32, device=x.device)
