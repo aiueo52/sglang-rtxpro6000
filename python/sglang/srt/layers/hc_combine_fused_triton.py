@@ -76,7 +76,7 @@ def _hc_combine_fused_kernel(
     o_ptr,  # out               [M, HC*HS]
     part_ptr,  # fp32           [>= M*NPROG, HC]
     cnt_ptr,  # int32           [2]
-    num_ctas,
+    n_ctas,
     HC: tl.constexpr,
     HS: tl.constexpr,
     NPROG: tl.constexpr,
@@ -102,7 +102,7 @@ def _hc_combine_fused_kernel(
     # ---- grid barrier ----
     tl.debug_barrier()
     tl.atomic_add(cnt_ptr, 1, sem="acq_rel", scope="gpu")
-    while tl.atomic_add(cnt_ptr, 0, sem="acq_rel", scope="gpu") < num_ctas:
+    while tl.atomic_add(cnt_ptr, 0, sem="acq_rel", scope="gpu") < n_ctas:
         pass
 
     # ---- phase 2: reduce the gate dots and stream the chunk ----
@@ -125,7 +125,7 @@ def _hc_combine_fused_kernel(
 
     # ---- restore the counters for the next launch / graph replay ----
     ticket = tl.atomic_add(cnt_ptr + 1, 1, sem="acq_rel", scope="gpu")
-    if ticket == num_ctas - 1:
+    if ticket == n_ctas - 1:
         tl.store(cnt_ptr, 0)
         tl.store(cnt_ptr + 1, 0)
 
@@ -211,10 +211,10 @@ def hc_combine_fused(
             f"hc_combine_fused: no chunking fits rows={rows} row_size={row_size}"
         )
     nprog, blk, warps = plan
-    num_ctas = rows * nprog
+    n_ctas = rows * nprog
     partials, counters = _state(r.device, hc_count)
 
-    _hc_combine_fused_kernel[(num_ctas,)](
+    _hc_combine_fused_kernel[(n_ctas,)](
         y,
         r,
         n,
@@ -222,7 +222,7 @@ def hc_combine_fused(
         o,
         partials,
         counters,
-        num_ctas,
+        n_ctas,
         HC=hc_count,
         HS=hidden_size,
         NPROG=nprog,
