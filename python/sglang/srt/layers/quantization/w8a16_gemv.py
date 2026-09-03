@@ -193,7 +193,9 @@ _BY_SHAPE = {
     (1, False, 32768, 2560): (128, 256, 1, True, None, 8, 3),  # draft lm_head, 1.14x
     (1, False, 248320, 2560): (128, 256, 1, True, None, 8, 3),  # lm_head, 1.02x
     # bf16, bf16_gemv
-    (2, False, 96, 2560): (16, 256, 10, True, None, 2, 4),  # GDN in_proj_ba, 2.0-2.2x
+    # GDN in_proj_ba: the bench's split-K winner (16,256,10,...,2,4) measured 9.2us in the
+    # server vs 7.9us for this single-launch tile (2026-09-03 gemv3 trace), so keep it.
+    (2, False, 96, 2560): (32, 512, 1, True, None, 4, 3),
     (2, False, 512, 2560): (16, 128, 10, True, None, 2, 4),  # MoE router gate, 1.04x
     # The 2560x6144 out_proj/o_proj and the 13312x2560 attention qkv are absent at
     # M > 1 because _plan's fallback already emits the fastest tile measured for them.
@@ -202,6 +204,9 @@ _BY_SHAPE_M16 = {
     # The _BY_SHAPE gate_up tile loses 12% at M=16; the qkvz tile below loses 1% at M=4.
     (1, False, 1280, 2560): (16, 64, 10, True, None, 4, 3),  # shared gate_up, 1.03x
     (1, False, 16384, 2560): (64, 128, 1, True, None, 4, 3),  # GDN in_proj_qkvz, 1.04x
+    # attention qkv at M=16: both the wide (128,256,8w) tile and the (64,128) qkvz tile
+    # measured 27.5us in the server vs 25.6us for the narrow single-split tile; pin it.
+    (1, False, 13312, 2560): (32, 128, 1, True, None, 4, 3),
 }
 _BY_SHAPE_M1 = {
     # USE_DOT False (the broadcast path, M_PAD 1) is only legal at M == 1.
