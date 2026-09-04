@@ -4,7 +4,7 @@ import copy
 import os
 import logging
 from contextlib import ExitStack
-from typing import Optional
+from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -20,14 +20,76 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
 from sglang.srt.models.qwen4_exp import Qwen4ExpModel
-from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.runtime_context import get_model, get_parallel, get_spec
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
 # Route the MTP entry projections through the tuned skinny BF16 GEMV at
 # decode sizes (SGLANG_MTP_FC_GEMV=1).
 _MTP_FC_GEMV = os.environ.get("SGLANG_MTP_FC_GEMV", "0") == "1"
+
+
+def _draft_vocab_weights_are_shared() -> bool:
+    """Whether this draft will be handed the target's embedding / lm_head.
+
+    Under EAGLE/NEXTN the worker replaces both tensors before the first forward
+    (eagle_worker_v2.init_lm_head -> set_embed_and_head), and the Qwen4-Exp
+    checkpoint ships no `mtp.embed_tokens` / `mtp.shared_head.head` rows, so
+    the draft's own [vocab, hidden] pair is start-up peak for nothing. The
+    speculative-algorithm check keeps a standalone load of this architecture
+    (no draft worker to fill the tensors in) on the full-size path.
+    """
+    if not envs.SGLANG_DRAFT_SKIP_VOCAB_WEIGHTS.get():
+        return False
+    return get_spec().speculative_algorithm is not None
+
+
+def _build_with_placeholder_vocab_weight(build: Callable[[], nn.Module]) -> nn.Module:
+    """Build a vocab-sized module without materialising its [vocab, hidden] table.
+
+    Construction runs on the meta device, so the layout metadata (shard
+    indices, num_embeddings, quant method) is real while the table costs
+    nothing; the module then gets a 1-row placeholder on the ambient device
+    for `set_embed_and_head` to `del` and replace.
+    """
+    with torch.device("meta"):
+        module = build()
+    meta_weight = module.weight
+    placeholder = nn.Parameter(
+        torch.empty(1, meta_weight.shape[1], dtype=meta_weight.dtype),
+        requires_grad=False,
+    )
+    set_weight_attrs(
+        placeholder,
+        {"input_dim": 1, "output_dim": 0, "weight_loader": module.weight_loader},
+    )
+    module.register_parameter("weight", placeholder)
+    return module
+
+
+def _is_draft_vocab_weight(name: str) -> bool:
+    """Checkpoint tensors that would target a placeholder (see above)."""
+    if "mtp" not in name:
+        return False
+    return (
+        name.endswith("embed_tokens.weight")
+        or name.endswith("lm_head.weight")
+        or "shared_head.head" in name
+    )
+
+
+class _Qwen4ExpDraftModel(Qwen4ExpModel):
+    """Draft backbone whose input embedding is a placeholder.
+
+    Only used when the target's table will be shared in; see
+    `_draft_vocab_weights_are_shared`.
+    """
+
+    def _build_embed_tokens(self, config) -> nn.Module:
+        return _build_with_placeholder_vocab_weight(
+            lambda: super(_Qwen4ExpDraftModel, self)._build_embed_tokens(config)
+        )
 
 
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
@@ -60,20 +122,45 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         self.hc_count = config.hc_count
         self._mtp_input_fusion = self._init_mtp_input_fusion(config)
 
-        self.model = Qwen4ExpModel(
+        self.skip_vocab_weights = _draft_vocab_weights_are_shared()
+        model_cls = _Qwen4ExpDraftModel if self.skip_vocab_weights else Qwen4ExpModel
+        self.model = model_cls(
             config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
-        )
+
+        def build_lm_head() -> nn.Module:
+            return ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_parallel().config.enable_dp_lm_head,
+            )
+
+        if self.skip_vocab_weights:
+            self.lm_head = _build_with_placeholder_vocab_weight(build_lm_head)
+            logger.info(
+                "MTP draft embed_tokens / lm_head are placeholders; the target's "
+                "tensors are shared in later (saved %.2f GB at load)",
+                2 * config.vocab_size * config.hidden_size * 2 / (1 << 30),
+            )
+        else:
+            self.lm_head = build_lm_head()
         self.logits_processor = LogitsProcessor(config)
+
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
+    ):
+        if self.skip_vocab_weights:
+            weights = (
+                (name, weight)
+                for name, weight in weights
+                if not _is_draft_vocab_weight(name)
+            )
+        return super().load_weights(weights, is_mtp)
 
     def _init_pre_fc_norms(self, config: PretrainedConfig) -> None:
         self.pre_fc_norm_embedding = GemmaRMSNorm(

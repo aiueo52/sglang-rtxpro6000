@@ -1188,6 +1188,14 @@ class Envs:
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+    # Build the MTP draft's embed_tokens / lm_head as 1-row placeholders. The
+    # EAGLE/NEXTN worker overwrites both with the target's tensors before the
+    # first forward (eagle_worker_v2.init_lm_head), so the draft's own
+    # [vocab, hidden] pair only raises the start-up peak. Off by default: the
+    # freed bytes are inside the mem_fraction_static budget, so the KV pool
+    # grows to claim them and a deployment tuned against the old (wasteful)
+    # footprint loses that much runtime headroom.
+    SGLANG_DRAFT_SKIP_VOCAB_WEIGHTS = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
