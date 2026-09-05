@@ -1017,6 +1017,53 @@ class Fp8LinearMethod(LinearMethodBase):
             return None
         return w8a16_gemv(x, w, layer.weight_scale, out=out)
 
+    def apply_norm_gated(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        norm_weight: torch.Tensor,
+        group_size: int,
+        eps: float,
+        sigmoid_gate: bool = False,
+        bias: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """`apply` with a gated RMSNorm over `x` folded into the GEMV's A-load.
+
+        Computes ``apply(layer, rms_norm_gated(x, z))`` -- each contiguous
+        ``group_size`` slice of an `x` row is one RMS group, normalised,
+        scaled by `norm_weight`, multiplied by ``silu(z)`` (or ``sigmoid(z)``)
+        and rounded to bf16, exactly as the standalone layer-norm kernel does,
+        before the same k-loop consumes it. Returns None when this call cannot
+        take the GEMV path, and the caller must then normalise separately.
+
+        Numerics: the fp32 sum of squares is summed in the GEMV tile's thread
+        layout rather than the norm kernel's, so the pre-round value can differ
+        in the last fp32 bit; after the bf16 round the result is within 1 ulp.
+        """
+        if bias is not None or not self._w8a16_gemv_ok(layer, x):
+            return None
+        from sglang.srt.layers.quantization.w8a16_gemv import (
+            w8a16_gemv_norm_gated,
+            w8a16_gemv_norm_gated_supported,
+        )
+
+        w = layer.weight.t()
+        if not w8a16_gemv_norm_gated_supported(
+            x, w, layer.weight_scale, z, norm_weight, group_size
+        ):
+            return None
+        return w8a16_gemv_norm_gated(
+            x,
+            w,
+            layer.weight_scale,
+            z,
+            norm_weight,
+            group_size,
+            eps,
+            sigmoid_gate,
+        )
+
     def apply_into_split(
         self,
         layer: torch.nn.Module,

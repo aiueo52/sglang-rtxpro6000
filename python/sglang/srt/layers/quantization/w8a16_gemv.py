@@ -130,6 +130,8 @@ def _w8a16_gemv_kernel(
     y2_ptr,
     ws_ptr,
     cnt_ptr,
+    z_ptr,
+    nw_ptr,
     M,
     N,
     K,
@@ -140,6 +142,8 @@ def _w8a16_gemv_kernel(
     stride_ym,
     stride_yn,
     stride_y2m,
+    stride_zm,
+    norm_eps,
     SPLIT_N: tl.constexpr,
     PER_CHANNEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -151,6 +155,8 @@ def _w8a16_gemv_kernel(
     USE_DOT: tl.constexpr,
     USE_PDL: tl.constexpr = False,
     SEG_NB0: tl.constexpr = 0,
+    NORM_G: tl.constexpr = 0,
+    NORM_SIGMOID: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -169,6 +175,11 @@ def _w8a16_gemv_kernel(
     offs_k = tl.arange(0, BLOCK_K)
     n_mask = offs_n < n_hi
     m_mask = offs_m < M
+    if NORM_G > 0:
+        # Gated RMSNorm folded into the A-load; the group is exactly one
+        # BLOCK_K tile (asserted by the planner), so the row statistics are
+        # local to the tile and nothing extra is read for them.
+        norm_w = tl.load(nw_ptr + offs_k).to(tl.float32)
     # x comes from the previous kernel; the weight/scale loads below are all
     # inside the reduction loop, so the wait sits at the top and what PDL buys
     # here is the block-scheduling ramp overlapping the previous kernel's drain.
@@ -198,6 +209,23 @@ def _w8a16_gemv_kernel(
                 x = tl.load(xp, mask=m_mask[:, None], other=0.0)
             else:
                 x = tl.load(xp, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            if NORM_G > 0:
+                zp = z_ptr + offs_m[:, None] * stride_zm + kk[None, :] * stride_xk
+                if EVEN_K:
+                    zt = tl.load(zp, mask=m_mask[:, None], other=0.0).to(tl.float32)
+                else:
+                    zt = tl.load(
+                        zp, mask=m_mask[:, None] & k_mask[None, :], other=0.0
+                    ).to(tl.float32)
+                xf = x.to(tl.float32)
+                var = tl.sum(xf * xf, axis=1) / NORM_G
+                rstd = tl.rsqrt(var + norm_eps)
+                yn = xf * rstd[:, None] * norm_w[None, :]
+                if NORM_SIGMOID:
+                    yn = yn * tl.sigmoid(zt)
+                else:
+                    yn = yn * (zt * tl.sigmoid(zt))
+                x = yn.to(tl.bfloat16)
             if W_KN:
                 acc += tl.dot(x, w.to(tl.bfloat16), out_dtype=tl.float32)
             else:
@@ -208,6 +236,20 @@ def _w8a16_gemv_kernel(
                 xv = tl.load(x_ptr + kk * stride_xk).to(tl.float32)
             else:
                 xv = tl.load(x_ptr + kk * stride_xk, mask=k_mask, other=0.0).to(tl.float32)
+            if NORM_G > 0:
+                if EVEN_K:
+                    zv = tl.load(z_ptr + kk * stride_xk).to(tl.float32)
+                else:
+                    zv = tl.load(z_ptr + kk * stride_xk, mask=k_mask, other=0.0).to(
+                        tl.float32
+                    )
+                rstd1 = tl.rsqrt(tl.sum(xv * xv, axis=0) / NORM_G + norm_eps)
+                yv = xv * rstd1 * norm_w
+                if NORM_SIGMOID:
+                    yv = yv * tl.sigmoid(zv)
+                else:
+                    yv = yv * (zv * tl.sigmoid(zv))
+                xv = yv.to(tl.bfloat16).to(tl.float32)
             if W_KN:
                 acc += tl.sum(w.to(tl.float32) * xv[:, None], axis=0)[None, :]
             else:
@@ -484,7 +526,7 @@ def _fit(M: int, N: int, cfg, n_blocks: Optional[int] = None):
     return cfg
 
 
-def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0):
+def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0, norm=None):
     block_n, block_k, splits, use_dot, w_kn, num_warps, num_stages = cfg
     use_dot = use_dot or M > 1
     m_pad = 16 if use_dot else 1
@@ -501,6 +543,9 @@ def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0):
             nb <= _WS_COUNTERS and nb * splits * m_pad * block_n <= _WS_FLOATS
         ):
             seg_nb0, n_blocks = nb0, nb
+    z, nw, norm_g, norm_eps, norm_sigmoid = (x, x, 0, 0.0, False)
+    if norm is not None:
+        z, nw, norm_g, norm_eps, norm_sigmoid = norm
     _w8a16_gemv_kernel[(n_blocks, splits)](
         x,
         w,
@@ -509,6 +554,8 @@ def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0):
         y if y2 is None else y2,
         ws,
         cnt,
+        z,
+        nw,
         M,
         N,
         K,
@@ -519,6 +566,8 @@ def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0):
         y.stride(0),
         y.stride(1),
         y.stride(0) if y2 is None else y2.stride(0),
+        z.stride(0),
+        norm_eps,
         SPLIT_N=split_n,
         PER_CHANNEL=per_channel,
         BLOCK_N=block_n,
@@ -530,6 +579,8 @@ def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0):
         USE_DOT=use_dot,
         USE_PDL=PDL,
         SEG_NB0=seg_nb0,
+        NORM_G=norm_g,
+        NORM_SIGMOID=norm_sigmoid,
         launch_pdl=PDL,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -605,6 +656,145 @@ def w8a16_gemv(
         cfg = _plan(M, N, K, w.stride(0) == 1, w.element_size(), _num_sms(x.device))
     _launch(x, w, s, y, M, N, K, s.numel() > 1, cfg, y2, split_n)
     return y if y2 is None else (y, y2)
+
+
+# ---------------------------------------------------------------------------
+# Fused gated-RMSNorm prologue (SGLANG_NORM_INTO_GEMV=1)
+#
+# The GDN block normalises its attention output per (token, v-head) --
+# `RMSNormGated(head_v_dim, norm_before_gate=True)`, i.e.
+# `y = x * rsqrt(mean(x^2) + eps) * w * silu(z)` -- and immediately feeds the
+# [tokens, num_v_heads * head_v_dim] result to the out_proj GEMV. That norm is
+# 192 one-warp CTAs moving ~150 KB: pure launch + ramp, ~1.9 us, 36 times per
+# verify step.
+#
+# The GEMV already re-reads the whole A row once per n block, and with
+# BLOCK_K == head_v_dim each A tile is exactly one norm group, so the row
+# statistics can be recomputed inside the tile from registers. The only extra
+# traffic is the `z` tile (same size as the A tile, L2-resident at these
+# widths) and the [head_v_dim] norm weight.
+#
+# Numerics: the fp32 sum of squares is re-associated (the GEMV tile has a
+# different thread layout from the norm kernel's), so the result is within
+# 1 ulp of bf16 rather than bit-identical -- everything else (fp32 math, the
+# `silu` form, the bf16 rounding before the dot) is reproduced exactly.
+# ---------------------------------------------------------------------------
+
+NORM_INTO_GEMV = _env_flag("SGLANG_NORM_INTO_GEMV")
+
+
+# Tiles for the fused-norm variant, keyed (M bucket, N, K, group size). A CTA
+# recomputes the norm for its k slice once per n block, so the right geometry is
+# NOT the plain one: halving the n-block count (BLOCK_N 32 -> 64) halves that
+# redundancy, and the split count comes down with it to keep ~2 CTAs/SM.
+# Measured with bench/h1/h1_check.py sweep (CUPTI medians, 4x-L2 working set,
+# RTX PRO 6000 Blackwell Max-Q); "plain" is the unfused GEMV on the server plan
+# plus the standalone `_layer_norm_fwd_1pass_kernel`.
+#
+#   M    plain gemv + norm      fused (64, 128, 4, 8w)
+#    4   12.54 + 1.31 = 13.85   13.44   (-0.41)
+#   16   12.74 + 1.50 = 14.24   14.08   (-0.16)
+_FUSED_NORM_BY_SHAPE = {
+    (4, 2560, 6144, 128): (64, 128, 4, True, None, 8, 4),
+    (16, 2560, 6144, 128): (64, 128, 4, True, None, 8, 3),
+}
+
+
+@functools.lru_cache(maxsize=128)
+def _norm_plan(M: int, N: int, K: int, G: int, w_bytes: int, sms: int):
+    """A plan for the fused-norm GEMV: same as `_plan` but with BLOCK_K == G."""
+    tuned = _FUSED_NORM_BY_SHAPE.get((_m_bucket(M), N, K, G))
+    if tuned is not None:
+        return _fit(M, N, tuned)
+    block_n, block_k, splits, use_dot, w_kn, warps, stages = _plan(
+        M, N, K, False, w_bytes, sms
+    )
+    if block_k == G:
+        return (block_n, block_k, splits, use_dot, w_kn, warps, stages)
+    # Keep roughly the same CTA count when the tile gets narrower/wider in K.
+    n_kb = K // G
+    want = max(1, min(_MAX_SPLITS, n_kb, round(splits * block_k / G)))
+    divs = [d for d in range(1, min(n_kb, _MAX_SPLITS) + 1) if n_kb % d == 0]
+    splits = min(divs, key=lambda d: abs(d - want))
+    return _fit(M, N, (block_n, G, splits, use_dot, w_kn, warps, stages))
+
+
+def w8a16_gemv_norm_gated_supported(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    group_size: int,
+) -> bool:
+    """Whether this call can take the fused gated-RMSNorm + GEMV path."""
+    K = x.shape[-1] if x.dim() == 2 else -1
+    return bool(
+        NORM_INTO_GEMV
+        and x.is_cuda
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and z.dtype == torch.bfloat16
+        and 1 <= x.shape[0] <= 16
+        and tuple(z.shape) == tuple(x.shape)
+        and x.stride(1) == 1
+        and z.stride(1) == 1
+        and group_size > 0
+        and K % group_size == 0
+        and norm_weight.dtype in (torch.bfloat16, torch.float32)
+        and norm_weight.numel() == group_size
+        and norm_weight.is_contiguous()
+        and w.dim() == 2
+        and w.shape[1] == K
+        and w.stride(1) == 1
+        and scale.numel() == w.shape[0]
+    )
+
+
+def w8a16_gemv_norm_gated(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    scale: torch.Tensor,
+    z: torch.Tensor,
+    norm_weight: torch.Tensor,
+    group_size: int,
+    eps: float,
+    sigmoid_gate: bool = False,
+    out: Optional[torch.Tensor] = None,
+):
+    """`(gated_rms_norm(x, z) @ w^T) * scale` in one launch.
+
+    `x`/`z` are [M, K] bf16 with K a multiple of `group_size`; the norm treats
+    each contiguous `group_size` slice of a row as its own RMS group, exactly
+    as `RMSNormGated(group_size, norm_before_gate=True)` does on the
+    [M * K / group_size, group_size] reshape the model applies.
+    """
+    M, K = x.shape
+    N = w.shape[0]
+    assert w.shape[1] == K and M <= 16
+    y = _out_or_new(out, M, N, x.device)
+    s = scale.reshape(-1)
+    if s.dtype != torch.float32 or not s.is_contiguous():
+        s = s.contiguous().float()
+    # The kernel upcasts the norm weight itself, exactly as the standalone
+    # layer-norm kernel does, so pass it through untouched (no per-call cast
+    # kernel would otherwise get baked into the CUDA graph).
+    nw = norm_weight
+    cfg = _norm_plan(M, N, K, group_size, w.element_size(), _num_sms(x.device))
+    assert cfg[1] == group_size, "fused-norm GEMV needs BLOCK_K == group_size"
+    _launch(
+        x,
+        w,
+        s,
+        y,
+        M,
+        N,
+        K,
+        s.numel() > 1,
+        cfg,
+        norm=(z, nw, group_size, float(eps), bool(sigmoid_gate)),
+    )
+    return y
 
 
 def bf16_gemv(

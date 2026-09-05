@@ -30,6 +30,11 @@ _GDN_BA_TRITON_GEMV = _os.environ.get("SGLANG_GDN_BA_TRITON_GEMV", "0") == "1"
 # same GEMV, same accumulation order, same scales, same bf16 rounding.
 _GDN_PROJ_DIRECT_LAYOUT = _os.environ.get("SGLANG_GDN_PROJ_DIRECT_LAYOUT", "0") == "1"
 _GDN_AB_STASH_DIRECT = _os.environ.get("SGLANG_GDN_AB_STASH_DIRECT", "0") == "1"
+# H1-B: the GDN gated RMSNorm over the attention output is 192 one-warp CTAs
+# (~1.9 us) whose only consumer is the out_proj GEMV, which re-reads the same
+# rows anyway. Fold it into that GEMV's A-load; see
+# `Fp8LinearMethod.apply_norm_gated`.
+_NORM_INTO_GEMV = _os.environ.get("SGLANG_NORM_INTO_GEMV", "0") == "1"
 import torch.nn as nn
 import triton
 
@@ -1030,6 +1035,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
+        fused = self._norm_out_proj_fused(core_attn_out, z, z_shape_og)
+        if fused is not None:
+            return fused
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
@@ -1039,6 +1048,54 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _norm_out_proj_fused(self, core_attn_out, z, z_shape_og):
+        """out_proj with the gated RMSNorm folded into its A-load, or None.
+
+        `core_attn_out` / `z` arrive as [rows, head_v_dim] (the norm's own 2-D
+        view, `rows = tokens * num_v_heads`). The out_proj GEMV wants
+        [tokens, num_v_heads * head_v_dim]; since both tensors are row-major
+        and contiguous, that is the same bytes, and each contiguous
+        `head_v_dim` slice of a GEMV row is exactly one norm group.
+        """
+        if not (_NORM_INTO_GEMV and _is_cuda) or len(z_shape_og) != 3:
+            return None
+        apply_norm = getattr(self.out_proj.quant_method, "apply_norm_gated", None)
+        if apply_norm is None:
+            return None
+        g = self.head_v_dim
+        if (
+            self.out_proj.tp_size != 1
+            or getattr(self.out_proj, "use_decode_attn_tp", False)
+            or self.out_proj.bias is not None
+            or self.norm.group_size is not None
+            or not self.norm.norm_before_gate
+            or self.norm.bias is not None
+            or self.norm.weight.shape != (g,)
+            or core_attn_out.dim() != 2
+            or core_attn_out.shape[1] != g
+            or core_attn_out.shape != z.shape
+            or not core_attn_out.is_contiguous()
+            or not z.is_contiguous()
+        ):
+            return None
+        act = getattr(self.norm, "activation", "swish")
+        if act not in ("swish", "silu", "sigmoid"):
+            return None
+        tokens = z_shape_og[0]
+        k = z_shape_og[1] * z_shape_og[2]
+        if core_attn_out.shape[0] != tokens * z_shape_og[1]:
+            return None
+        out = apply_norm(
+            self.out_proj,
+            core_attn_out.view(tokens, k),
+            z.view(tokens, k),
+            self.norm.weight,
+            g,
+            self.norm.eps,
+            act == "sigmoid",
+        )
+        return out
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
