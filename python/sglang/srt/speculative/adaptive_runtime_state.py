@@ -18,6 +18,54 @@ if TYPE_CHECKING:
     )
 
 
+def init_cuda_graph_state_no_shrink(
+    attn_backend, max_bs: int, max_num_token: int
+) -> None:
+    """``init_cuda_graph_state`` that never shrinks an already-sized backend.
+
+    Adaptive speculative decoding (``--speculative-adaptive``) builds one
+    runtime state per candidate step count, each with its own draft-extend
+    graph runner.  For compressed-QSA draft models
+    ``DraftBackendFactory.create_draft_extend_backend()`` returns the draft
+    runner's *own* attention backend (draft_utils.py), so **every** state's
+    draft-extend runner shares one backend object.  ``init_cuda_graph_state``
+    reallocates that backend's metadata tensors (``_graph_seq_lens``,
+    ``_graph_compressed_page_table``, ...).  Re-running it for a smaller
+    candidate frees exactly the tensors the already-captured graphs of the
+    larger state baked in, so their next replay touches freed memory ->
+    ``illegal memory access``.
+
+    Sharing the (larger) tensors between states is safe: the metadata is
+    written immediately before each capture/replay and only one state is
+    active at a time -- the same argument ``share_input_buffer`` makes for the
+    forward input buffers.  So allocate only when the request does not already
+    fit.  For a non-adaptive server this runs exactly once and is a no-op
+    change.
+
+    A candidate *larger* than what is already allocated would still have to
+    reallocate (and would break the earlier graphs); ``AdaptiveController``
+    rejects such configs up front, and the assertion here documents the
+    invariant.
+    """
+    from sglang.srt.runtime_context import get_spec
+
+    if not get_spec().speculative_adaptive:
+        # Single runtime state: the backend is sized exactly once, so keep the
+        # upstream call (and do not stamp anything onto the backend).
+        attn_backend.init_cuda_graph_state(max_bs, max_num_token)
+        return
+    prev = getattr(attn_backend, "_spec_graph_state_extent", None)
+    if prev is not None and prev[0] >= max_bs and prev[1] >= max_num_token:
+        return
+    assert prev is None, (
+        "draft-extend attention backend is shared across speculative runtime "
+        f"states and is being re-sized upward ({prev} -> {(max_bs, max_num_token)}); "
+        "this frees buffers already captured into earlier CUDA graphs"
+    )
+    attn_backend.init_cuda_graph_state(max_bs, max_num_token)
+    attn_backend._spec_graph_state_extent = (max_bs, max_num_token)
+
+
 @dataclass
 class SpecRuntimeState:
     """A complete set of runtime resources bound to a specific speculative
@@ -77,6 +125,7 @@ class AdaptiveController:
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
         self.worker = worker
+        self.initial_steps = worker.speculative_num_steps
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
             cfg_path=config_path,
@@ -102,6 +151,7 @@ class AdaptiveController:
         max_batch_size: int | None = None,
     ) -> None:
         """Build and register runtime states for all candidate steps."""
+        self.validate_candidates()
         self.params.set_cuda_graph_bs(cuda_graph_bs)
 
         for steps in self.candidate_steps:
@@ -123,6 +173,27 @@ class AdaptiveController:
                 cuda_graph_bs=pruned_bs,
             )
             self._states[steps] = state
+
+    def validate_candidates(self) -> None:
+        """No candidate may exceed the step count the server started with.
+
+        Everything sized once at start-up from ``--speculative-num-steps`` --
+        the per-request KV / mamba reservation, the chain buffers, and (for
+        draft models whose draft-extend backend is the draft runner's own
+        backend, i.e. compressed QSA) that backend's CUDA-graph metadata
+        tensors -- is dimensioned for the launch value.  A larger candidate
+        would have to grow those buffers *after* the initial state's graphs
+        were captured against them, which frees what those graphs point at
+        (illegal memory access at the next replay).  Raise at start-up instead.
+        """
+        over = [s for s in self.candidate_steps if s > self.initial_steps]
+        if over:
+            raise ValueError(
+                f"speculative_adaptive_config candidate_steps {sorted(over)} exceed "
+                f"--speculative-num-steps ({self.initial_steps}). Launch the server "
+                "with the largest candidate as --speculative-num-steps and list the "
+                "smaller ones as candidates."
+            )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
         target = (

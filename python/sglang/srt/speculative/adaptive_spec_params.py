@@ -161,6 +161,16 @@ class AdaptiveStepSlot:
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
+        # One EMA is shared by every candidate, but the quantity it tracks
+        # (accepted drafts per verify) is bounded by the *current* step count,
+        # so its scale changes with every switch: an EMA of 5.9 that justified
+        # leaving steps=15 is an impossibly high reading at steps=3 and would
+        # bounce straight back up. Re-seeding it at the new step's neutral
+        # value (target - 1, the same convention __init__ and the steps=0 probe
+        # use) makes each candidate's threshold a statement about that
+        # candidate, and turns a switch into a probe that the next update
+        # confirms or undoes. Off by default (upstream behaviour).
+        self.reset_ema_on_switch = cfg.get("reset_ema_on_switch", False)
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
@@ -249,11 +259,19 @@ class AdaptiveStepSlot:
 
     def _apply_target_steps(self, old_steps: int, target: int) -> bool:
         if target != old_steps:
+            decided_at = self.ema_accept_len
             self.current_steps = target
+            if self.reset_ema_on_switch and target > 0:
+                self.ema_accept_len = float(target - 1)
             log_info_on_rank0(
                 logger,
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "
-                f"(ema_accept_len={self.ema_accept_len:.2f})",
+                f"(ema_accept_len={decided_at:.2f}"
+                + (
+                    f", ema reseeded to {self.ema_accept_len:.2f})"
+                    if self.ema_accept_len != decided_at
+                    else ")"
+                ),
             )
             return True
         return False
