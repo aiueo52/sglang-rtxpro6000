@@ -1043,6 +1043,9 @@ class Envs:
     # Compute the shared-expert gate before the routed experts and fold the
     # `routed + gate * shared` join into the HC combine's apply stage.
     SGLANG_SHARED_GATE_EARLY = EnvBool(False)
+    # Fold the HC combine's apply stage into the next boundary's HC mix K0,
+    # whose branch CTAs already own exactly the row slice the apply writes.
+    SGLANG_HC_APPLY_MIX_FUSED = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at

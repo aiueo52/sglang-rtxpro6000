@@ -25,6 +25,13 @@ _HC_MIX2_FP8_DROP_BF16 = os.environ.get("SGLANG_HC_MIX2_FP8_DROP_BF16", "0") == 
 _HC_MIX_FP8 = os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 
 
+def _hc_apply_mix_fused() -> bool:
+    """R7: fold the combine apply into the next boundary's HC mix K0."""
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_HC_APPLY_MIX_FUSED.get())
+
+
 def _hc_gate_early_mode() -> int:
     """R1: where the combine gate runs. See `HCGateEarly` in `srt.environ`.
 
@@ -279,6 +286,7 @@ class GatedResidual(HyperConnectionBase):
             self._gate_early = (
                 _hc_gate_early_mode() if self._split_combine_ok else 0
             )
+            self._apply_mix_fused = bool(self._gate_early) and _hc_apply_mix_fused()
             if self._gate_early:
                 self._early_partials_buf = torch.empty(
                     (32, 8, self.hc_count),
@@ -770,7 +778,52 @@ class GatedResidual(HyperConnectionBase):
     ):
         """Combine this boundary and norm/mix the next one in one launch."""
         hyper_input, hyper_input_normed = residuals[0], residuals[1]
+        gate_partials = residuals[2] if len(residuals) > 2 else None
         inject_w = self.block_inject_weight.weight
+        if gate_partials is not None and getattr(self, "_apply_mix_fused", False):
+            from sglang.srt.layers.hc_mix2_triton import (
+                hc_apply_norm_mix2_supported,
+                hc_norm_mix2,
+            )
+
+            w_down, w_up, s_down, s_up = next_hc._mix2_weights()
+            if (
+                next_hc._mix2_supported(hyper_input)
+                and next_hc._gate_early_ok(hyper_input)
+                and self.hc_count == next_hc.hc_count
+                and self.hidden_size == next_hc.hidden_size
+                and hc_apply_norm_mix2_supported(self.hidden_size, w_down)
+                and block_output.shape == (hyper_input.shape[0], self.hidden_size)
+                and block_output.dtype == hyper_input.dtype
+                and block_output.is_cuda
+                and block_output.is_contiguous()
+            ):
+                # R7: this boundary's apply is the next K0's prologue -- the
+                # branch CTA that norms the row is the one that would have
+                # written it, so the apply launch and the residual round trip
+                # both go away.
+                mixed, normed, next_partials, applied = hc_norm_mix2(
+                    hyper_input,
+                    next_hc.hc_norm.weight,
+                    next_hc.hc_norm.variance_epsilon,
+                    w_down,
+                    w_up,
+                    next_hc.hc_count,
+                    next_hc.hidden_size,
+                    None,
+                    s_down,
+                    s_up,
+                    inject_weight=(
+                        next_hc.block_inject_weight.weight.data
+                        if next_hc._gate_early == 1
+                        else None
+                    ),
+                    apply_inputs=(block_output, gate_partials),
+                )
+                assert applied is not None
+                if next_partials is None:
+                    return mixed, next_hc._early_gate(applied, normed)
+                return mixed, (applied, normed, next_partials)
         if (
             next_hc._fused_mix_supported(hyper_input)
             and self.hc_count == next_hc.hc_count

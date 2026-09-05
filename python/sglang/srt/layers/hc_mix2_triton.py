@@ -8,7 +8,12 @@ three independent launches, each of which streams one thing:
 * K0 (grid = M * hc) -- one CTA per (row, branch): the sum of squares, the
   ``inv_rms`` it implies, the bf16 ``normed`` row chunk, and a slice of the
   fp32 split-K workspace cleared for K1's atomics. Folding the clear in here
-  is what keeps the graph free of a separate memset node.
+  is what keeps the graph free of a separate memset node. Two optional stages
+  ride along on the branch slice this CTA already owns: ``FUSE_APPLY`` runs
+  the *previous* HC boundary's combine apply as a prologue (``x_ptr`` is then
+  the output residual, ``apply_resid_ptr`` the input one) and ``FUSE_GATE``
+  dots ``normed`` against the inject weight as an epilogue, leaving the gate
+  partials the *next* boundary's apply needs.
 * K1 (grid = k_groups x n_blocks) -- ``BLOCK_G`` chunks of ``BLOCK_K`` columns
   against the matching ``w_down`` tile, accumulated in registers and pushed to
   ``t_raw`` with one device-scope atomic per CTA.
@@ -133,6 +138,9 @@ def _hc_branch_stats_kernel(
     t_raw_ptr,
     inject_w_ptr,
     gate_partials_ptr,
+    apply_resid_ptr,
+    apply_block_ptr,
+    apply_part_ptr,
     num_tasks,
     zero_span,
     K,
@@ -144,6 +152,8 @@ def _hc_branch_stats_kernel(
     WRITE_NORMED: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
     FUSE_GATE: tl.constexpr,
+    FUSE_APPLY: tl.constexpr,
+    PREV_SPLITS: tl.constexpr,
 ):
     pid = tl.program_id(0)
     m = pid // HC
@@ -156,7 +166,26 @@ def _hc_branch_stats_kernel(
         # the weight latency overlaps the sum-of-squares reduction instead of
         # starting a second dependent round trip after it.
         mask_s = offs < HS
-        x = tl.load(x_ptr + base + offs, mask=mask_s, other=0.0).to(tl.float32)
+        if FUSE_APPLY:
+            # Previous boundary's HC combine apply (SGLANG_HC_APPLY_MIX_FUSED):
+            # this CTA owns branch `c` of the row, which is exactly the slice
+            # the apply would write, so form the new residual here and keep it
+            # in registers instead of storing it and reading it back.
+            total = 0.0
+            for ps in tl.static_range(PREV_SPLITS):
+                total += tl.load(apply_part_ptr + (m * PREV_SPLITS + ps) * HC + c)
+            a = 2.0 / (1.0 + tl.exp(-total / HC))
+            y = tl.load(
+                apply_block_ptr + m * HS + offs, mask=mask_s, other=0.0
+            ).to(tl.float32)
+            r = tl.load(
+                apply_resid_ptr + base + offs, mask=mask_s, other=0.0
+            ).to(tl.float32)
+            xb = (r + a * y).to(x_ptr.dtype.element_ty)
+            tl.store(x_ptr + base + offs, xb, mask=mask_s)
+            x = xb.to(tl.float32)
+        else:
+            x = tl.load(x_ptr + base + offs, mask=mask_s, other=0.0).to(tl.float32)
         if WRITE_NORMED:
             w = tl.load(norm_w_ptr + c * HS + offs, mask=mask_s, other=0.0).to(
                 tl.float32
@@ -185,6 +214,8 @@ def _hc_branch_stats_kernel(
                         tl.sum(nrm32 * gw, axis=0),
                     )
     else:
+        # FUSE_APPLY / FUSE_GATE are gated to the single-tile shape by the
+        # launcher, so this branch stays the plain statistics pass.
         acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
         for s0 in range(0, HS, BLOCK_S):
             s = s0 + offs
@@ -460,6 +491,25 @@ def hc_norm_mix2_supported(
     )
 
 
+def hc_apply_norm_mix2_supported(
+    hs: int,
+    w_down: torch.Tensor,
+    config: HCMix2Config | None = None,
+) -> bool:
+    """Whether `hc_norm_mix2` can absorb the previous boundary's combine apply.
+
+    K0 must exist (not the "redundant" stats mode) and one branch must fit in
+    one tile, which is what lets the applied row stay in registers.
+    """
+    if config is None:
+        config = (
+            _DEFAULT_CONFIG_FP8
+            if w_down.dtype == torch.float8_e4m3fn
+            else _DEFAULT_CONFIG
+        )
+    return config.stats_mode != "redundant" and config.stats_block >= hs
+
+
 def hc_norm_mix2(
     hyper_input: torch.Tensor,
     norm_w: torch.Tensor,
@@ -472,6 +522,7 @@ def hc_norm_mix2(
     s_down: torch.Tensor | None = None,
     s_up: torch.Tensor | None = None,
     inject_weight: torch.Tensor | None = None,
+    apply_inputs: tuple | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-branch Gemma RMSNorm followed by the gated low-rank mix.
 
@@ -482,6 +533,13 @@ def hc_norm_mix2(
     ``w_down``/``w_up`` may be fp8 e4m3 (weight-only), in which case ``s_down``
     (one fp32 scale per lowrank row) and ``s_up`` (one per hc*hs row) are
     required; ``normed`` is bit-identical to the bf16 path either way.
+
+    ``inject_weight`` adds the next combine's gate to K0 and makes the return
+    ``(mixed, normed, gate_partials[M, hc, hc])``. ``apply_inputs`` is
+    ``(block_output, gate_partials)`` of the *previous* boundary: K0 then
+    applies that combine to ``hyper_input`` first, and the return grows to
+    ``(mixed, normed, gate_partials, applied)`` where ``applied`` is the
+    combined residual. Check `hc_apply_norm_mix2_supported` before passing it.
     """
     w_fp8 = w_down.dtype == torch.float8_e4m3fn
     if config is None:
@@ -500,11 +558,28 @@ def hc_norm_mix2(
     device = hyper_input.device
     rows_pad = _HC_MIX2_MAX_ROWS
 
-    normed = torch.empty_like(hyper_input)
     mixed = torch.empty((rows, hs), dtype=hyper_input.dtype, device=device)
     redundant_stats = config.stats_mode == "redundant"
     read_normed = config.stats_mode == "norm"
     single_tile = config.stats_block >= hs
+    fuse_apply = apply_inputs is not None and not redundant_stats and single_tile
+    if fuse_apply:
+        # `hyper_input` is the *previous* boundary's residual: K0 runs that
+        # boundary's combine apply on it and writes the result to `applied`,
+        # which is this boundary's hyper input and the tensor the next combine
+        # reads back. Nothing else re-reads the row in between.
+        prev_block_output, prev_partials = apply_inputs
+        prev_splits = prev_partials.shape[1]
+        applied = torch.empty_like(hyper_input)
+    else:
+        prev_block_output = prev_partials = hyper_input
+        prev_splits = 1
+        applied = None
+    if apply_inputs is not None and not fuse_apply:
+        # The caller must have checked `hc_apply_norm_mix2_supported`; running
+        # the mix on the un-applied row would be silently wrong.
+        raise RuntimeError("hc_norm_mix2: this config cannot absorb the apply")
+    x_for_mix = applied if fuse_apply else hyper_input
     fuse_gate = (
         inject_weight is not None
         and not redundant_stats
@@ -516,6 +591,7 @@ def hc_norm_mix2(
         if fuse_gate
         else None
     )
+    normed = torch.empty_like(hyper_input)
     if redundant_stats:
         # No K0 to fold the clear into, so the graph carries a 20 KB memset.
         t_raw = torch.zeros((rows_pad, lowrank), dtype=torch.float32, device=device)
@@ -526,13 +602,16 @@ def hc_norm_mix2(
         num_tasks = rows * hc
         zero_span = rows * lowrank
         _hc_branch_stats_kernel[(num_tasks,)](
-            hyper_input,
+            x_for_mix,
             norm_w,
             inv_rms,
             normed,
             t_raw,
             inject_weight if fuse_gate else normed,
             gate_partials if fuse_gate else t_raw,
+            hyper_input,
+            prev_block_output,
+            prev_partials,
             num_tasks,
             zero_span,
             k,
@@ -544,13 +623,15 @@ def hc_norm_mix2(
             WRITE_NORMED=read_normed,
             SINGLE_TILE=single_tile,
             FUSE_GATE=fuse_gate,
+            FUSE_APPLY=fuse_apply,
+            PREV_SPLITS=prev_splits,
             num_warps=config.stats_warps,
         )
 
     _hc_down_kernel[
         (k // (config.block_k * config.block_g), triton.cdiv(lowrank, config.block_n))
     ](
-        hyper_input,
+        x_for_mix,
         norm_w,
         w_down,
         inv_rms,
@@ -594,6 +675,8 @@ def hc_norm_mix2(
         W_FP8=w_fp8,
         num_warps=config.up_warps,
     )
+    if apply_inputs is not None:
+        return mixed, normed, gate_partials, applied
     if inject_weight is not None:
         return mixed, normed, gate_partials
     return mixed, normed

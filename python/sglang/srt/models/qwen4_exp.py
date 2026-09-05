@@ -1341,7 +1341,12 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        if _HC_FUSED and get_parallel().attn_tp_size == 1:
+        if (
+            _HC_FUSED
+            or getattr(self.attn_hyper_connection, "_apply_mix_fused", False)
+        ) and get_parallel().attn_tp_size == 1:
+            # `combine_then_mix` falls back to combine + mix when neither
+            # fusion applies to this shape.
             return self.attn_hyper_connection.combine_then_mix(
                 hidden_states, residual, self.mlp_hyper_connection
             )
