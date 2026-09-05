@@ -136,16 +136,27 @@ class TestResetEmaOnSwitch(CustomTestCase):
         "update_interval": 5,
         "warmup_batches": 10,
         "down_hysteresis": 3.5,
-        "up_hysteresis": -0.15,
+        "up_hysteresis": 0.0,
         "reset_ema_on_switch": True,
     }
 
-    def _run(self, accept_at_steps, batches=200):
-        """Feed a workload whose accepted-draft count depends on the step count."""
+    LAG = 2  # verify results reach the controller this many batches late
+
+    def _run(self, accept_at_steps, batches=200, lag=None):
+        """Feed a workload whose accepted-draft count depends on the step count.
+
+        *lag* models the real pipeline: the sample handed to ``update`` was
+        produced by the step count that was live ``lag`` batches ago, so the
+        first samples after a switch still describe the old configuration.
+        """
+        lag = self.LAG if lag is None else lag
         slot = AdaptiveStepSlot(initial_steps=15, cfg=dict(self.CFG))
+        inflight = [slot.current_steps] * lag
         trace = []
         for _ in range(batches):
-            slot.update([accept_at_steps[slot.current_steps]])
+            produced_by = inflight.pop(0) if lag else slot.current_steps
+            slot.update([accept_at_steps[produced_by]])
+            inflight.append(slot.current_steps)
             trace.append(slot.current_steps)
         return slot, trace
 
@@ -166,6 +177,27 @@ class TestResetEmaOnSwitch(CustomTestCase):
         slot, trace = self._run({15: 3.76, 3: 2.24})
         self.assertEqual(slot.current_steps, 3)
         self.assertEqual(trace[-50:], [3] * 50)
+
+    def test_stale_samples_are_dropped(self):
+        """A leftover steps=15 reading cannot move a steps=3 EMA."""
+        slot = AdaptiveStepSlot(initial_steps=3, cfg=dict(self.CFG))
+        slot.ema_accept_len = 2.0
+        slot.update([9])  # impossible at steps=3 -> stale, ignored
+        self.assertEqual(slot.ema_accept_len, 2.0)
+        slot.update([3])  # possible at steps=3 -> counted
+        self.assertGreater(slot.ema_accept_len, 2.0)
+
+    def test_switch_count_stays_small(self):
+        """The 2026-09-05 run made 489 switches in 90s; bound the churn."""
+        for name, accept in (
+            ("prose-en", {15: 1.96, 3: 1.54}),
+            ("code-edit", {15: 8.85, 3: 2.81}),
+            ("agent-loop", {15: 3.76, 3: 2.24}),
+        ):
+            with self.subTest(name):
+                _, trace = self._run(accept, batches=300)
+                switches = sum(a != b for a, b in zip(trace, trace[1:]))
+                self.assertLessEqual(switches, 4, f"{name}: {switches} switches")
 
     def test_without_reset_the_same_config_oscillates(self):
         cfg = dict(self.CFG)

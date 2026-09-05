@@ -191,12 +191,24 @@ class AdaptiveStepSlot:
             return False
 
         if self.current_steps > 0:
-            batch_avg = sum(num_correct_drafts_per_req) / len(
-                num_correct_drafts_per_req
-            )
-            self.ema_accept_len = (
-                1 - self.ema_alpha
-            ) * self.ema_accept_len + self.ema_alpha * batch_avg
+            # Verify results arrive one or more batches behind the decision
+            # that produced them (the scheduler processes them off the overlap
+            # queue, and a decided switch is only applied at the next batch
+            # boundary), so right after a switch the first samples still carry
+            # the *previous* step count. A sample larger than the current chain
+            # cannot have been produced by it, which makes those stale samples
+            # identifiable and droppable -- without them a single leftover
+            # steps=15 reading (up to 15 accepted drafts) drags a freshly
+            # seeded steps=3 EMA straight back over the step-up threshold, and
+            # the server ping-pongs every decision interval.
+            fresh = [
+                n for n in num_correct_drafts_per_req if n <= self.current_steps
+            ]
+            if fresh:
+                batch_avg = sum(fresh) / len(fresh)
+                self.ema_accept_len = (
+                    1 - self.ema_alpha
+                ) * self.ema_accept_len + self.ema_alpha * batch_avg
 
         self._batch_count += 1
         if self._batch_count <= self.warmup_batches:

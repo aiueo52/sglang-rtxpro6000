@@ -5,7 +5,7 @@
     "update_interval": 5,
     "warmup_batches": 10,
     "down_hysteresis": 3.5,
-    "up_hysteresis": -0.15,
+    "up_hysteresis": 0.0,
     "ceiling_coeff": 0,
     "reset_ema_on_switch": true
   }
