@@ -859,10 +859,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 split_n=self.num_v_heads,
             )
 
+        # Same dual-stream gate as `_forward_input_proj`, including the
+        # TC-piecewise prefill graph which forces the threshold to 0.
+        dual_stream_threshold = (
+            0 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE) else 1024
+        )
         use_alt = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and num_tokens < 1024
+            and num_tokens < dual_stream_threshold
             and _gdn_use_alt_stream
         )
         if use_alt:
