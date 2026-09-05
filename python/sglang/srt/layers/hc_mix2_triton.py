@@ -180,28 +180,49 @@ def _hc_branch_stats_kernel(
             # this CTA owns branch `c` of the row, which is exactly the slice
             # the apply would write, so form the new residual here and keep it
             # in registers instead of storing it and reading it back.
-            total = 0.0
-            for ps in tl.static_range(PREV_SPLITS):
-                total += tl.load(apply_part_ptr + (m * PREV_SPLITS + ps) * HC + c)
-            a = 2.0 / (1.0 + tl.exp(-total / HC))
-            y = tl.load(
-                apply_block_ptr + m * HS + offs, mask=mask_s, other=0.0
-            ).to(tl.float32)
             if FUSE_SHARED:
                 # R6's shared-expert join (`routed + gate * shared`) rides in
-                # the same prologue at the layer->layer boundary. Round the sum
-                # back to the storage dtype first: that reproduces the bf16
-                # store `fused_gate_sigmoid_mul_add` would have made before the
-                # combine read it, which is what `hc_combine_apply`'s
-                # `kUseShared` path does too.
-                g = tl.load(apply_sgate_ptr + m)
+                # the same prologue at the layer->layer boundary. The three row
+                # loads are issued *before* the gate reduction here: with the
+                # shared row there are three of them and the reduction's own
+                # chain of scalar loads is long enough that leaving them behind
+                # it costs 0.18 us a launch at M=16 (measured; the two-load
+                # `else` below keeps R7's original order, which measures the
+                # same either way).
+                y = tl.load(
+                    apply_block_ptr + m * HS + offs, mask=mask_s, other=0.0
+                ).to(tl.float32)
                 sh = tl.load(
                     apply_shared_ptr + m * HS + offs, mask=mask_s, other=0.0
                 ).to(tl.float32)
+                g = tl.load(apply_sgate_ptr + m)
+                r = tl.load(
+                    apply_resid_ptr + base + offs, mask=mask_s, other=0.0
+                ).to(tl.float32)
+                total = 0.0
+                for ps in tl.static_range(PREV_SPLITS):
+                    total += tl.load(
+                        apply_part_ptr + (m * PREV_SPLITS + ps) * HC + c
+                    )
+                a = 2.0 / (1.0 + tl.exp(-total / HC))
+                # Round the sum back to the storage dtype first: that
+                # reproduces the bf16 store `fused_gate_sigmoid_mul_add` would
+                # have made before the combine read it, which is what
+                # `hc_combine_apply`'s `kUseShared` path does too.
                 y = (y + g * sh).to(x_ptr.dtype.element_ty).to(tl.float32)
-            r = tl.load(
-                apply_resid_ptr + base + offs, mask=mask_s, other=0.0
-            ).to(tl.float32)
+            else:
+                total = 0.0
+                for ps in tl.static_range(PREV_SPLITS):
+                    total += tl.load(
+                        apply_part_ptr + (m * PREV_SPLITS + ps) * HC + c
+                    )
+                a = 2.0 / (1.0 + tl.exp(-total / HC))
+                y = tl.load(
+                    apply_block_ptr + m * HS + offs, mask=mask_s, other=0.0
+                ).to(tl.float32)
+                r = tl.load(
+                    apply_resid_ptr + base + offs, mask=mask_s, other=0.0
+                ).to(tl.float32)
             xb = (r + a * y).to(x_ptr.dtype.element_ty)
             tl.store(x_ptr + base + offs, xb, mask=mask_s)
             x = xb.to(tl.float32)
