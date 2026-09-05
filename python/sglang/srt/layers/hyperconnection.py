@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
@@ -10,6 +11,8 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 from sglang.srt.layers.linear import ReplicatedLinear
+
+logger = logging.getLogger(__name__)
 
 _HC_FUSED = os.environ.get("SGLANG_HC_FUSED", "0") == "1"
 # Single-launch combine (gate + apply in one Triton kernel), see
@@ -42,6 +45,11 @@ def _hc_gate_early_mode() -> int:
     from sglang.srt.environ import HCGateEarly, envs
 
     mode = int(envs.SGLANG_HC_GATE_EARLY.get())
+    if mode == HCGateEarly.FUSED:
+        logger.warning(
+            "SGLANG_HC_GATE_EARLY=FUSED measured +114 us/step at W4 (K0 median "
+            "1.5 -> 4.3 us); MOVED is the useful setting."
+        )
     if not mode and envs.SGLANG_SHARED_GATE_EARLY.get():
         return int(HCGateEarly.MOVED)
     return mode

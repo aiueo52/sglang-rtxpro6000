@@ -1036,9 +1036,11 @@ class Envs:
     SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
     # Compute the HC combine gate at mix time instead of after the block, so
     # only the apply stage is left on the boundary's post-block critical path.
-    # 0 = off, 1 = fold the partial dots into the HC mix K0 branch CTAs (no
-    # gate launch at all), 2 = keep the split gate kernel but launch it early
-    # (bit-identical values).
+    # MOVED is worth -12..-20 us/step at W4 on its own (the gate's own median
+    # drops 2.0 -> 1.5 us next to the mix) and is what SGLANG_SHARED_GATE_EARLY
+    # and SGLANG_HC_APPLY_MIX_FUSED need. FUSED measured +114 us/step: K0 has
+    # only M*hc CTAs, so four more dependent row loads and block reductions
+    # cost it 1.5 -> 4.3 us, far more than the 2 us gate launch it removes.
     SGLANG_HC_GATE_EARLY = EnvInt(HCGateEarly.OFF)
     # Compute the shared-expert gate before the routed experts and fold the
     # `routed + gate * shared` join into the HC combine's apply stage.
