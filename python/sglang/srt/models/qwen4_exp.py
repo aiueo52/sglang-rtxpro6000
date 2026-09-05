@@ -1222,6 +1222,35 @@ class Qwen4ExpPLELayer(nn.Module):
         return _pad_token_rows(output, batch.physical_tokens)
 
 
+class _PendingHCCombine:
+    """A layer's HC combine that has not been launched yet.
+
+    H2 (`SGLANG_HC_LAYER_APPLY_FUSED`): the MoE boundary's apply is the only
+    thing standing between layer L's block output and layer L+1's HC mix, and
+    the mix's K0 already owns exactly the row slice the apply writes. So the
+    combine travels across the model loop in place of the hidden states and is
+    launched as that K0's prologue. Every path that needs the residual as a
+    real tensor calls `materialize()` instead.
+    """
+
+    __slots__ = ("hc", "block_output", "residuals", "shared_output", "shared_gate")
+
+    def __init__(self, hc, block_output, residuals, shared_output, shared_gate):
+        self.hc = hc
+        self.block_output = block_output
+        self.residuals = residuals
+        self.shared_output = shared_output
+        self.shared_gate = shared_gate
+
+    def materialize(self) -> torch.Tensor:
+        return self.hc.combine(
+            self.block_output,
+            self.residuals,
+            self.shared_output,
+            self.shared_gate,
+        )
+
+
 class Qwen4ExpLayerExtensionMixin:
     def _init_qwen4_exp_layer_extensions(
         self,
@@ -1279,6 +1308,15 @@ class Qwen4ExpLayerExtensionMixin:
             if layer_prefix
             else "mlp_hyper_connection"
         )
+        # H2: may this layer's MoE combine be deferred into the next layer's
+        # attention mix? The next layer has to exist and must not run a PLE --
+        # the PLE query reads the combined residual, so the apply cannot move
+        # past it. (The draft backbone is one layer, so it never defers.)
+        next_layer_id = layer_id + 1
+        self._hc_defer_to_next_layer = next_layer_id < int(
+            config.num_hidden_layers
+        ) and (next_layer_id + 1) not in config.ple_layer_ids
+
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
@@ -1310,6 +1348,25 @@ class Qwen4ExpLayerExtensionMixin:
         *,
         ple_batch: Optional[_PLEBatch],
     ):
+        if isinstance(hidden_states, _PendingHCCombine):
+            pending = hidden_states
+            if self.ple is None:
+                # H2: the deferred apply becomes this mix's K0 prologue.
+                # `combine_then_mix` falls back to combine + mix for any shape
+                # the fused prologue cannot serve.
+                return pending.hc.combine_then_mix(
+                    pending.block_output,
+                    pending.residuals,
+                    self.attn_hyper_connection,
+                    shared_output=pending.shared_output,
+                    shared_gate=pending.shared_gate,
+                    fused_attr="_layer_apply_fused",
+                )
+            # The PLE reads the combined residual as its query, so it has to
+            # exist before the mix; `_hc_defer_to_next_layer` keeps the
+            # previous layer off this path, and this is the safety net.
+            hidden_states = pending.materialize()
+
         hc_dim = self.hc_count * self.hidden_size
         if hidden_states.shape[-1] != hc_dim:
             assert hidden_states.shape[-1] == self.hidden_size
@@ -1424,7 +1481,28 @@ class Qwen4ExpLayerExtensionMixin:
         # kernel. `_pending_shared_join` is reset by every MoE forward.
         pending = getattr(self.mlp, "_pending_shared_join", None)
         shared_output, shared_gate = pending if pending is not None else (None, None)
-        hidden_states = self.mlp_hyper_connection.combine(
+        hc = self.mlp_hyper_connection
+        if (
+            self._hc_defer_to_next_layer
+            and getattr(hc, "_layer_apply_fused", False)
+            and get_parallel().attn_tp_size == 1
+            and residual is not None
+            and len(residual) > 2
+            and residual[2] is not None
+            and 0 < hidden_states.shape[0] <= 16
+        ):
+            # H2: hand the combine to the next layer's mix instead of
+            # launching it. Nothing between here and that mix reads the
+            # residual (`_hc_defer_to_next_layer` excludes the PLE layer and
+            # the last layer, and the aux-hidden-state capture is inert for
+            # this model), so the apply can be its K0 prologue.
+            return (
+                _PendingHCCombine(
+                    hc, hidden_states, residual, shared_output, shared_gate
+                ),
+                None,
+            )
+        hidden_states = hc.combine(
             hidden_states, residual, shared_output, shared_gate
         )
         return hidden_states, None
@@ -1720,6 +1798,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         else None
                     ),
                 )
+
+        if isinstance(hidden_states, _PendingHCCombine):
+            # Safety net: the last executed layer has nothing to fuse into
+            # (and `hc_hidden_states` below is read bitwise by the MTP head).
+            hidden_states = hidden_states.materialize()
 
         _commit_ple_batch(ple_batch, forward_batch)
 

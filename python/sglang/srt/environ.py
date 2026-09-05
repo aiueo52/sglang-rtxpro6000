@@ -1048,6 +1048,10 @@ class Envs:
     # Fold the HC combine's apply stage into the next boundary's HC mix K0,
     # whose branch CTAs already own exactly the row slice the apply writes.
     SGLANG_HC_APPLY_MIX_FUSED = EnvBool(False)
+    # H2: the same fold at the layer->layer boundary -- layer L's MoE combine
+    # becomes the prologue of layer L+1's attention HC mix K0. Needs the
+    # combine deferred across the model loop, so it is a separate flag.
+    SGLANG_HC_LAYER_APPLY_FUSED = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at

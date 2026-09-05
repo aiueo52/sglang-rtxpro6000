@@ -35,6 +35,20 @@ def _hc_apply_mix_fused() -> bool:
     return bool(envs.SGLANG_HC_APPLY_MIX_FUSED.get())
 
 
+def _hc_layer_apply_fused() -> bool:
+    """H2: the same fold at the layer->layer boundary.
+
+    R7 covers the attention->MoE boundary, where the combine and the next mix
+    are two statements of one method. The MoE->next-attention boundary needs
+    the combine deferred across the model loop, so the decision lives in
+    `Qwen4ExpLayerExtensionMixin`; this flag only says the kernel side is
+    allowed to serve it.
+    """
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_HC_LAYER_APPLY_FUSED.get())
+
+
 def _hc_gate_early_mode() -> int:
     """R1: where the combine gate runs. See `HCGateEarly` in `srt.environ`.
 
@@ -295,6 +309,11 @@ class GatedResidual(HyperConnectionBase):
                 _hc_gate_early_mode() if self._split_combine_ok else 0
             )
             self._apply_mix_fused = bool(self._gate_early) and _hc_apply_mix_fused()
+            # H2: whether this boundary's combine may be deferred into the
+            # *next layer's* attention mix K0. Same prologue, different seam.
+            self._layer_apply_fused = (
+                bool(self._gate_early) and _hc_layer_apply_fused()
+            )
             if self._gate_early:
                 self._early_partials_buf = torch.empty(
                     (32, 8, self.hc_count),
@@ -783,12 +802,35 @@ class GatedResidual(HyperConnectionBase):
         block_output: torch.Tensor,
         residuals,
         next_hc: "GatedResidual",
+        shared_output: Optional[torch.Tensor] = None,
+        shared_gate: Optional[torch.Tensor] = None,
+        fused_attr: str = "_apply_mix_fused",
     ):
-        """Combine this boundary and norm/mix the next one in one launch."""
+        """Combine this boundary and norm/mix the next one in one launch.
+
+        `shared_output`/`shared_gate` carry R6's deferred shared-expert join,
+        which the fused prologue folds in the way `hc_combine_apply` would.
+        `fused_attr` names the flag that authorises the fold: R7's
+        `_apply_mix_fused` for the attention->MoE seam inside a layer, H2's
+        `_layer_apply_fused` for the layer->layer one.
+        """
         hyper_input, hyper_input_normed = residuals[0], residuals[1]
         gate_partials = residuals[2] if len(residuals) > 2 else None
         inject_w = self.block_inject_weight.weight
-        if gate_partials is not None and getattr(self, "_apply_mix_fused", False):
+        shared_ok = shared_output is None or (
+            shared_gate is not None
+            and shared_output.shape == (hyper_input.shape[0], self.hidden_size)
+            and shared_output.dtype == hyper_input.dtype
+            and shared_output.is_cuda
+            and shared_output.is_contiguous()
+            and shared_gate.dtype == torch.float32
+            and shared_gate.is_contiguous()
+        )
+        if (
+            gate_partials is not None
+            and shared_ok
+            and getattr(self, fused_attr, False)
+        ):
             from sglang.srt.layers.hc_mix2_triton import (
                 hc_apply_norm_mix2_supported,
                 hc_norm_mix2,
@@ -826,14 +868,24 @@ class GatedResidual(HyperConnectionBase):
                         if next_hc._gate_early == 1
                         else None
                     ),
-                    apply_inputs=(block_output, gate_partials),
+                    apply_inputs=(
+                        (block_output, gate_partials)
+                        if shared_output is None
+                        else (
+                            block_output,
+                            gate_partials,
+                            shared_output,
+                            shared_gate,
+                        )
+                    ),
                 )
                 assert applied is not None
                 if next_partials is None:
                     return mixed, next_hc._early_gate(applied, normed)
                 return mixed, (applied, normed, next_partials)
         if (
-            next_hc._fused_mix_supported(hyper_input)
+            shared_output is None
+            and next_hc._fused_mix_supported(hyper_input)
             and self.hc_count == next_hc.hc_count
             and self.hidden_size == next_hc.hidden_size
             and block_output.shape == (hyper_input.shape[0], self.hidden_size)
@@ -864,7 +916,9 @@ class GatedResidual(HyperConnectionBase):
                 self.hidden_size,
             )
             return mixed, (new_residual, normed)
-        return next_hc.mix(self.combine(block_output, residuals))
+        return next_hc.mix(
+            self.combine(block_output, residuals, shared_output, shared_gate)
+        )
 
 
 HYPERCONNECTION_CLASS_DICT = {

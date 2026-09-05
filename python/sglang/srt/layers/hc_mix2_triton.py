@@ -143,6 +143,8 @@ def _hc_branch_stats_kernel(
     apply_resid_ptr,
     apply_block_ptr,
     apply_part_ptr,
+    apply_shared_ptr,
+    apply_sgate_ptr,
     num_tasks,
     zero_span,
     K,
@@ -155,6 +157,7 @@ def _hc_branch_stats_kernel(
     SINGLE_TILE: tl.constexpr,
     FUSE_GATE: tl.constexpr,
     FUSE_APPLY: tl.constexpr,
+    FUSE_SHARED: tl.constexpr,
     PREV_SPLITS: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):
@@ -184,6 +187,18 @@ def _hc_branch_stats_kernel(
             y = tl.load(
                 apply_block_ptr + m * HS + offs, mask=mask_s, other=0.0
             ).to(tl.float32)
+            if FUSE_SHARED:
+                # R6's shared-expert join (`routed + gate * shared`) rides in
+                # the same prologue at the layer->layer boundary. Round the sum
+                # back to the storage dtype first: that reproduces the bf16
+                # store `fused_gate_sigmoid_mul_add` would have made before the
+                # combine read it, which is what `hc_combine_apply`'s
+                # `kUseShared` path does too.
+                g = tl.load(apply_sgate_ptr + m)
+                sh = tl.load(
+                    apply_shared_ptr + m * HS + offs, mask=mask_s, other=0.0
+                ).to(tl.float32)
+                y = (y + g * sh).to(x_ptr.dtype.element_ty).to(tl.float32)
             r = tl.load(
                 apply_resid_ptr + base + offs, mask=mask_s, other=0.0
             ).to(tl.float32)
@@ -551,10 +566,12 @@ def hc_norm_mix2(
 
     ``inject_weight`` adds the next combine's gate to K0 and makes the return
     ``(mixed, normed, gate_partials[M, hc, hc])``. ``apply_inputs`` is
-    ``(block_output, gate_partials)`` of the *previous* boundary: K0 then
-    applies that combine to ``hyper_input`` first, and the return grows to
-    ``(mixed, normed, gate_partials, applied)`` where ``applied`` is the
-    combined residual. Check `hc_apply_norm_mix2_supported` before passing it.
+    ``(block_output, gate_partials)`` -- or ``(block_output, gate_partials,
+    shared_output, shared_gate)`` to fold R6's shared-expert join in -- of the
+    *previous* boundary: K0 then applies that combine to ``hyper_input`` first,
+    and the return grows to ``(mixed, normed, gate_partials, applied)`` where
+    ``applied`` is the combined residual. Check
+    `hc_apply_norm_mix2_supported` before passing it.
     """
     w_fp8 = w_down.dtype == torch.float8_e4m3fn
     if config is None:
@@ -583,13 +600,23 @@ def hc_norm_mix2(
         # boundary's combine apply on it and writes the result to `applied`,
         # which is this boundary's hyper input and the tensor the next combine
         # reads back. Nothing else re-reads the row in between.
-        prev_block_output, prev_partials = apply_inputs
+        prev_block_output, prev_partials = apply_inputs[0], apply_inputs[1]
+        prev_shared = apply_inputs[2] if len(apply_inputs) > 2 else None
+        prev_sgate = apply_inputs[3] if len(apply_inputs) > 3 else None
         prev_splits = prev_partials.shape[1]
         applied = torch.empty_like(hyper_input)
     else:
         prev_block_output = prev_partials = hyper_input
+        prev_shared = prev_sgate = None
         prev_splits = 1
         applied = None
+    fuse_shared = fuse_apply and prev_shared is not None
+    if fuse_shared:
+        assert prev_sgate is not None
+    else:
+        # FUSE_SHARED is a constexpr, so these loads are never traced; pass a
+        # live tensor rather than allocating a dummy inside a graph capture.
+        prev_shared = prev_sgate = hyper_input
     if apply_inputs is not None and not fuse_apply:
         # The caller must have checked `hc_apply_norm_mix2_supported`; running
         # the mix on the un-applied row would be silently wrong.
@@ -627,6 +654,8 @@ def hc_norm_mix2(
             hyper_input,
             prev_block_output,
             prev_partials,
+            prev_shared,
+            prev_sgate,
             num_tasks,
             zero_span,
             k,
@@ -639,6 +668,7 @@ def hc_norm_mix2(
             SINGLE_TILE=single_tile,
             FUSE_GATE=fuse_gate,
             FUSE_APPLY=fuse_apply,
+            FUSE_SHARED=fuse_shared,
             PREV_SPLITS=prev_splits,
             USE_PDL=PDL,
             launch_pdl=PDL,
