@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from dataclasses import replace
 from typing import List, Optional
@@ -1180,6 +1181,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
 
+def _adaptive_split() -> frozenset:
+    """Debug-only construction-step switches, see build_adaptive_runtime_state."""
+    raw = os.environ.get("SGLANG_ADAPTIVE_SPLIT", "")
+    if not raw:
+        return frozenset()
+    parts = frozenset(p.strip() for p in raw.split(",") if p.strip())
+    logger.warning("SGLANG_ADAPTIVE_SPLIT=%s: extra spec states are DEBUG ONLY", raw)
+    return parts
+
+
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -1511,9 +1522,41 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
             backup_private = set_private_input_buffers(True)
+            # Debug-only bisection switches (SGLANG_ADAPTIVE_SPLIT, comma
+            # separated). Building an extra runtime state measurably degrades
+            # the *base* state's long-chain acceptance on qwen4_exp even when
+            # the extra state is never activated; these let one server session
+            # attribute that to a single construction step. Never set in
+            # production -- each one leaves the extra state unusable.
+            split = _adaptive_split()
             try:
-                self._draft_worker.init_attention_backend()
-                self._draft_worker._capture_cuda_graphs()
+                if "no_draft" not in split:
+                    if "shared_extend" not in split:
+                        # Every state needs its OWN draft-extend backend.
+                        # DraftBackendFactory.create_draft_extend_backend()
+                        # returns draft_model_runner.attn_backend for
+                        # compressed-QSA draft models, so without this every
+                        # state's draft-extend runner would alias one backend
+                        # -- and QwenSparseAttnBackend caches its captured
+                        # graph metadata in a dict keyed only by
+                        # (forward_mode, bs). This state's capture would then
+                        # replace the launch state's DRAFT_EXTEND_V2 entry with
+                        # one sliced to *this* state's narrower token width, so
+                        # the launch state would replay its 16-wide graph after
+                        # filling only 4 rows of metadata: no crash, but the
+                        # sparse selection seeding draft positions past the
+                        # short state's width is stale, and long-chain
+                        # acceptance collapses (measured: code-edit acc 10.8 ->
+                        # 5.7 with the steps=3 state merely built).
+                        # _override_worker_state restores the base backend.
+                        draft_runner.attn_backend = (
+                            draft_runner._get_attention_backend(
+                                init_new_workspace=True
+                            )
+                        )
+                    self._draft_worker.init_attention_backend()
+                    if "no_draft_graphs" not in split:
+                        self._draft_worker._capture_cuda_graphs()
             finally:
                 draft_runner.init_new_workspace = backup_draft_ws
                 set_private_input_buffers(backup_private)
@@ -1529,7 +1572,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 target_model_runner.init_new_workspace = backup_init
 
             target_graph_runner = None
-            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            if not check_cuda_graph_backend(
+                Phase.DECODE, Backend.DISABLED
+            ) and "no_target_graphs" not in split:
                 TargetGraphRunnerCls = (
                     NPUGraphRunner if _is_npu else DecodeCudaGraphRunner
                 )
@@ -1548,10 +1593,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_num_steps=speculative_num_steps,
                     speculative_num_draft_tokens=speculative_num_draft_tokens,
                 )
-                target_model_runner.maybe_capture_gdn_recovery_graphs(
-                    attn_backend=target_attn_backend,
-                    capture_bs=target_graph_runner.capture_bs,
-                )
+                if "no_gdn_recovery" not in split:
+                    target_model_runner.maybe_capture_gdn_recovery_graphs(
+                        attn_backend=target_attn_backend,
+                        capture_bs=target_graph_runner.capture_bs,
+                    )
                 _set_private(_backup_private_t)
                 target_graph_after_mem = get_available_gpu_memory(
                     self.device, self.gpu_id

@@ -16,6 +16,7 @@ point at, freeing them (illegal memory access at the next replay).
 """
 
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -214,6 +215,39 @@ class TestControllerSettles(CustomTestCase):
         self.assertGreaterEqual(
             slot._grace_until - switched_at, cfg["switch_grace_batches"] - 1
         )
+
+
+class TestPerStateDraftExtendBackend(CustomTestCase):
+    """Each runtime state must build its own draft-extend attention backend.
+
+    For compressed-QSA draft models DraftBackendFactory returns the draft
+    runner's own backend, and QwenSparseAttnBackend caches captured graph
+    metadata in a dict keyed only by (forward_mode, bs). Two states sharing
+    one backend therefore collide on the DRAFT_EXTEND_V2 entry: the last one
+    captured wins, and the other replays its wider graph over metadata filled
+    for the narrower token width. Measured cost of that collision with the
+    steps=3 state merely built and never activated: code-edit acceptance
+    10.8 -> 5.7, 564 -> 311 t/s.
+    """
+
+    def test_sharing_is_off_by_default(self):
+        from sglang.srt.speculative import eagle_worker_v2
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SGLANG_ADAPTIVE_SPLIT", None)
+            self.assertEqual(eagle_worker_v2._adaptive_split(), frozenset())
+        self.assertNotIn("shared_extend", eagle_worker_v2._adaptive_split())
+
+    def test_split_switches_parse(self):
+        from sglang.srt.speculative import eagle_worker_v2
+
+        with patch.dict(
+            os.environ, {"SGLANG_ADAPTIVE_SPLIT": "shared_extend, no_draft"}
+        ):
+            self.assertEqual(
+                eagle_worker_v2._adaptive_split(),
+                frozenset({"shared_extend", "no_draft"}),
+            )
 
 
 if __name__ == "__main__":
