@@ -43,13 +43,24 @@ def _jit_hc_combine_module(
             ("hc_combine", f"HcCombineKernel<{args}>::run"),
             ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
             ("hc_combine_gate", f"HcCombineSplitKernel<{args}>::run_gate"),
-            (
-                "hc_combine_apply",
-                f"HcCombineApplyKernel<{args}, false>::run_plain",
+            # One export per (shared fold, partial-slot count): the slot count
+            # is 8 from the split gate kernel and hc_count from the HC-mix K0
+            # epilogue, and unrolling that loop is worth ~0.4 us a call.
+            *(
+                (
+                    f"hc_combine_apply_p{n}",
+                    f"HcCombineApplyKernel<{args}, false, {n}>::run_plain",
+                )
+                for n in (hc_count, 8)
+                if n == 8 or hc_count != 8
             ),
-            (
-                "hc_combine_apply_shared",
-                f"HcCombineApplyKernel<{args}, true>::run",
+            *(
+                (
+                    f"hc_combine_apply_shared_p{n}",
+                    f"HcCombineApplyKernel<{args}, true, {n}>::run",
+                )
+                for n in (hc_count, 8)
+                if n == 8 or hc_count != 8
             ),
         ],
     )
@@ -173,10 +184,11 @@ def hc_combine_apply(
     else:
         out = out.reshape(-1, hc_count * hidden_size)
     module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
+    n = partials.shape[1]
     if shared_output is None:
-        module.hc_combine_apply(y, r, partials, out)
+        getattr(module, f"hc_combine_apply_p{n}")(y, r, partials, out)
     else:
-        module.hc_combine_apply_shared(
+        getattr(module, f"hc_combine_apply_shared_p{n}")(
             y, r, shared_output.reshape(-1, hidden_size), shared_gate, partials, out
         )
     return out.reshape(residual.shape)

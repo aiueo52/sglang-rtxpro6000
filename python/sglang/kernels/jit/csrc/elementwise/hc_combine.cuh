@@ -417,18 +417,17 @@ struct HcCombineApplyParams {
   const void* residual;         // [M, HC * H]
   const void* shared_output;    // [M, H], only read when kUseShared
   const float* shared_gate;     // [M],    only read when kUseShared
-  const float* partials;        // [M, num_partials, HC]
+  const float* partials;        // [M, kNumPartials, HC]
   void* output;                 // [M, HC * H]
-  int32_t num_partials;
 };
 
 /**
  * \brief Apply-only stage of the HC combine, for a gate computed earlier.
  *
  * Same geometry and math as ``hc_combine_apply_kernel``, except that the number
- * of gate partial slots is a runtime value: the standalone gate kernel emits
- * kSplit=8 of them, while the HC-mix K0 epilogue (SGLANG_HC_GATE_EARLY) emits
- * one per branch CTA, i.e. kHcCount.
+ * of gate partial slots is a template parameter: the standalone gate kernel
+ * emits kSplit=8 of them, while the HC-mix K0 epilogue (SGLANG_HC_GATE_EARLY)
+ * emits one per branch CTA, i.e. kHcCount.
  *
  * With kUseShared the shared-expert join is folded in as well
  * (SGLANG_SHARED_GATE_EARLY):
@@ -440,7 +439,7 @@ struct HcCombineApplyParams {
  * ``fused_gate_sigmoid_mul_add`` performs before the combine reads it, so the
  * folded path is bit-identical to the separate-kernel one.
  */
-template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float, bool kUseShared>
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float, bool kUseShared, int kNumPartials>
 __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_combine_apply2_kernel(
     const HcCombineApplyParams __grid_constant__ params) {
   using namespace device;
@@ -465,10 +464,10 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_com
 
   PDLWaitPrimary<kUsePDL>();
 
-  const int32_t num_partials = params.num_partials;
   float total = 0.0f;
-  for (int32_t s = 0; s < num_partials; ++s) {
-    total += params.partials[(static_cast<int64_t>(m) * num_partials + s) * kHcCount + branch];
+#pragma unroll
+  for (int s = 0; s < kNumPartials; ++s) {
+    total += params.partials[(static_cast<int64_t>(m) * kNumPartials + s) * kHcCount + branch];
   }
   const float a = 2.0f / (1.0f + math::exp(-total / kHcCount));
 
@@ -513,10 +512,11 @@ __global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_com
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType, bool kUseShared>
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType, bool kUseShared, int kNumPartials>
 struct HcCombineApplyKernel {
   static_assert(sizeof(DType) == 2, "HcCombine only supports 2-byte dtypes");
-  static constexpr auto kernel = hc_combine_apply2_kernel<kHcCount, kHiddenSize, kUsePDL, DType, kUseShared>;
+  static constexpr auto kernel =
+      hc_combine_apply2_kernel<kHcCount, kHiddenSize, kUsePDL, DType, kUseShared, kNumPartials>;
 
   /// Apply without the shared-expert fold; `block_output` is the finished block output.
   static void
@@ -548,8 +548,7 @@ struct HcCombineApplyKernel {
         .verify(residual)
         .verify(output);
     auto part_rows = SymbolicSize{"partial_rows"};
-    auto num_partials = SymbolicSize{"num_partials"};
-    TensorMatcher({part_rows, num_partials, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
+    TensorMatcher({part_rows, kNumPartials, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
     if constexpr (kUseShared) {
       TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(shared_output);
       auto gate_rows = SymbolicSize{"gate_rows"};
@@ -563,7 +562,6 @@ struct HcCombineApplyKernel {
         .shared_gate = kUseShared ? static_cast<const float*>(shared_gate.data_ptr()) : nullptr,
         .partials = static_cast<const float*>(partials.data_ptr()),
         .output = output.data_ptr(),
-        .num_partials = static_cast<int32_t>(num_partials.unwrap()),
     };
 
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
