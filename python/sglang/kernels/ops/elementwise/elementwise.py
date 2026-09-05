@@ -5,6 +5,8 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.triton_pdl import PDL as _TRITON_PDL
+from sglang.kernels.triton_pdl import pdl_trigger, pdl_wait
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -388,10 +390,13 @@ def _fused_sigmoid_mul_kernel(
     hidden_dim: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
     pid_block = tl.program_id(1)
+    # Both operands come from the attention kernels that precede this launch.
+    pdl_wait(USE_PDL)
 
     offsets = pid_block * BLOCK_H + tl.arange(0, BLOCK_H)
     mask = offsets < hidden_dim
@@ -406,6 +411,7 @@ def _fused_sigmoid_mul_kernel(
 
     result = attn * tl.sigmoid(g)
     tl.store(output_ptr + attn_off, result, mask=mask)
+    pdl_trigger(USE_PDL)
 
 
 def fused_sigmoid_mul(
@@ -457,6 +463,8 @@ def fused_sigmoid_mul(
         hidden_dim,
         HEAD_DIM=head_dim,
         BLOCK_H=block_h,
+        USE_PDL=_TRITON_PDL,
+        launch_pdl=_TRITON_PDL,
         num_warps=4,
     )
     return out
