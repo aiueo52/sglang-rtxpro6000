@@ -9,6 +9,7 @@ import bisect
 import json
 import logging
 import math
+import os
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -171,6 +172,16 @@ class AdaptiveStepSlot:
         # candidate, and turns a switch into a probe that the next update
         # confirms or undoes. Off by default (upstream behaviour).
         self.reset_ema_on_switch = cfg.get("reset_ema_on_switch", False)
+        # Batches after a switch during which no new decision may be taken.
+        # A swap leaves the draft model cold (its per-step KV branches and the
+        # state's QSA shared-index buffers were captured for the other step
+        # count), so the first verifies after it under-report acceptance. With
+        # a short decision interval the controller reads its own transient,
+        # decides the new setting is bad, switches back -- and never observes
+        # either setting's steady state. The EMA keeps updating through the
+        # grace window; only the decision is held.
+        self.switch_grace_batches = cfg.get("switch_grace_batches", 0)
+        self._grace_until = 0
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
@@ -180,6 +191,17 @@ class AdaptiveStepSlot:
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
+        # Debug accounting (SGLANG_ADAPTIVE_DEBUG=1): what the EMA actually saw
+        # since the last decision.
+        self._dbg = os.environ.get("SGLANG_ADAPTIVE_DEBUG", "") == "1"
+        self._dbg_reset()
+
+    def _dbg_reset(self) -> None:
+        self._dbg_n = 0
+        self._dbg_kept = 0
+        self._dbg_sum = 0.0
+        self._dbg_dropped_sum = 0.0
+        self._dbg_hist: dict[int, int] = {}
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
@@ -204,6 +226,13 @@ class AdaptiveStepSlot:
             fresh = [
                 n for n in num_correct_drafts_per_req if n <= self.current_steps
             ]
+            if self._dbg:
+                self._dbg_n += len(num_correct_drafts_per_req)
+                self._dbg_kept += len(fresh)
+                self._dbg_sum += sum(fresh)
+                self._dbg_dropped_sum += sum(num_correct_drafts_per_req) - sum(fresh)
+                for n in num_correct_drafts_per_req:
+                    self._dbg_hist[n] = self._dbg_hist.get(n, 0) + 1
             if fresh:
                 batch_avg = sum(fresh) / len(fresh)
                 self.ema_accept_len = (
@@ -214,9 +243,26 @@ class AdaptiveStepSlot:
         if self._batch_count <= self.warmup_batches:
             return False
 
+        if self._batch_count < self._grace_until:
+            return False
+
         if (self._batch_count - self.warmup_batches) % self.update_interval != 0:
             return False
 
+        if self._dbg:
+            kept_avg = self._dbg_sum / self._dbg_kept if self._dbg_kept else float("nan")
+            logger.info(
+                "[adaptive-dbg] steps=%d batch=%d ema=%.2f seen=%d kept=%d "
+                "kept_avg=%.2f hist=%s",
+                self.current_steps,
+                self._batch_count,
+                self.ema_accept_len,
+                self._dbg_n,
+                self._dbg_kept,
+                kept_avg,
+                sorted(self._dbg_hist.items()),
+            )
+            self._dbg_reset()
         return self._recompute_params()
 
     def _recompute_params(self) -> bool:
@@ -273,6 +319,7 @@ class AdaptiveStepSlot:
         if target != old_steps:
             decided_at = self.ema_accept_len
             self.current_steps = target
+            self._grace_until = self._batch_count + self.switch_grace_batches
             if self.reset_ema_on_switch and target > 0:
                 self.ema_accept_len = float(target - 1)
             log_info_on_rank0(

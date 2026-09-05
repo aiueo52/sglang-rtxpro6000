@@ -141,14 +141,18 @@ class TestAdaptiveStepSlot(unittest.TestCase):
                 "ema_alpha": 1.0,
                 "warmup_batches": 0,
                 "update_interval": 1,
-                "up_hysteresis": 0.75,
+                # Thresholds must stay inside the reachable range: at
+                # steps=3 a verify accepts at most 3 drafts, so anything
+                # above that is not an observable reading (update() drops
+                # such samples as stale leftovers from a previous step count).
+                "up_hysteresis": 0.25,
             },
         )
 
-        self.assertFalse(params.update([3, 3]))
+        self.assertFalse(params.update([2, 2]))
         self.assertEqual(params.current_steps, 3)
 
-        self.assertTrue(params.update([4, 4]))
+        self.assertTrue(params.update([3, 3]))
         self.assertEqual(params.current_steps, 7)
 
     def test_down_hysteresis_can_prevent_premature_downshift(self):
@@ -182,21 +186,28 @@ class TestAdaptiveStepSlot(unittest.TestCase):
             },
         )
 
-        self.assertTrue(params.update([4, 4]))
+        # steps=3 caps an observable reading at 3 accepted drafts, so the
+        # ramp up needs two full-chain batches (ema 2.0 -> 2.5 -> 2.75) to
+        # clear the 2.5 step-up threshold.
+        self.assertFalse(params.update([3, 3]))
+        self.assertEqual(params.current_steps, 3)
+        self.assertEqual(params.ema_accept_len, 2.5)
+
+        self.assertTrue(params.update([3, 3]))
         self.assertEqual(params.current_steps, 7)
-        self.assertEqual(params.ema_accept_len, 3.0)
+        self.assertEqual(params.ema_accept_len, 2.75)
 
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 1.5)
+        self.assertEqual(params.ema_accept_len, 1.375)
 
         self.assertFalse(params.update([0, 0]))
         self.assertEqual(params.current_steps, 3)
-        self.assertEqual(params.ema_accept_len, 0.75)
+        self.assertEqual(params.ema_accept_len, 0.6875)
 
         self.assertTrue(params.update([0, 0]))
         self.assertEqual(params.current_steps, 1)
-        self.assertEqual(params.ema_accept_len, 0.375)
+        self.assertEqual(params.ema_accept_len, 0.34375)
 
     def test_zero_step_mixed_slot_drops_probes_and_rechecks(self):
         params = self._make_params_from_config(

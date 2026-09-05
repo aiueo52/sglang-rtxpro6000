@@ -127,17 +127,18 @@ class TestDraftExtendGraphStateNoShrink(CustomTestCase):
         self.assertEqual(backend.calls, [(2, 8)])
 
 
-class TestResetEmaOnSwitch(CustomTestCase):
+class TestControllerSettles(CustomTestCase):
     """The shipped w16_3_15 controller must settle, not oscillate."""
 
     CFG = {
         "candidate_steps": [3, 15],
-        "ema_alpha": 0.2,
-        "update_interval": 5,
-        "warmup_batches": 10,
+        "ema_alpha": 0.1,
+        "update_interval": 20,
+        "warmup_batches": 15,
+        "switch_grace_batches": 40,
         "down_hysteresis": 3.5,
         "up_hysteresis": 0.0,
-        "reset_ema_on_switch": True,
+        "reset_ema_on_switch": False,
     }
 
     LAG = 2  # verify results reach the controller this many batches late
@@ -199,17 +200,20 @@ class TestResetEmaOnSwitch(CustomTestCase):
                 switches = sum(a != b for a, b in zip(trace, trace[1:]))
                 self.assertLessEqual(switches, 4, f"{name}: {switches} switches")
 
-    def test_without_reset_the_same_config_oscillates(self):
+    def test_grace_window_holds_decisions_after_a_switch(self):
+        """No second decision until the post-switch transient has passed."""
         cfg = dict(self.CFG)
-        cfg["reset_ema_on_switch"] = False
         slot = AdaptiveStepSlot(initial_steps=15, cfg=cfg)
-        trace = []
-        for _ in range(200):
-            slot.update([{15: 1.96, 3: 1.54}[slot.current_steps]])
-            trace.append(slot.current_steps)
-        # Documents why the reset exists: the shared EMA carries a steps=15
-        # reading into steps=3, where it reads as a near-perfect chain.
-        self.assertGreater(len(set(trace[:60])), 1)
+        # Force a switch, then feed values that would otherwise decide again.
+        while slot.current_steps == 15:
+            slot.update([1.0])
+        switched_at = slot._batch_count
+        for _ in range(cfg["switch_grace_batches"] - 1):
+            self.assertFalse(slot.update([3.0]), "decided inside the grace window")
+        self.assertEqual(slot.current_steps, 3)
+        self.assertGreaterEqual(
+            slot._grace_until - switched_at, cfg["switch_grace_batches"] - 1
+        )
 
 
 if __name__ == "__main__":
