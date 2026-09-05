@@ -191,3 +191,55 @@ def test_decode_and_tree_paths_untouched():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_transposed_state_layout():
+    """kda_backend passes conv_state/intermediate window as transposed views;
+    the chain kernel must honour the strides the same way the serial one does."""
+    _skip_if_no_cuda()
+    bs, dim, seqlen, width = 2, 256, 8, 4
+    dtype = torch.bfloat16
+    ncl = 6
+    g = torch.Generator(device="cuda").manual_seed(11)
+    x = (
+        torch.randn((bs, seqlen, dim), generator=g, device="cuda", dtype=torch.float32)
+        .to(dtype)
+        .transpose(1, 2)
+    )
+    state_t = torch.randn(
+        (ncl, width - 1, dim), generator=g, device="cuda", dtype=torch.float32
+    ).to(dtype)
+    weight = torch.randn(
+        (dim, width), generator=g, device="cuda", dtype=torch.float32
+    ).to(dtype)
+    bias = torch.randn((dim,), generator=g, device="cuda", dtype=torch.float32).to(dtype)
+    idx = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+    iidx = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
+
+    def go(chain):
+        st = state_t.clone()
+        inter = torch.zeros((ncl, seqlen, width - 1, dim), device="cuda", dtype=dtype)
+        out = torch.empty_like(x)
+        old = ccv._CHAIN_PARALLEL_ENABLED
+        ccv._CHAIN_PARALLEL_ENABLED = chain
+        try:
+            ccv.causal_conv1d_update(
+                x,
+                st.transpose(-1, -2),
+                weight,
+                bias,
+                "silu",
+                conv_state_indices=idx,
+                intermediate_conv_window=inter.transpose(-1, -2),
+                intermediate_state_indices=iidx,
+                out=out,
+            )
+        finally:
+            ccv._CHAIN_PARALLEL_ENABLED = old
+        torch.cuda.synchronize()
+        return out, st, inter
+
+    a, b = go(False), go(True)
+    assert torch.equal(a[0], b[0])
+    assert torch.equal(a[1], b[1])
+    assert torch.equal(a[2], b[2])
