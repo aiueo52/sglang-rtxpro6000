@@ -133,13 +133,13 @@ class TestControllerSettles(CustomTestCase):
 
     CFG = {
         "candidate_steps": [3, 15],
-        "ema_alpha": 0.1,
+        "ema_alpha": 0.07,
         "update_interval": 20,
         "warmup_batches": 15,
         "switch_grace_batches": 40,
-        "down_hysteresis": 3.5,
+        "down_hysteresis": 2.5,
         "up_hysteresis": 0.0,
-        "reset_ema_on_switch": False,
+        "reset_ema_on_switch": "down",
     }
 
     LAG = 2  # verify results reach the controller this many batches late
@@ -163,20 +163,20 @@ class TestControllerSettles(CustomTestCase):
         return slot, trace
 
     def test_prose_settles_at_three(self):
-        # measured num_correct_drafts (acc - 1): prose-en 1.96 @15, 1.54 @3
-        slot, trace = self._run({15: 1.96, 3: 1.54})
+        # measured num_correct_drafts (acc - 1): prose-en 1.83 @15, 1.51 @3
+        slot, trace = self._run({15: 1.83, 3: 1.51})
         self.assertEqual(slot.current_steps, 3)
         self.assertEqual(trace[-50:], [3] * 50)
 
     def test_code_settles_at_fifteen(self):
-        # code-edit 8.85 @15, 2.81 @3
-        slot, trace = self._run({15: 8.85, 3: 2.81})
+        # code-edit 9.87 @15, 2.86 @3
+        slot, trace = self._run({15: 9.87, 3: 2.86})
         self.assertEqual(slot.current_steps, 15)
         self.assertEqual(trace[-50:], [15] * 50)
 
     def test_agent_settles_at_three(self):
-        # agent-loop 3.76 @15, 2.24 @3 -- W4 is the faster profile there
-        slot, trace = self._run({15: 3.76, 3: 2.24})
+        # agent-loop 3.82 @15, 2.29 @3 -- W4 is the faster profile there
+        slot, trace = self._run({15: 3.82, 3: 2.29})
         self.assertEqual(slot.current_steps, 3)
         self.assertEqual(trace[-50:], [3] * 50)
 
@@ -192,14 +192,24 @@ class TestControllerSettles(CustomTestCase):
     def test_switch_count_stays_small(self):
         """The 2026-09-05 run made 489 switches in 90s; bound the churn."""
         for name, accept in (
-            ("prose-en", {15: 1.96, 3: 1.54}),
-            ("code-edit", {15: 8.85, 3: 2.81}),
-            ("agent-loop", {15: 3.76, 3: 2.24}),
+            ("prose-en", {15: 1.83, 3: 1.51}),
+            ("code-edit", {15: 9.87, 3: 2.86}),
+            ("agent-loop", {15: 3.82, 3: 2.29}),
         ):
             with self.subTest(name):
                 _, trace = self._run(accept, batches=300)
                 switches = sum(a != b for a, b in zip(trace, trace[1:]))
                 self.assertLessEqual(switches, 4, f"{name}: {switches} switches")
+
+    def test_reseed_is_downward_only(self):
+        """Stepping down re-seeds at the new neutral; stepping up must not."""
+        slot = AdaptiveStepSlot(initial_steps=15, cfg=dict(self.CFG))
+        slot.ema_accept_len = 9.0
+        self.assertTrue(slot._apply_target_steps(15, 3))
+        self.assertEqual(slot.ema_accept_len, 2.0)
+        slot.ema_accept_len = 2.9
+        self.assertTrue(slot._apply_target_steps(3, 15))
+        self.assertEqual(slot.ema_accept_len, 2.9)
 
     def test_grace_window_holds_decisions_after_a_switch(self):
         """No second decision until the post-switch transient has passed."""

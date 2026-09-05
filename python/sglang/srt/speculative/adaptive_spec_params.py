@@ -164,14 +164,27 @@ class AdaptiveStepSlot:
         self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
         # One EMA is shared by every candidate, but the quantity it tracks
         # (accepted drafts per verify) is bounded by the *current* step count,
-        # so its scale changes with every switch: an EMA of 5.9 that justified
-        # leaving steps=15 is an impossibly high reading at steps=3 and would
-        # bounce straight back up. Re-seeding it at the new step's neutral
-        # value (target - 1, the same convention __init__ and the steps=0 probe
-        # use) makes each candidate's threshold a statement about that
-        # candidate, and turns a switch into a probe that the next update
-        # confirms or undoes. Off by default (upstream behaviour).
+        # so its scale changes with every switch. False (upstream), True, or
+        # "down".
+        #
+        # "down" is what this model wants, and the asymmetry is the point.
+        # Stepping DOWN carries a large-chain EMA into a small chain, where it
+        # reads as a near-perfect chain: agent-loop measures 2.29 accepted
+        # drafts at steps=3 but arrives carrying ~4.4, and the 20-batch window
+        # is not long enough to forget it, so it steps straight back up and
+        # oscillates. Re-seeding at the new step's neutral value (target - 1,
+        # the convention __init__ and the steps=0 probe use) makes the window
+        # measure the new setting instead. Stepping UP has the opposite need:
+        # the carried small-chain EMA is a *pessimistic* start that the long
+        # chain quickly beats, whereas re-seeding at 14 would make every
+        # workload look worth 15 steps for a window (measured: 489 switches in
+        # 90 s).
         self.reset_ema_on_switch = cfg.get("reset_ema_on_switch", False)
+        if self.reset_ema_on_switch not in (True, False, "down"):
+            raise ValueError(
+                "reset_ema_on_switch must be true, false or \"down\", got "
+                f"{self.reset_ema_on_switch!r}"
+            )
         # Batches after a switch during which no new decision may be taken.
         # A swap leaves the draft model cold (its per-step KV branches and the
         # state's QSA shared-index buffers were captured for the other step
@@ -320,7 +333,10 @@ class AdaptiveStepSlot:
             decided_at = self.ema_accept_len
             self.current_steps = target
             self._grace_until = self._batch_count + self.switch_grace_batches
-            if self.reset_ema_on_switch and target > 0:
+            if target > 0 and (
+                self.reset_ema_on_switch is True
+                or (self.reset_ema_on_switch == "down" and target < old_steps)
+            ):
                 self.ema_accept_len = float(target - 1)
             log_info_on_rank0(
                 logger,

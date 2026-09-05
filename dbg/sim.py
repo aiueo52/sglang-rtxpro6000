@@ -17,11 +17,13 @@ def pool(mean, steps, spread):  # noqa
         return lambda r: hi if r.random() < p else lo
     return lambda r: min(steps, max(0, round(r.gauss(mean, 0.9))))
 
+# Post-fix measured accepted drafts per verify (fnbench acc - 1), 2026-09-05
+# 21:07-21:27 fixed-profile runs.
 WL = {  # name -> {steps: (mean, bimodal)}
-    "code-edit": {15: (10.85, True), 3: (2.77, True)},
-    "agent-loop": {15: (4.59, True), 3: (2.22, False)},
-    "prose-en": {15: (1.99, False), 3: (1.50, False)},
-    "prose-ja": {15: (1.64, False), 3: (1.46, False)},
+    "code-edit": {15: (9.87, True), 3: (2.86, True)},
+    "agent-loop": {15: (3.82, True), 3: (2.29, False)},
+    "prose-en": {15: (1.83, False), 3: (1.51, False)},
+    "prose-ja": {15: (1.55, False), 3: (1.31, False)},
 }
 # Cost model: ms/iteration = 9.74 + 0.70*S (prof/OVERHEAD_REPORT.md)
 STEP_MS = lambda s: 9.74 + 0.70 * s
@@ -68,6 +70,9 @@ cfgs = {
   "v3 grace40/noreseed": {"candidate_steps":[3,15],"ema_alpha":0.1,"update_interval":20,
                        "warmup_batches":15,"switch_grace_batches":40,"down_hysteresis":3.5,
                        "up_hysteresis":0.0,"reset_ema_on_switch":False},
+  "v4 shipped (down-reseed)": {"candidate_steps":[3,15],"ema_alpha":0.07,"update_interval":20,
+                       "warmup_batches":15,"switch_grace_batches":40,"down_hysteresis":2.5,
+                       "up_hysteresis":0.0,"reset_ema_on_switch":"down"},
 }
 for name, cfg in cfgs.items():
     print(f"--- {name}")
