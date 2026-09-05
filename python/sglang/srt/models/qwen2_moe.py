@@ -128,6 +128,8 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 # combine's apply stage do the `routed + gate * shared` join, so the separate
 # post-join gate/mul/add kernel disappears from the boundary.
 _SHARED_GATE_EARLY = envs.SGLANG_SHARED_GATE_EARLY.get()
+# The HC apply that absorbs the join only runs at decode widths (<= 32 rows).
+_SHARED_GATE_EARLY_MAX_ROWS = 32
 
 logger = logging.getLogger(__name__)
 
@@ -708,12 +710,19 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     def _shared_gate_early_ok(
         self, hidden_states: torch.Tensor, use_fused_gate: bool
     ) -> bool:
-        """Whether the shared-expert join can be deferred to the HC combine."""
+        """Whether the shared-expert join can be deferred to the HC combine.
+
+        Decode widths only. The HC apply that absorbs the join is itself
+        decode-only, so at prefill width deferring would buy nothing and would
+        pin a [tokens, hidden] tensor per layer until that layer's next MoE
+        forward -- 2 GB across the 48 layers at an 8k prefill chunk, which is
+        more than the W4 profile's headroom.
+        """
         return bool(
             _SHARED_GATE_EARLY
             and use_fused_gate
             and self.shared_expert is not None
-            and hidden_states.shape[0] > 0
+            and 0 < hidden_states.shape[0] <= _SHARED_GATE_EARLY_MAX_ROWS
             and self.tp_size == 1
             and get_moe_a2a_backend().is_none()
             and hidden_states.dtype == torch.bfloat16
