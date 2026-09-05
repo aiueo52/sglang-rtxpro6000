@@ -41,12 +41,14 @@ def _store_split(
     y2_ptr,
     offs_m,
     offs_n,
+    n_lo,
     stride_ym,
     stride_yn,
     stride_y2m,
     m_mask,
     n_mask,
     SPLIT_N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     """Write the rounded accumulator to `y`, or to `y`/`y2` split at column SPLIT_N.
 
@@ -54,24 +56,43 @@ def _store_split(
     original epilogue. With SPLIT_N > 0 columns [0, SPLIT_N) land in `y` and
     columns [SPLIT_N, N) land in `y2` at column `n - SPLIT_N`; both stores see
     the same rounded value, so the numerics are identical either way.
+
+    An n block that lies wholly on one side of the split (every block, when
+    BLOCK_N divides SPLIT_N) takes a single unconditional store; only a block
+    that straddles the split pays for two masked ones.
     """
     # Round to bf16 first even when the destination is fp32: an fp32 destination
     # is only ever the shared logits buffer, whose old contents were a bf16
     # result widened by `.copy_()`. Rounding here keeps that bit-identical.
     val = acc.to(tl.bfloat16).to(y_ptr.dtype.element_ty)
     if SPLIT_N > 0:
-        lo = offs_n < SPLIT_N
-        tl.store(
-            y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
-            val,
-            mask=m_mask[:, None] & n_mask[None, :] & lo[None, :],
-        )
-        n2 = tl.maximum(offs_n - SPLIT_N, 0)
-        tl.store(
-            y2_ptr + offs_m[:, None] * stride_y2m + n2[None, :] * stride_yn,
-            val,
-            mask=m_mask[:, None] & n_mask[None, :] & (offs_n >= SPLIT_N)[None, :],
-        )
+        if n_lo + BLOCK_N <= SPLIT_N:
+            tl.store(
+                y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+                val,
+                mask=m_mask[:, None] & n_mask[None, :],
+            )
+        elif n_lo >= SPLIT_N:
+            tl.store(
+                y2_ptr
+                + offs_m[:, None] * stride_y2m
+                + (offs_n - SPLIT_N)[None, :] * stride_yn,
+                val,
+                mask=m_mask[:, None] & n_mask[None, :],
+            )
+        else:
+            lo = offs_n < SPLIT_N
+            tl.store(
+                y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
+                val,
+                mask=m_mask[:, None] & n_mask[None, :] & lo[None, :],
+            )
+            n2 = tl.maximum(offs_n - SPLIT_N, 0)
+            tl.store(
+                y2_ptr + offs_m[:, None] * stride_y2m + n2[None, :] * stride_yn,
+                val,
+                mask=m_mask[:, None] & n_mask[None, :] & (offs_n >= SPLIT_N)[None, :],
+            )
     else:
         tl.store(
             y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
@@ -167,12 +188,14 @@ def _w8a16_gemv_kernel(
             y2_ptr,
             offs_m,
             offs_n,
+            pid_n * BLOCK_N,
             stride_ym,
             stride_yn,
             stride_y2m,
             m_mask,
             n_mask,
             SPLIT_N,
+            BLOCK_N,
         )
         return
 
@@ -197,12 +220,14 @@ def _w8a16_gemv_kernel(
             y2_ptr,
             offs_m,
             offs_n,
+            pid_n * BLOCK_N,
             stride_ym,
             stride_yn,
             stride_y2m,
             m_mask,
             n_mask,
             SPLIT_N,
+            BLOCK_N,
         )
         # Every increment for this N block has happened, so a plain store is enough to
         # leave the counter at 0 for the next launch / graph replay.
