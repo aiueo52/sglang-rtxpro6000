@@ -110,7 +110,7 @@ def _w8a16_gemv_kernel(
     EVEN_K: tl.constexpr,
     W_KN: tl.constexpr,
     USE_DOT: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -601,7 +601,7 @@ def _w8a16_gemv_silu_kernel(
     SPLITS: tl.constexpr,
     EVEN_K: tl.constexpr,
     USE_DOT: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)

@@ -156,7 +156,7 @@ def _hc_branch_stats_kernel(
     FUSE_GATE: tl.constexpr,
     FUSE_APPLY: tl.constexpr,
     PREV_SPLITS: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     m = pid // HC
@@ -276,7 +276,7 @@ def _hc_down_kernel(
     REDUNDANT_STATS: tl.constexpr,
     READ_NORMED: tl.constexpr,
     W_FP8: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     kg = tl.program_id(0)
     nb = tl.program_id(1)
@@ -371,7 +371,7 @@ def _hc_up_kernel(
     BLOCK_R: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     W_FP8: tl.constexpr,
-    USE_PDL: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     jb = tl.program_id(0)
     pdl_wait(USE_PDL)
