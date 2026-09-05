@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
+
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 _is_hip = is_hip()
@@ -178,8 +180,12 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
     HEAD_QK: tl.constexpr,
     HEAD_V: tl.constexpr,
     V_POW2: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     i_bs, i_qk = tl.program_id(0), tl.program_id(1)
+    # Pure split/copy of the fused qkvz/ba GEMV output: every load is dependent,
+    # so the wait goes first and PDL only buys the scheduling ramp.
+    pdl_wait(USE_PDL)
 
     V_PER_GROUP: tl.constexpr = NUM_HEADS_V // NUM_HEADS_QK
 
@@ -267,6 +273,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
         blk_a_st_ptr = a + i_bs * NUM_HEADS_V + i_qk * V_PER_GROUP + i
         tl.store(blk_a_st_ptr, tl.load(blk_a_ptr))
 
+    pdl_trigger(USE_PDL)
+
 
 def fused_qkvzba_split_reshape_cat_contiguous(
     mixed_qkvz,
@@ -351,6 +359,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         head_qk,
         head_v,
         V_POW2=(v_per_group & (v_per_group - 1)) == 0,
+        USE_PDL=PDL,
+        launch_pdl=PDL,
         num_warps=num_warps,
         num_stages=3,
     )
