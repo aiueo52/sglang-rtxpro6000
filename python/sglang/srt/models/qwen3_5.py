@@ -948,6 +948,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if (
             (_GDN_AB_STASH_DIRECT or _GDN_PROJ_DIRECT_LAYOUT)
             and _is_cuda
+            and isinstance(hidden_states, torch.Tensor)
             and hidden_states.dim() == 2
         ):
             if _GDN_AB_STASH_DIRECT:
