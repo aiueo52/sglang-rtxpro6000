@@ -110,16 +110,19 @@ def numerics():
     gv.NORM_INTO_GEMV = True
     w, sc = _fp8_weight(HIDDEN, VALUE_DIM, seed=3)
     nw = (torch.randn(HEAD_V, device=dev) * 0.3 + 1.0).to(torch.bfloat16)
-    for M in MS:
+    # The served checkpoint has output_gate_type=sigmoid; swish is the fla
+    # default, so both gates are covered.
+    for act, M in [(a, m) for a in ("sigmoid", "swish") for m in MS]:
         x = (torch.randn(M * NUM_V, HEAD_V, device=dev) * 0.5).to(torch.bfloat16)
         z = (torch.randn(M * NUM_V, HEAD_V, device=dev) * 0.5).to(torch.bfloat16)
         normed = rms_norm_gated(
             x=x, weight=nw, bias=None, z=z, eps=1e-6, group_size=None,
-            norm_before_gate=True, is_rms_norm=True, activation="swish",
+            norm_before_gate=True, is_rms_norm=True, activation=act,
         )
         ref = gv.w8a16_gemv(normed.view(M, VALUE_DIM), w, sc)
         got = gv.w8a16_gemv_norm_gated(
-            x.view(M, VALUE_DIM), w, sc, z.view(M, VALUE_DIM), nw, HEAD_V, 1e-6
+            x.view(M, VALUE_DIM), w, sc, z.view(M, VALUE_DIM), nw, HEAD_V, 1e-6,
+            sigmoid_gate=(act == "sigmoid"),
         )
         torch.cuda.synchronize()
         u, frac = _ulp_report(ref, got)
@@ -136,7 +139,7 @@ def numerics():
         un, fn = _ulp_report(yc, got)
         ok &= un <= 1
         print(
-            f"  M={M:2d}  vs server-plan ref: max_ulp={u} ({frac*100:.2f}%)  "
+            f"  {act:7s} M={M:2d}  vs server-plan ref: max_ulp={u} ({frac*100:.2f}%)  "
             f"max_rel={rel:.2e}   | split-K retile alone: {uc} ulp ({fc*100:.2f}%)"
             f"   | norm fold alone: {un} ulp ({fn*100:.2f}%)   plan={cfg}"
         )

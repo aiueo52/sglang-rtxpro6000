@@ -51,6 +51,14 @@ def _env_flag(name: str, default: str = "0") -> bool:
 #: CTA straddles and every CTA has exactly one destination. Each weight row is
 #: still read by exactly one CTA running the same k loop, so the output is
 #: bit-identical -- only the (pid_n -> columns) map changes.
+#:
+#: Measured (server A/B 2026-09-06, in_proj_ba grid [3,1,1] -> [4,1,1], CUPTI
+#: medians): W16 code-edit 7.82 -> 7.61 us/call, W16 prose-en 7.43 -> 7.23,
+#: W4 code-edit 5.82 -> 5.84, W4 prose-en 5.61 -> 6.16. So it recovers ~0.2 us
+#: of the 0.9 us the split costs at M=16 and is neutral-to-noise at M=4.
+#: Below the 1 us/call bar -> RECOMMENDED OFF; kept because it is bit-exact and
+#: is the right shape for any future two-destination split that is not
+#: launch-bound at 3-4 CTAs.
 BA_SPLIT_GRID = _env_flag("SGLANG_GEMV_BA_SPLIT_GRID")
 
 
@@ -694,6 +702,24 @@ NORM_INTO_GEMV = _env_flag("SGLANG_NORM_INTO_GEMV")
 #   M    plain gemv + norm      fused (64, 128, 4, 8w)
 #    4   12.54 + 1.31 = 13.85   13.44   (-0.41)
 #   16   12.74 + 1.50 = 14.24   14.08   (-0.16)
+#
+# In the server the norm launch costs 1.88 us (W4) / 1.98 us (W16) rather than
+# the 1.3-1.5 us it costs here, so the fold is worth more there. Server A/B
+# (2026-09-06, out_proj grid [80,6,1] -> [40,4,1], CUPTI medians per call):
+#
+#   profile / workload   plain + norm            fused    delta
+#   W4  code-edit        13.84 + 1.88 = 15.72    14.13    -1.59
+#                                                14.50    -1.22
+#   W4  prose-en         13.19 + 1.88 = 15.07    14.06    -1.01
+#                                                15.26    +0.19
+#   W16 code-edit        13.11 + 1.98 = 15.09    14.04    -1.05
+#                                                14.01    -1.08
+#   W16 prose-en         12.96 + 1.98 = 14.94    13.75    -1.19
+#                                                14.30    -0.64
+#
+# (two independent server sessions per row) -> mean -0.95, median -1.06
+# us/call over 36 GDN layers = -36 us/step, and 36 of the 1596 (W4) / 2211
+# (W16) kernels per step disappear.
 _FUSED_NORM_BY_SHAPE = {
     (4, 2560, 6144, 128): (64, 128, 4, True, None, 8, 4),
     (16, 2560, 6144, 128): (64, 128, 4, True, None, 8, 3),
