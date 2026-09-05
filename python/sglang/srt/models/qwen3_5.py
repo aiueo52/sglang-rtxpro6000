@@ -23,6 +23,10 @@ import torch
 import os as _os
 
 _GDN_BA_TRITON_GEMV = _os.environ.get("SGLANG_GDN_BA_TRITON_GEMV", "0") == "1"
+# R2: a/b are written straight into the RecoverSSM stash, so the two per-layer
+# stash copies of the verify step disappear. Destination change only -- the
+# stored values are the same bytes.
+_GDN_AB_STASH_DIRECT = _os.environ.get("SGLANG_GDN_AB_STASH_DIRECT", "0") == "1"
 import torch.nn as nn
 import triton
 
@@ -748,6 +752,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba = self._in_proj_ba_skinny(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
+    def _gdn_ab_stash_out(self, forward_batch: ForwardBatch, num_tokens: int):
+        """(a, b) destinations inside the RecoverSSM stash, or None.
+
+        Only a FlashInfer-recovery target-verify has one; every other mode (and
+        every other backend) gets None and keeps its own a/b allocation.
+        """
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+
+        backend = get_attn_backend()
+        backend = getattr(backend, "linear_attn_backend", backend)
+        fn = getattr(backend, "gdn_ab_stash_out", None)
+        if fn is None:
+            return None
+        return fn(
+            self.attn,
+            forward_batch,
+            num_tokens,
+            self.in_proj_ba.weight.dtype,
+            self.in_proj_ba.weight.device,
+        )
+
     def _forward_xpu(
         self,
         backend: object,
@@ -793,6 +818,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        ab_out = None
+        if _GDN_AB_STASH_DIRECT and _is_cuda and hidden_states.dim() == 2:
+            ab_out = self._gdn_ab_stash_out(forward_batch, hidden_states.shape[0])
+
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -824,6 +853,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 num_v_heads_tp,
                 self.head_k_dim,
                 self.head_v_dim,
+                out_a=None if ab_out is None else ab_out[0],
+                out_b=None if ab_out is None else ab_out[1],
             )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(

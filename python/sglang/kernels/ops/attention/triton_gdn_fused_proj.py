@@ -275,6 +275,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
     num_heads_v,
     head_qk,
     head_v,
+    out_a=None,
+    out_b=None,
 ):
     """Fused split/reshape/cat for CONTIGUOUS input format (Qwen3.5).
 
@@ -287,6 +289,10 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         z: [num_v_heads, head_v]
         b: [num_v_heads]
         a: [num_v_heads]
+
+    ``out_a`` / ``out_b`` let the caller own the a/b destination (the RecoverSSM
+    stash slice, SGLANG_GDN_AB_STASH_DIRECT=1) so the kernel writes it in place
+    of a fresh allocation; the stored values are unchanged.
     """
     batch, seq_len = mixed_qkvz.shape[0], 1
     qkv_dim_t = num_heads_qk * head_qk * 2 + num_heads_v * head_v
@@ -300,12 +306,23 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         dtype=mixed_qkvz.dtype,
         device=mixed_qkvz.device,
     )
-    b = torch.empty(
-        [batch * seq_len, num_heads_v],
-        dtype=mixed_ba.dtype,
-        device=mixed_ba.device,
-    )
-    a = torch.empty_like(b)
+    ba_shape = [batch * seq_len, num_heads_v]
+
+    def _ba_out(out):
+        if out is None:
+            return torch.empty(
+                ba_shape, dtype=mixed_ba.dtype, device=mixed_ba.device
+            )
+        assert (
+            list(out.shape) == ba_shape
+            and out.dtype == mixed_ba.dtype
+            and out.device == mixed_ba.device
+            and out.is_contiguous()
+        ), f"gdn split out= must be a contiguous {ba_shape} {mixed_ba.dtype} tensor"
+        return out
+
+    b = _ba_out(out_b)
+    a = _ba_out(out_a)
     if _is_hip and batch * seq_len == 0:
         return mixed_qkv, z, b, a
     v_per_group = num_heads_v // num_heads_qk

@@ -1,3 +1,5 @@
+import os
+
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -59,6 +61,9 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+_GDN_AB_STASH_DIRECT = os.environ.get("SGLANG_GDN_AB_STASH_DIRECT", "0") == "1"
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -432,6 +437,97 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Triton-recovery path (which uses the flat k/v stash instead).
         self._conv_out_persist: Dict[int, torch.Tensor] = {}
 
+    def _fi_ab_stash(self, layer, draft_token_num: int, head_shape, dtype, device):
+        """Allocate-or-return this layer's FlashInfer-recovery a/b stash.
+
+        Shared by the verify forward and (with SGLANG_GDN_AB_STASH_DIRECT=1) the
+        GDN projection, which writes a/b straight into ``[:batch_size]`` instead
+        of copying them in afterwards. The buffers are allocated once per layer
+        and never resized, so the addresses the recovery graphs capture stay
+        valid.
+        """
+        stash_entry = self._no_cache_stash.get(layer.layer_id)
+        if stash_entry is None or "conv_dims" not in stash_entry:
+            pool_size = self.req_to_token_pool.size
+            # Allocate outside inference_mode so buffers can be updated
+            # across forward invocations.
+            with torch.inference_mode(False):
+                stash_entry = {
+                    "a": torch.empty(
+                        (pool_size, draft_token_num, *head_shape),
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "b": torch.empty(
+                        (pool_size, draft_token_num, *head_shape),
+                        dtype=dtype,
+                        device=device,
+                    ),
+                    "A_log": layer.A_log,
+                    "dt_bias": layer.dt_bias,
+                    # A_log is always float32 (all GDN models define it
+                    # with dtype=torch.float32). No detach or cast needed.
+                    "A_log_f32": layer.A_log,
+                }
+            self._no_cache_stash[layer.layer_id] = stash_entry
+        stash_entry["conv_dims"] = (
+            layer.q_dim,
+            layer.k_dim,
+            layer.v_dim,
+            layer.num_k_heads,
+            layer.head_k_dim,
+            layer.num_v_heads,
+            layer.head_v_dim,
+        )
+        return stash_entry
+
+    def gdn_ab_stash_out(
+        self,
+        layer,
+        forward_batch: ForwardBatch,
+        num_tokens: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        """Destinations for a/b so the projection writes the stash directly.
+
+        Returns ``(a_out, b_out)`` as flat ``[num_tokens, num_v_heads]`` views of
+        this layer's persistent RecoverSSM stash, or None when this call is not a
+        FlashInfer-recovery target-verify (every other mode keeps allocating its
+        own a/b). ``forward_extend`` detects the aliasing by data_ptr and skips
+        the copy.
+        """
+        if not (_GDN_AB_STASH_DIRECT and self._recover_ssm):
+            return None
+        if not forward_batch.forward_mode.is_target_verify():
+            return None
+        spec_info = forward_batch.spec_info
+        draft_token_num = getattr(spec_info, "draft_token_num", None)
+        if not draft_token_num or num_tokens % draft_token_num:
+            return None
+        batch_size = num_tokens // draft_token_num
+        if batch_size > self.req_to_token_pool.size:
+            return None
+        from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+            fi_recovery_kernel,
+        )
+
+        if fi_recovery_kernel(self) is None:
+            return None
+        stash_entry = self._fi_ab_stash(
+            layer, draft_token_num, (layer.num_v_heads,), dtype, device
+        )
+        if (
+            stash_entry["a"].shape[1] != draft_token_num
+            or stash_entry["a"].shape[2] != layer.num_v_heads
+            or stash_entry["a"].dtype != dtype
+        ):
+            return None
+        return (
+            stash_entry["a"][:batch_size].view(num_tokens, layer.num_v_heads),
+            stash_entry["b"][:batch_size].view(num_tokens, layer.num_v_heads),
+        )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
@@ -751,49 +847,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     # a/b are pre-shaped [pool_size, T, ...] — a [:B] slice already
                     # has the right shape. The presence of "conv_dims" also tells
                     # recovery to take the FI / conv-out-view path.
-                    needs_realloc = (
-                        stash_entry is None or "conv_dims" not in stash_entry
-                    )
-                    if needs_realloc:
-                        # Allocate outside inference_mode so buffers can be updated
-                        # across forward invocations.
-                        with torch.inference_mode(False):
-                            stash_entry = {
-                                "a": torch.empty(
-                                    (pool_size, draft_token_num, *a.shape[1:]),
-                                    dtype=a.dtype,
-                                    device=a.device,
-                                ),
-                                "b": torch.empty(
-                                    (pool_size, draft_token_num, *b.shape[1:]),
-                                    dtype=b.dtype,
-                                    device=b.device,
-                                ),
-                                "A_log": layer.A_log,
-                                "dt_bias": layer.dt_bias,
-                                # A_log is always float32 (all GDN models define it
-                                # with dtype=torch.float32). No detach or cast needed.
-                                "A_log_f32": layer.A_log,
-                            }
-                        self._no_cache_stash[layer.layer_id] = stash_entry
-                    stash_entry["conv_dims"] = (
-                        layer.q_dim,
-                        layer.k_dim,
-                        layer.v_dim,
-                        layer.num_k_heads,
-                        layer.head_k_dim,
-                        layer.num_v_heads,
-                        layer.head_v_dim,
+                    stash_entry = self._fi_ab_stash(
+                        layer, draft_token_num, a.shape[1:], a.dtype, a.device
                     )
                     # a/b arrive flat [B*T, ...]; view into [B, T, ...] before the
                     # in-place copy. k/v are NOT copied — recovery reads them from
-                    # _conv_out_persist views.
-                    stash_entry["a"][:batch_size].copy_(
-                        a.view(batch_size, draft_token_num, *a.shape[1:])
-                    )
-                    stash_entry["b"][:batch_size].copy_(
-                        b.view(batch_size, draft_token_num, *b.shape[1:])
-                    )
+                    # _conv_out_persist views. With SGLANG_GDN_AB_STASH_DIRECT=1
+                    # the projection already wrote into these very buffers
+                    # (gdn_ab_stash_out); the alias test skips the redundant copy.
+                    if a.data_ptr() != stash_entry["a"].data_ptr():
+                        stash_entry["a"][:batch_size].copy_(
+                            a.view(batch_size, draft_token_num, *a.shape[1:])
+                        )
+                    if b.data_ptr() != stash_entry["b"].data_ptr():
+                        stash_entry["b"][:batch_size].copy_(
+                            b.view(batch_size, draft_token_num, *b.shape[1:])
+                        )
                 else:
                     # Triton recovery: flat stash holds the post-conv k/v + a/b
                     # (the Triton recover kernel reads flat [rows, tokens, ...]
