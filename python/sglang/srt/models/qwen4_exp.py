@@ -1414,7 +1414,14 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        hidden_states = self.mlp_hyper_connection.combine(hidden_states, residual)
+        # R6: when the MoE deferred its shared-expert join, hand it to the HC
+        # apply so `routed + gate * shared` and the residual update are one
+        # kernel. `_pending_shared_join` is reset by every MoE forward.
+        pending = getattr(self.mlp, "_pending_shared_join", None)
+        shared_output, shared_gate = pending if pending is not None else (None, None)
+        hidden_states = self.mlp_hyper_connection.combine(
+            hidden_states, residual, shared_output, shared_gate
+        )
         return hidden_states, None
 
 

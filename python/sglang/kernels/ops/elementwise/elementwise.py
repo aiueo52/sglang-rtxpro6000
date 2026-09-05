@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -547,3 +549,108 @@ def fused_gate_sigmoid_mul_add(
         **config,
         **pdl_kwargs,
     )
+
+
+@triton.jit
+def _shared_expert_gate_kernel(
+    hidden_states_ptr,  # [num_tokens, hidden_dim]
+    gate_weight_ptr,  # [hidden_dim]
+    gate_out_ptr,  # [num_tokens] fp32
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    row_offset = pid * hidden_dim
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+    w = tl.load(gate_weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    h = tl.load(hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    tl.store(gate_out_ptr + pid, tl.sigmoid(tl.sum(h * w, axis=0)))
+
+
+def _gate_launch_config(hidden_dim: int, num_tokens: int) -> dict:
+    max_warps = 16 if _is_hip else 32
+    config = {
+        "BLOCK_SIZE": triton.next_power_of_2(hidden_dim),
+        "num_warps": max(
+            min(triton.next_power_of_2(triton.cdiv(hidden_dim, 256)), max_warps), 4
+        ),
+    }
+    if num_tokens >= 1024:
+        config["num_warps"] = min(config["num_warps"], 8)
+    return config
+
+
+def shared_expert_gate_sigmoid(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """`sigmoid(hidden_states @ gate_weight)` as fp32, one value per row.
+
+    This is the gate half of `fused_gate_sigmoid_mul_add`, split out so it can
+    run before the routed experts (SGLANG_SHARED_GATE_EARLY): it depends only
+    on the MoE input. The block shape and warp count match the fused kernel, so
+    the reduction tree -- and therefore the gate value -- is bit-identical.
+    """
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
+    num_tokens, hidden_dim = hidden_states.shape
+    assert gate_weight.shape == (hidden_dim,)
+    if out is None:
+        out = torch.empty(
+            num_tokens, dtype=torch.float32, device=hidden_states.device
+        )
+    _shared_expert_gate_kernel[(num_tokens,)](
+        hidden_states,
+        gate_weight,
+        out,
+        hidden_dim=hidden_dim,
+        **_gate_launch_config(hidden_dim, num_tokens),
+    )
+    return out
+
+
+@triton.jit
+def _shared_mul_add_kernel(
+    gate_ptr,  # [num_tokens] fp32
+    shared_output_ptr,  # [num_tokens, hidden_dim]
+    final_hidden_states_ptr,  # [num_tokens, hidden_dim]
+    hidden_dim: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    row_offset = pid * hidden_dim
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < hidden_dim
+    g = tl.load(gate_ptr + pid).to(tl.float32)
+    s = tl.load(shared_output_ptr + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    f = tl.load(
+        final_hidden_states_ptr + row_offset + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
+    tl.store(final_hidden_states_ptr + row_offset + offsets, f + g * s, mask=mask)
+
+
+def fused_gate_sigmoid_mul_add_precomputed(
+    final_hidden_states: torch.Tensor,
+    shared_output: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """`final += gate * shared` for a gate already computed as fp32 per row.
+
+    Fallback for shapes the fused HC apply cannot take; the arithmetic and the
+    bf16 store match `fused_gate_sigmoid_mul_add`.
+    """
+    num_tokens, hidden_dim = final_hidden_states.shape
+    _shared_mul_add_kernel[(num_tokens,)](
+        gate,
+        shared_output,
+        final_hidden_states,
+        hidden_dim=hidden_dim,
+        **_gate_launch_config(hidden_dim, num_tokens),
+    )
+    return final_hidden_states
