@@ -131,6 +131,8 @@ def _hc_branch_stats_kernel(
     inv_rms_ptr,
     normed_ptr,
     t_raw_ptr,
+    inject_w_ptr,
+    gate_partials_ptr,
     num_tasks,
     zero_span,
     K,
@@ -141,6 +143,7 @@ def _hc_branch_stats_kernel(
     ZERO_BLOCK: tl.constexpr,
     WRITE_NORMED: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
+    FUSE_GATE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     m = pid // HC
@@ -161,11 +164,26 @@ def _hc_branch_stats_kernel(
         inv_rms = tl.rsqrt(tl.sum(x * x, axis=0) / HS + eps)
         tl.store(inv_rms_ptr + pid, inv_rms)
         if WRITE_NORMED:
-            tl.store(
-                normed_ptr + base + offs,
-                (x * inv_rms * (1.0 + w)).to(normed_ptr.dtype.element_ty),
-                mask=mask_s,
-            )
+            nrm = (x * inv_rms * (1.0 + w)).to(normed_ptr.dtype.element_ty)
+            tl.store(normed_ptr + base + offs, nrm, mask=mask_s)
+            if FUSE_GATE:
+                # HC-combine gate epilogue (SGLANG_HC_GATE_EARLY): this CTA
+                # already holds branch `c` of the normed row, so the branch's
+                # slice of each of the HC inject-weight rows is dotted here and
+                # left as one partial per (row, branch, gate). The apply stage
+                # after the block sums the HC partials; the standalone gate
+                # kernel is then never launched.
+                nrm32 = nrm.to(tl.float32)
+                for cc in tl.static_range(HC):
+                    gw = tl.load(
+                        inject_w_ptr + cc * K + c * HS + offs,
+                        mask=mask_s,
+                        other=0.0,
+                    ).to(tl.float32)
+                    tl.store(
+                        gate_partials_ptr + pid * HC + cc,
+                        tl.sum(nrm32 * gw, axis=0),
+                    )
     else:
         acc = tl.zeros((BLOCK_S,), dtype=tl.float32)
         for s0 in range(0, HS, BLOCK_S):
@@ -453,6 +471,7 @@ def hc_norm_mix2(
     config: HCMix2Config | None = None,
     s_down: torch.Tensor | None = None,
     s_up: torch.Tensor | None = None,
+    inject_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-branch Gemma RMSNorm followed by the gated low-rank mix.
 
@@ -485,6 +504,18 @@ def hc_norm_mix2(
     mixed = torch.empty((rows, hs), dtype=hyper_input.dtype, device=device)
     redundant_stats = config.stats_mode == "redundant"
     read_normed = config.stats_mode == "norm"
+    single_tile = config.stats_block >= hs
+    fuse_gate = (
+        inject_weight is not None
+        and not redundant_stats
+        and read_normed
+        and single_tile
+    )
+    gate_partials = (
+        torch.empty((rows, hc, hc), dtype=torch.float32, device=device)
+        if fuse_gate
+        else None
+    )
     if redundant_stats:
         # No K0 to fold the clear into, so the graph carries a 20 KB memset.
         t_raw = torch.zeros((rows_pad, lowrank), dtype=torch.float32, device=device)
@@ -500,6 +531,8 @@ def hc_norm_mix2(
             inv_rms,
             normed,
             t_raw,
+            inject_weight if fuse_gate else normed,
+            gate_partials if fuse_gate else t_raw,
             num_tasks,
             zero_span,
             k,
@@ -509,7 +542,8 @@ def hc_norm_mix2(
             BLOCK_S=config.stats_block,
             ZERO_BLOCK=max(64, triton.next_power_of_2(zero_span // num_tasks)),
             WRITE_NORMED=read_normed,
-            SINGLE_TILE=config.stats_block >= hs,
+            SINGLE_TILE=single_tile,
+            FUSE_GATE=fuse_gate,
             num_warps=config.stats_warps,
         )
 
@@ -560,4 +594,6 @@ def hc_norm_mix2(
         W_FP8=w_fp8,
         num_warps=config.up_warps,
     )
+    if inject_weight is not None:
+        return mixed, normed, gate_partials
     return mixed, normed

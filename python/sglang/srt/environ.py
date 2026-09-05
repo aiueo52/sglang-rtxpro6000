@@ -209,6 +209,20 @@ class GateGemvMode(IntEnum):
     FUSED = 2
 
 
+class HCGateEarly(IntEnum):
+    """Where the HyperConnection combine gate is computed.
+
+    OFF:    after the block, as the first half of the split combine (today)
+    FUSED:  in the HC mix K0 branch CTAs, which already hold the normed row,
+            so no gate kernel is launched at all
+    MOVED:  the same split gate kernel, launched right after the mix
+    """
+
+    OFF = 0
+    FUSED = 1
+    MOVED = 2
+
+
 class ToolStrictLevel(IntEnum):
     """
     Defines the strictness levels for tool call parsing and validation.
@@ -1020,6 +1034,15 @@ class Envs:
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.
     SGLANG_HC_COMBINE_SPLIT = EnvBool(True)
+    # Compute the HC combine gate at mix time instead of after the block, so
+    # only the apply stage is left on the boundary's post-block critical path.
+    # 0 = off, 1 = fold the partial dots into the HC mix K0 branch CTAs (no
+    # gate launch at all), 2 = keep the split gate kernel but launch it early
+    # (bit-identical values).
+    SGLANG_HC_GATE_EARLY = EnvInt(HCGateEarly.OFF)
+    # Compute the shared-expert gate before the routed experts and fold the
+    # `routed + gate * shared` join into the HC combine's apply stage.
+    SGLANG_SHARED_GATE_EARLY = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at

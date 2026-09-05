@@ -340,6 +340,38 @@ struct HcCombineSplitKernel {
   static constexpr auto gate_kernel = hc_combine_gate_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
   static constexpr auto apply_kernel = hc_combine_apply_kernel<kHcCount, kHiddenSize, kUsePDL, DType>;
 
+  /// Gate stage only: the split partial dots, for a caller that runs the apply
+  /// stage later (SGLANG_HC_GATE_EARLY). Bit-identical to `run`'s first launch.
+  static void
+  run_gate(
+      const tvm::ffi::TensorView normed_residual,
+      const tvm::ffi::TensorView inject_weight,
+      const tvm::ffi::TensorView partials) {
+    using namespace host;
+    using namespace hc_combine_split_detail;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(normed_residual);
+    TensorMatcher({kHcCount, kHcCount * kHiddenSize}).with_dtype<DType>().with_device(device).verify(inject_weight);
+    auto part_rows = SymbolicSize{"partial_rows"};
+    TensorMatcher({part_rows, kSplit, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
+
+    const auto params = HcCombineSplitParams{
+        .block_output = nullptr,
+        .residual = nullptr,
+        .normed_residual = normed_residual.data_ptr(),
+        .inject_weight = inject_weight.data_ptr(),
+        .output = nullptr,
+        .partials = static_cast<float*>(partials.data_ptr()),
+    };
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
+        .enable_pdl(kUsePDL)(gate_kernel, params);
+  }
+
   static void
   run(const tvm::ffi::TensorView block_output,
       const tvm::ffi::TensorView residual,
@@ -377,6 +409,165 @@ struct HcCombineSplitKernel {
     LaunchKernel(dim3(num_tokens, kSplit * kHcCount, 1), kGateThreads, device.unwrap())
         .enable_pdl(kUsePDL)(gate_kernel, params);
     LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(apply_kernel, params);
+  }
+};
+
+struct HcCombineApplyParams {
+  const void* block_output;     // [M, H]  routed / block output
+  const void* residual;         // [M, HC * H]
+  const void* shared_output;    // [M, H], only read when kUseShared
+  const float* shared_gate;     // [M],    only read when kUseShared
+  const float* partials;        // [M, num_partials, HC]
+  void* output;                 // [M, HC * H]
+  int32_t num_partials;
+};
+
+/**
+ * \brief Apply-only stage of the HC combine, for a gate computed earlier.
+ *
+ * Same geometry and math as ``hc_combine_apply_kernel``, except that the number
+ * of gate partial slots is a runtime value: the standalone gate kernel emits
+ * kSplit=8 of them, while the HC-mix K0 epilogue (SGLANG_HC_GATE_EARLY) emits
+ * one per branch CTA, i.e. kHcCount.
+ *
+ * With kUseShared the shared-expert join is folded in as well
+ * (SGLANG_SHARED_GATE_EARLY):
+ *
+ *   y[m, i] = Float(routed[m, i] + gate[m] * shared[m, i])
+ *   out[m, c*H + i] = residual[m, c*H + i] + a[m, c] * y[m, i]
+ *
+ * The intermediate rounding to ``Float`` reproduces the bf16 store that
+ * ``fused_gate_sigmoid_mul_add`` performs before the combine reads it, so the
+ * folded path is bit-identical to the separate-kernel one.
+ */
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename Float, bool kUseShared>
+__global__ __launch_bounds__(hc_combine_split_detail::kApplyThreads) void hc_combine_apply2_kernel(
+    const HcCombineApplyParams __grid_constant__ params) {
+  using namespace device;
+  using namespace hc_combine_split_detail;
+  using Float2 = packed_t<Float>;
+  using Storage = AlignedVector<Float2, 4>;
+  constexpr int64_t kRowSize = kHcCount * kHiddenSize;
+  constexpr uint32_t kVecsPerRow = kRowSize / kVecLen;
+  constexpr uint32_t kVecsPerSplit = kVecsPerRow / kSplit;
+  constexpr uint32_t kVecsPerThread = kVecsPerSplit / kApplyThreads;
+  constexpr uint32_t kVecsPerBranch = kHiddenSize / kVecLen;
+  static_assert(kVecsPerBranch % kVecsPerSplit == 0);
+
+  const uint32_t m = blockIdx.x;
+  const uint32_t split = blockIdx.y;
+  const uint32_t vec_base = split * kVecsPerSplit;
+  const uint32_t branch = vec_base / kVecsPerBranch;
+
+  const auto y_ptr = pointer::offset<Float>(params.block_output, static_cast<int64_t>(m) * kHiddenSize);
+  const auto r_ptr = pointer::offset<Float>(params.residual, static_cast<int64_t>(m) * kRowSize);
+  const auto out_ptr = pointer::offset<Float>(params.output, static_cast<int64_t>(m) * kRowSize);
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const int32_t num_partials = params.num_partials;
+  float total = 0.0f;
+  for (int32_t s = 0; s < num_partials; ++s) {
+    total += params.partials[(static_cast<int64_t>(m) * num_partials + s) * kHcCount + branch];
+  }
+  const float a = 2.0f / (1.0f + math::exp(-total / kHcCount));
+
+  float g = 0.0f;
+  const void* s_ptr = nullptr;
+  if constexpr (kUseShared) {
+    g = params.shared_gate[m];
+    s_ptr = pointer::offset<Float>(params.shared_output, static_cast<int64_t>(m) * kHiddenSize);
+  }
+
+#pragma unroll
+  for (uint32_t j = 0; j < kVecsPerThread; ++j) {
+    const uint32_t vec_idx = vec_base + threadIdx.x + j * kApplyThreads;
+    const uint32_t col_in_branch = (vec_idx % kVecsPerBranch);
+    Storage r_vec;
+    r_vec.load(r_ptr, vec_idx);
+    Storage y_vec;
+    y_vec.load(y_ptr, col_in_branch);
+    Storage s_vec;
+    if constexpr (kUseShared) {
+      s_vec.load(s_ptr, col_in_branch);
+    }
+    Storage out_vec;
+#pragma unroll
+    for (uint32_t i = 0; i < kVecLen / 2; ++i) {
+      const auto [rx, ry] = cast<fp32x2_t>(r_vec[i]);
+      auto [yx, yy] = cast<fp32x2_t>(y_vec[i]);
+      if constexpr (kUseShared) {
+        const auto [sx, sy] = cast<fp32x2_t>(s_vec[i]);
+        // Round the routed+shared sum to Float exactly like the standalone
+        // fused_gate_sigmoid_mul_add store does, then widen again.
+        const Float2 rounded = cast<Float2>(fp32x2_t{yx + g * sx, yy + g * sy});
+        const auto [wx, wy] = cast<fp32x2_t>(rounded);
+        yx = wx;
+        yy = wy;
+      }
+      out_vec[i] = cast<Float2>(fp32x2_t{rx + a * yx, ry + a * yy});
+    }
+    out_vec.store(out_ptr, vec_idx);
+  }
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int64_t kHcCount, int64_t kHiddenSize, bool kUsePDL, typename DType, bool kUseShared>
+struct HcCombineApplyKernel {
+  static_assert(sizeof(DType) == 2, "HcCombine only supports 2-byte dtypes");
+  static constexpr auto kernel = hc_combine_apply2_kernel<kHcCount, kHiddenSize, kUsePDL, DType, kUseShared>;
+
+  /// Apply without the shared-expert fold; `block_output` is the finished block output.
+  static void
+  run_plain(const tvm::ffi::TensorView block_output,
+            const tvm::ffi::TensorView residual,
+            const tvm::ffi::TensorView partials,
+            const tvm::ffi::TensorView output) {
+    static_assert(!kUseShared, "run_plain requires kUseShared == false");
+    run(block_output, residual, block_output, partials, partials, output);
+  }
+
+  static void
+  run(const tvm::ffi::TensorView block_output,
+      const tvm::ffi::TensorView residual,
+      const tvm::ffi::TensorView shared_output,
+      const tvm::ffi::TensorView shared_gate,
+      const tvm::ffi::TensorView partials,
+      const tvm::ffi::TensorView output) {
+    using namespace host;
+    using namespace hc_combine_split_detail;
+    auto M = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(block_output);
+    TensorMatcher({M, kHcCount * kHiddenSize})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(residual)
+        .verify(output);
+    auto part_rows = SymbolicSize{"partial_rows"};
+    auto num_partials = SymbolicSize{"num_partials"};
+    TensorMatcher({part_rows, num_partials, kHcCount}).with_dtype<fp32_t>().with_device(device).verify(partials);
+    if constexpr (kUseShared) {
+      TensorMatcher({M, kHiddenSize}).with_dtype<DType>().with_device(device).verify(shared_output);
+      auto gate_rows = SymbolicSize{"gate_rows"};
+      TensorMatcher({gate_rows}).with_dtype<fp32_t>().with_device(device).verify(shared_gate);
+    }
+
+    const auto params = HcCombineApplyParams{
+        .block_output = block_output.data_ptr(),
+        .residual = residual.data_ptr(),
+        .shared_output = kUseShared ? shared_output.data_ptr() : nullptr,
+        .shared_gate = kUseShared ? static_cast<const float*>(shared_gate.data_ptr()) : nullptr,
+        .partials = static_cast<const float*>(partials.data_ptr()),
+        .output = output.data_ptr(),
+        .num_partials = static_cast<int32_t>(num_partials.unwrap()),
+    };
+
+    const auto num_tokens = static_cast<uint32_t>(M.unwrap());
+    LaunchKernel(dim3(num_tokens, kSplit, 1), kApplyThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 

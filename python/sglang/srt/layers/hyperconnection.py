@@ -24,6 +24,21 @@ _HC_MIX2_FP8 = os.environ.get("SGLANG_HC_MIX2_FP8", "0") == "1"
 _HC_MIX2_FP8_DROP_BF16 = os.environ.get("SGLANG_HC_MIX2_FP8_DROP_BF16", "0") == "1"
 _HC_MIX_FP8 = os.environ.get("SGLANG_HC_MIX_FP8", "0") == "1"
 
+
+def _hc_gate_early_mode() -> int:
+    """R1: where the combine gate runs. See `HCGateEarly` in `srt.environ`.
+
+    `SGLANG_SHARED_GATE_EARLY` (R6) folds the shared-expert join into the apply
+    stage, which only exists as a separate launch once the gate has moved to
+    mix time, so it implies the bit-identical MOVED mode when R1 is left off.
+    """
+    from sglang.srt.environ import HCGateEarly, envs
+
+    mode = int(envs.SGLANG_HC_GATE_EARLY.get())
+    if not mode and envs.SGLANG_SHARED_GATE_EARLY.get():
+        return int(HCGateEarly.MOVED)
+    return mode
+
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
@@ -257,6 +272,19 @@ class GatedResidual(HyperConnectionBase):
             # fits its grid barrier; the per-call row count decides that, so the
             # rest of the check lives in hc_combine_fused_supported.
             self._fused_combine_ok = _HC_COMBINE_FUSED and torch.cuda.is_available()
+            # R1 (SGLANG_HC_GATE_EARLY): partials for the mode-2 path, which
+            # reuses the split gate kernel's 8-slot layout. Allocated once here
+            # so a CUDA-graph capture never takes it from a graph-private pool.
+            self._early_partials_buf = None
+            self._gate_early = (
+                _hc_gate_early_mode() if self._split_combine_ok else 0
+            )
+            if self._gate_early:
+                self._early_partials_buf = torch.empty(
+                    (32, 8, self.hc_count),
+                    dtype=torch.float32,
+                    device=self.block_inject_weight.weight.device,
+                )
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -436,6 +464,27 @@ class GatedResidual(HyperConnectionBase):
             from sglang.srt.layers.hc_mix2_triton import hc_norm_mix2
 
             w_down, w_up, s_down, s_up = self._mix2_weights()
+            if self._gate_early_ok(hyper_input) and getattr(self, "_gate_early", 0) == 1:
+                mixed_input, hyper_input_normed, gate_partials = hc_norm_mix2(
+                    hyper_input,
+                    self.hc_norm.weight,
+                    self.hc_norm.variance_epsilon,
+                    w_down,
+                    w_up,
+                    self.hc_count,
+                    self.hidden_size,
+                    None,
+                    s_down,
+                    s_up,
+                    inject_weight=self.block_inject_weight.weight.data,
+                )
+                if gate_partials is not None:
+                    return mixed_input, (
+                        hyper_input,
+                        hyper_input_normed,
+                        gate_partials,
+                    )
+                return mixed_input, self._early_gate(hyper_input, hyper_input_normed)
             mixed_input, hyper_input_normed = hc_norm_mix2(
                 hyper_input,
                 self.hc_norm.weight,
@@ -448,6 +497,8 @@ class GatedResidual(HyperConnectionBase):
                 s_down,
                 s_up,
             )
+            if self._gate_early_ok(hyper_input):
+                return mixed_input, self._early_gate(hyper_input, hyper_input_normed)
             return mixed_input, (hyper_input, hyper_input_normed)
 
         if self._fused_mix_supported(hyper_input):
@@ -559,14 +610,93 @@ class GatedResidual(HyperConnectionBase):
                 self.hc_count,
                 self.hidden_size,
             ).to(self.params_dtype)
+        if self._gate_early_ok(hyper_input):
+            return mixed_input, self._early_gate(hyper_input, hyper_input_normed)
         return mixed_input, (hyper_input, hyper_input_normed)
 
-    def combine(self, block_output: torch.Tensor, residuals) -> torch.Tensor:
-        hyper_input, hyper_input_normed = residuals
+    def _gate_early_ok(self, hyper_input: torch.Tensor) -> bool:
+        """Whether the combine gate for this boundary can be run at mix time."""
+        return bool(
+            getattr(self, "_gate_early", 0)
+            and self._split_combine_ok
+            and hyper_input.is_cuda
+            and hyper_input.dtype == self.block_inject_weight.weight.dtype
+            and hyper_input.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input.dim() == 2
+            and hyper_input.shape[0] <= 32
+        )
+
+    def _early_gate(self, hyper_input: torch.Tensor, hyper_input_normed: torch.Tensor):
+        """Run the split gate kernel now; `combine` is then apply-only.
+
+        Values are bit-identical to the gate stage inside `hc_combine_split`;
+        only its position in the stream changes.
+        """
+        from sglang.kernels.ops.elementwise.hc_combine import hc_combine_gate
+
+        rows = hyper_input_normed.shape[0]
+        partials = hc_combine_gate(
+            hyper_input_normed,
+            self.block_inject_weight.weight.data,
+            self.hc_count,
+            self.hidden_size,
+            partials=self._early_partials_buf[:rows],
+        )
+        return hyper_input, hyper_input_normed, partials
+
+    def combine(
+        self,
+        block_output: torch.Tensor,
+        residuals,
+        shared_output: Optional[torch.Tensor] = None,
+        shared_gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hyper_input, hyper_input_normed = residuals[0], residuals[1]
+        gate_partials = residuals[2] if len(residuals) > 2 else None
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
         if block_output.shape[0] == 0:
             return hyper_input.to(self.params_dtype)
+
+        if (
+            gate_partials is not None
+            and block_output.is_cuda
+            and block_output.dtype == hyper_input.dtype
+            and block_output.shape[0] <= 32
+            and (
+                shared_output is None
+                or (
+                    shared_output.shape == block_output.shape
+                    and shared_output.dtype == block_output.dtype
+                    and shared_output.is_contiguous()
+                    and shared_gate is not None
+                )
+            )
+        ):
+            # R1/R6: the gate was computed at mix time and the shared-expert
+            # join (if any) is folded in here, so this is the only kernel left
+            # on the boundary's post-block critical path.
+            from sglang.kernels.ops.elementwise.hc_combine import hc_combine_apply
+
+            return hc_combine_apply(
+                block_output,
+                hyper_input,
+                gate_partials,
+                self.hc_count,
+                self.hidden_size,
+                shared_output=shared_output,
+                shared_gate=shared_gate,
+            )
+
+        if shared_output is not None:
+            # No fused apply for this shape: reproduce the standalone epilogue.
+            from sglang.kernels.ops.elementwise.elementwise import (
+                fused_gate_sigmoid_mul_add_precomputed,
+            )
+
+            block_output = fused_gate_sigmoid_mul_add_precomputed(
+                block_output, shared_output, shared_gate
+            )
 
         if (
             self._jit_combine_ok
@@ -639,7 +769,7 @@ class GatedResidual(HyperConnectionBase):
         next_hc: "GatedResidual",
     ):
         """Combine this boundary and norm/mix the next one in one launch."""
-        hyper_input, hyper_input_normed = residuals
+        hyper_input, hyper_input_normed = residuals[0], residuals[1]
         inject_w = self.block_inject_weight.weight
         if (
             next_hc._fused_mix_supported(hyper_input)

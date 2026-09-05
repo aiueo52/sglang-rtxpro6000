@@ -42,6 +42,15 @@ def _jit_hc_combine_module(
         cuda_wrappers=[
             ("hc_combine", f"HcCombineKernel<{args}>::run"),
             ("hc_combine_split", f"HcCombineSplitKernel<{args}>::run"),
+            ("hc_combine_gate", f"HcCombineSplitKernel<{args}>::run_gate"),
+            (
+                "hc_combine_apply",
+                f"HcCombineApplyKernel<{args}, false>::run_plain",
+            ),
+            (
+                "hc_combine_apply_shared",
+                f"HcCombineApplyKernel<{args}, true>::run",
+            ),
         ],
     )
 
@@ -134,3 +143,62 @@ def hc_combine_split(
     module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
     module.hc_combine_split(y, r, n, inject_weight, out, partials)
     return out.reshape(residual.shape)
+
+
+def hc_combine_apply(
+    block_output: torch.Tensor,
+    residual: torch.Tensor,
+    partials: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    out: Optional[torch.Tensor] = None,
+    shared_output: Optional[torch.Tensor] = None,
+    shared_gate: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Apply stage only, for a gate whose partial dots are already in `partials`.
+
+    `partials` is fp32 [rows, splits, hc_count]; `splits` is a runtime value so
+    both the standalone gate kernel (8 splits) and the HC-mix K0 epilogue
+    (one slot per branch CTA, i.e. hc_count splits) can feed this.
+
+    With `shared_output`/`shared_gate` the shared-expert join is folded in:
+    ``block_output`` is then the routed-expert output only and the kernel forms
+    ``bf16(routed + gate * shared)`` before the residual update, matching the
+    order of the separate ``fused_gate_sigmoid_mul_add`` + combine pair.
+    """
+    y = block_output.reshape(-1, hidden_size)
+    r = residual.reshape(-1, hc_count * hidden_size)
+    if out is None:
+        out = torch.empty_like(r)
+    else:
+        out = out.reshape(-1, hc_count * hidden_size)
+    module = _jit_hc_combine_module(hc_count, hidden_size, residual.dtype)
+    if shared_output is None:
+        module.hc_combine_apply(y, r, partials, out)
+    else:
+        module.hc_combine_apply_shared(
+            y, r, shared_output.reshape(-1, hidden_size), shared_gate, partials, out
+        )
+    return out.reshape(residual.shape)
+
+
+def hc_combine_gate(
+    normed_residual: torch.Tensor,
+    inject_weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    partials: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Gate stage only: the split partial dots, without touching block output.
+
+    Returns the fp32 [rows, 8, hc_count] partials that `hc_combine_apply`
+    reduces. Only the gate kernel of the split pair is launched, so the values
+    are bit-identical to what `hc_combine_split` computes internally.
+    """
+    n = normed_residual.reshape(-1, hc_count * hidden_size)
+    rows = n.shape[0]
+    if partials is None:
+        partials = _get_partials(hc_count, n.device, rows)[:rows]
+    module = _jit_hc_combine_module(hc_count, hidden_size, normed_residual.dtype)
+    module.hc_combine_gate(n, inject_weight, partials)
+    return partials
