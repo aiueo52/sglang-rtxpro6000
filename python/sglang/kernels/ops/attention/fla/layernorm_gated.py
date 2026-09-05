@@ -16,7 +16,6 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.triton_pdl import PDL as _TRITON_PDL
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -95,7 +94,6 @@ def _layer_norm_fwd_1pass_kernel(
     IS_RMS_NORM: tl.constexpr,
     ACTIVATION: tl.constexpr,
     USE_GDC: tl.constexpr = False,
-    GDC_TRIGGER: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -181,12 +179,6 @@ def _layer_norm_fwd_1pass_kernel(
     # Write output
     tl.store(Y_base, y, mask=mask)
 
-    # The successor (the GDN out_proj gemv) carries launch_pdl under
-    # SGLANG_TRITON_PDL, so releasing it here lets it schedule its blocks while
-    # this grid drains. Its own gdc_wait keeps its loads behind these stores.
-    if GDC_TRIGGER:
-        tl.extra.cuda.gdc_launch_dependents()
-
     if USE_GDC:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -263,8 +255,6 @@ def _layer_norm_fwd(
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-    if pdl_kwargs and _TRITON_PDL:
-        pdl_kwargs["GDC_TRIGGER"] = True
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that
     # SourcelessBuilder cannot wrap, causing a hard error under
