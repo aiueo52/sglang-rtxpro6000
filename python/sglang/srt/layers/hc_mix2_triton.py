@@ -48,6 +48,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.triton_pdl import PDL, pdl_trigger, pdl_wait
+
 _HC_MIX2_MAX_ROWS = 16
 
 
@@ -154,12 +156,16 @@ def _hc_branch_stats_kernel(
     FUSE_GATE: tl.constexpr,
     FUSE_APPLY: tl.constexpr,
     PREV_SPLITS: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     m = pid // HC
     c = pid % HC
     base = m * K + c * HS
     offs = tl.arange(0, BLOCK_S)
+    # `x` is the previous kernel's output; nothing above this point touches
+    # memory, so the CTAs can be scheduled while that kernel drains.
+    pdl_wait(USE_PDL)
 
     if SINGLE_TILE:
         # One branch fits in one tile: issue the x and weight loads together so
@@ -241,6 +247,9 @@ def _hc_branch_stats_kernel(
     for z0 in range(pid * ZERO_BLOCK, zero_span, num_tasks * ZERO_BLOCK):
         idx = z0 + offs_z
         tl.store(t_raw_ptr + idx, 0.0, mask=idx < zero_span)
+    # K1 atomically accumulates into t_raw; its own gdc_wait keeps its stores
+    # behind this clear, so triggering here only lets it start scheduling.
+    pdl_trigger(USE_PDL)
 
 
 @triton.jit
@@ -267,9 +276,11 @@ def _hc_down_kernel(
     REDUNDANT_STATS: tl.constexpr,
     READ_NORMED: tl.constexpr,
     W_FP8: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     kg = tl.program_id(0)
     nb = tl.program_id(1)
+    pdl_wait(USE_PDL)
     offs_m = tl.arange(0, ROWS)
     mask_m = offs_m < num_rows
     k0 = kg * (BLOCK_K * BLOCK_G)
@@ -339,6 +350,7 @@ def _hc_down_kernel(
         sem="relaxed",
         scope="gpu",
     )
+    pdl_trigger(USE_PDL)
 
 
 @triton.jit
@@ -359,8 +371,10 @@ def _hc_up_kernel(
     BLOCK_R: tl.constexpr,
     NUM_STAGES: tl.constexpr,
     W_FP8: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     jb = tl.program_id(0)
+    pdl_wait(USE_PDL)
     offs_m = tl.arange(0, ROWS)
     mask_m = offs_m < num_rows
     offs_j = tl.arange(0, BLOCK_J)
@@ -414,6 +428,7 @@ def _hc_up_kernel(
         out.to(out_ptr.dtype.element_ty),
         mask=mask_m[:, None] & mask_j[None, :],
     )
+    pdl_trigger(USE_PDL)
 
 
 def quantize_hc_mix2_weights_fp8(
@@ -625,6 +640,8 @@ def hc_norm_mix2(
             FUSE_GATE=fuse_gate,
             FUSE_APPLY=fuse_apply,
             PREV_SPLITS=prev_splits,
+            USE_PDL=PDL,
+            launch_pdl=PDL,
             num_warps=config.stats_warps,
         )
 
@@ -653,6 +670,8 @@ def hc_norm_mix2(
         REDUNDANT_STATS=redundant_stats,
         READ_NORMED=read_normed,
         W_FP8=w_fp8,
+        USE_PDL=PDL,
+        launch_pdl=PDL,
         num_warps=config.down_warps,
     )
 
@@ -673,6 +692,8 @@ def hc_norm_mix2(
         BLOCK_R=config.block_r,
         NUM_STAGES=config.up_stages,
         W_FP8=w_fp8,
+        USE_PDL=PDL,
+        launch_pdl=PDL,
         num_warps=config.up_warps,
     )
     if apply_inputs is not None:
