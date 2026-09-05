@@ -1017,6 +1017,45 @@ class Fp8LinearMethod(LinearMethodBase):
             return None
         return w8a16_gemv(x, w, layer.weight_scale, out=out)
 
+    def apply_into_split(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        out2: torch.Tensor,
+        split_n: int,
+        bias: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """`apply` writing the output columns into two caller-owned buffers.
+
+        Columns [0, split_n) land in `out`, columns [split_n, N) in `out2` at
+        column `n - split_n`. Only the GEMV's store epilogue differs from
+        `apply_into`, so the bytes are identical to `apply` followed by two
+        slice copies. Returns False when this call cannot take the GEMV path
+        (the caller must then fall back to `apply`).
+        """
+        if bias is not None or not self._w8a16_gemv_ok(layer, x):
+            return False
+        from sglang.srt.layers.quantization.w8a16_gemv import w8a16_gemv
+
+        w = layer.weight.t()
+        N = w.shape[0]
+        M = x.shape[0]
+        if (
+            not (0 < split_n < N)
+            or tuple(out.shape) != (M, split_n)
+            or tuple(out2.shape) != (M, N - split_n)
+            or out.dtype is not torch.bfloat16
+            or out2.dtype is not torch.bfloat16
+            or out.device != x.device
+            or out2.device != x.device
+            or out.stride(1) != 1
+            or out2.stride(1) != 1
+        ):
+            return False
+        w8a16_gemv(x, w, layer.weight_scale, out=out, out2=out2, split_n=split_n)
+        return True
+
     def apply(
         self,
         layer: torch.nn.Module,
