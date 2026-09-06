@@ -192,7 +192,9 @@ def _run_flashinfer_cutlass(
     # P1: mask low-weight routes that are the only user of their expert, so the
     # grouped GEMM reads fewer distinct expert weights.  No-op unless
     # SGLANG_MOE_PRUNE_SINGLETON_TAU is set.  In place and CUDA-graph safe; see
-    # sglang/srt/layers/moe/prune_singleton.py.
+    # sglang/srt/layers/moe/prune_singleton.py.  With SGLANG_MOE_PRUNE_IN_PROLOGUE=1
+    # (P2) this is a no-op and FlashInfer's patched routing prologue applies the
+    # same mask in-kernel.
     maybe_prune_singleton_routes(topk_ids, topk_weights)
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
