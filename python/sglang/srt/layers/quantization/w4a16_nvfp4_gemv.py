@@ -438,8 +438,14 @@ def quantize_nvfp4(
     """
     assert w.dim() == 2 and w.shape[1] % block == 0
     N, K = w.shape
-    wf = w.float()
-    gscale = (wf.abs().amax() / (E4M3_MAX * E2M1_MAX)).clamp_(min=1e-30)
+    # The global amax is taken chunk-wise and `w` is never cast to fp32 whole. A single
+    # `w.float()` is 2x the weight -- 2.5 GB for the 248320-row target head -- and the
+    # server reaches this with ~2 GB free at mem_fraction 0.935, which is exactly how
+    # stage B first died (torch.OutOfMemoryError: tried to allocate 2.37 GiB).
+    gmax = w.new_zeros((), dtype=torch.float32)
+    for r0 in range(0, N, row_chunk):
+        gmax = torch.maximum(gmax, w[r0 : r0 + row_chunk].float().abs().amax())
+    gscale = (gmax / (E4M3_MAX * E2M1_MAX)).clamp_(min=1e-30)
     # The *encode* scale, and multiplication by it, are the fork's own convention
     # (nvfp4_online.py:296 hands flashinfer `1.0 / weight_scale_2`). The form matters
     # beyond taste: `amax/6/gscale` and `amax/6*enc` differ by one fp32 ulp, and e4m3's
@@ -452,7 +458,7 @@ def quantize_nvfp4(
     bs = torch.empty((N, K // block), dtype=torch.uint8, device=w.device)
     for r0 in range(0, N, row_chunk):
         r1 = min(N, r0 + row_chunk)
-        blk = wf[r0:r1].view(r1 - r0, K // block, block)
+        blk = w[r0:r1].float().view(r1 - r0, K // block, block)
         amax = blk.abs().amax(dim=-1)
         sb = (amax / E2M1_MAX * enc).clamp_(min=0.0, max=E4M3_MAX)
         sb8 = sb.to(torch.float8_e4m3fn)

@@ -988,6 +988,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         kv_tp_size: Optional[int] = None,
     ):
         self.with_bias = bias
+        # Its sibling MergedColumnParallelLinear records this and QKVParallelLinear
+        # did not, so anything identifying a layer by `layer.prefix` silently saw ""
+        # for every attention qkv -- which is exactly how N1 stage C came to pack the
+        # 36 GDN projections and none of the attention ones without erroring.
+        self.prefix = prefix
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size

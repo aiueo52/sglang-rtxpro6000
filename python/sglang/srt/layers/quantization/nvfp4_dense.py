@@ -152,8 +152,13 @@ def build_or_load(
     w = read_bf16_rows(model_dir, tensor_name, rows)
     t_read = time.time() - t0
     t0 = time.time()
-    wq, bs, gscale = quantize_nvfp4(w.to(device))
+    # Packed on the CPU, then only the *packed* tensors go to the device. The server
+    # runs at mem_fraction 0.935 and reaches this with ~2 GB of VRAM free, while the
+    # full target head would need 1.27 GB bf16 + an fp32 working set on top of it.
+    # The packed result is 0.5625 B/element, and host RAM is not the constraint here.
+    wq, bs, gscale = quantize_nvfp4(w)
     del w
+    wq, bs, gscale = wq.to(device), bs.to(device), gscale.to(device)
     t_pack = time.time() - t0
     os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = path + f".tmp{os.getpid()}"
@@ -320,6 +325,14 @@ def maybe_pack_dense_nvfp4(layer) -> bool:
     if not cats:
         return False
     prefix = getattr(layer, "prefix", "") or ""
+    if not prefix:
+        # Never silently skip: a layer with no prefix cannot be matched, and that is a
+        # bug in the layer class rather than a reason to leave it FP8.
+        logger.warning(
+            "NVFP4 dense: %s has no .prefix, cannot match it against %s",
+            type(layer).__name__, cats,
+        )
+        return False
     if not any(prefix.endswith(c) or f".{c}" in prefix for c in cats):
         return False
     w = getattr(layer, "weight", None)
