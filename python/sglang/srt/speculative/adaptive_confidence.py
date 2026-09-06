@@ -311,8 +311,12 @@ class ConfidenceStepSlot:
 
     # Position-0 confidence bucket edges.  Coarse on purpose: each bucket has
     # to accumulate its own rate estimate, and a decode server sees a few
-    # thousand steps per workload.
-    BUCKETS = (0.5, 0.8, 0.95, 0.995)
+    # thousand steps per workload.  The default edges are packed against 1.0
+    # because that is where the mass is: on the 2026-09-06 code-edit trace the
+    # position-0 probability has a 10th percentile of 0.966 and a median of
+    # 1.000, so uniform edges would put 80% of steps in one bucket and
+    # discriminate nothing.  Overridable from the config ("buckets").
+    BUCKETS = (0.8, 0.95, 0.99, 0.999)
 
     def __init__(self, initial_steps: int, cfg: dict):
         candidates = sorted(set(cfg["candidate_steps"]))
@@ -341,7 +345,8 @@ class ConfidenceStepSlot:
         self.min_bucket_samples = int(cfg.get("min_bucket_samples", 12))
         self.weight_alpha = float(cfg.get("weight_alpha", 0.02))
 
-        nb = len(self.BUCKETS) + 1
+        self.buckets = tuple(cfg.get("buckets", self.BUCKETS))
+        nb = len(self.buckets) + 1
         self._nb = nb
         self._rate = [0.0] * nb
         self._rate_n = [0] * nb
@@ -361,7 +366,7 @@ class ConfidenceStepSlot:
     # -- inputs ------------------------------------------------------------
     def _bucket(self, conf: float) -> int:
         i = 0
-        for edge in self.BUCKETS:
+        for edge in self.buckets:
             if conf < edge:
                 return i
             i += 1
