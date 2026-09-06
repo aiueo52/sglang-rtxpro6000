@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.prune_singleton import maybe_prune_singleton_routes
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
 
@@ -188,6 +189,11 @@ def _run_flashinfer_cutlass(
     topk_output = dispatch_output.topk_output
     topk_weights = topk_output.topk_weights
     topk_ids = topk_output.topk_ids
+    # P1: mask low-weight routes that are the only user of their expert, so the
+    # grouped GEMM reads fewer distinct expert weights.  No-op unless
+    # SGLANG_MOE_PRUNE_SINGLETON_TAU is set.  In place and CUDA-graph safe; see
+    # sglang/srt/layers/moe/prune_singleton.py.
+    maybe_prune_singleton_routes(topk_ids, topk_weights)
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
