@@ -133,6 +133,12 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+#: N1 stage A -- serve the draft's hot-vocab lm_head as NVFP4 instead of the FP8 row
+#: slice of the target head. Off by default; see _install_nvfp4_draft_head.
+_MTP_LMHEAD_NVFP4 = os.environ.get("SGLANG_MTP_LMHEAD_NVFP4", "0").lower() in (
+    "1", "true", "yes", "on"
+)
+
 
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
@@ -366,6 +372,50 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_lm_head.weight_scale = self._draft_fp8_head_scale
                 draft_lm_head.input_scale = None
                 draft_lm_head.quant_method = self._draft_fp8_head_method
+            if _MTP_LMHEAD_NVFP4 and self.hot_token_id is not None:
+                self._install_nvfp4_draft_head()
+
+    def _install_nvfp4_draft_head(self):
+        """Replace the draft's hot-vocab FP8 head with an NVFP4 one (N1 stage A).
+
+        The rows are re-read from the checkpoint shard rather than taken from the FP8
+        head this method just built: `head` is already FP8 by the time we get here, and
+        quantising FP8 -> NVFP4 compounds two lossy steps and costs argmax
+        agreement (N1_LOG.md 4). The packed result is cached on disk keyed by shard
+        identity + row set, so only the first start pays the ~2 s.
+
+        Measured: 1.487x on the draft-head GEMV (52.6 vs 78.3 us).
+        Off by default; SGLANG_MTP_LMHEAD_NVFP4=1 turns it on.
+        """
+        from sglang.srt.layers.quantization.nvfp4_dense import (
+            NVFP4DenseLinearMethod,
+            build_or_load,
+        )
+
+        model_dir = self.target_worker.model_runner.model_config.model_path
+        draft_lm_head = self.draft_runner.model.lm_head
+        try:
+            wq, bs, gscale = build_or_load(
+                model_dir, "lm_head.weight", self.hot_token_id,
+                device=self.hot_token_id.device, label="draft lm_head",
+            )
+        except Exception:
+            logger.exception(
+                "SGLANG_MTP_LMHEAD_NVFP4=1 but the draft head could not be packed; "
+                "keeping the FP8 head"
+            )
+            return
+        NVFP4DenseLinearMethod.attach(draft_lm_head, wq, bs, gscale)
+        draft_lm_head.weight = wq
+        draft_lm_head.weight_scale = None
+        draft_lm_head.input_scale = None
+        draft_lm_head.quant_method = NVFP4DenseLinearMethod("draft lm_head")
+        logger.info(
+            "Draft lm_head: %d hot rows in NVFP4 (%.1f MB vs %.1f MB FP8)",
+            wq.shape[0],
+            (wq.numel() + bs.numel()) / 1e6,
+            wq.shape[0] * wq.shape[1] * 2 / 1e6,
+        )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
