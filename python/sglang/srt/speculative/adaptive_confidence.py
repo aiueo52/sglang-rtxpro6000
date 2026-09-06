@@ -209,16 +209,28 @@ class ChainTracer:
     """One line per verified decode step: the input to the offline simulator."""
 
     def __init__(self, path: str):
-        self._f = open(path, "a", buffering=1 << 16)
+        # Line buffered on purpose.  The offline split into per-workload
+        # segments is driven by `wc -l` on this file between fnbench
+        # invocations, so a 64 KB buffer (~300 rows at steps=15) silently
+        # shifts every boundary and each segment ends up a blend of two
+        # workloads -- which is exactly what happened to the first w16 trace
+        # (its per-segment mean acceptance disagreed with fnbench's own
+        # acc: 8.94/4.01/1.81/2.68 traced vs 7.30/2.16/1.45/4.19 measured).
+        self._f = open(path, "a", buffering=1)
         self._n = 0
 
     def write(self, steps: int, bs: int, chain, accepted: list[int]) -> None:
         import json
+        import time
 
         self._f.write(
             json.dumps(
                 {
                     "i": self._n,
+                    # Wall clock, so the offline split into per-workload
+                    # segments can key off the idle gap between fnbench
+                    # invocations instead of trusting a line count.
+                    "t": round(time.time(), 3),
                     "steps": steps,
                     "bs": bs,
                     "p": [[round(x, 5) for x in row] for row in chain]
