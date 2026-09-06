@@ -169,8 +169,11 @@ def build_or_load(
 # Serving-side linear method
 # ---------------------------------------------------------------------------
 
-#: Rows dequantised at a time in the wide-M fallback, bounding its transient.
+#: Rows dequantised at a time in the large-M fallback, bounding its transient.
 _FALLBACK_ROW_CHUNK = 16384
+#: Up to this many rows, the fallback loops the GEMV instead of dequantising; this is
+#: the CUDA-graph-captured draft-extend regime, where a dequant is not capture-safe.
+_CHUNK_M_MAX = 128
 
 
 class NVFP4DenseLinearMethod:
@@ -240,21 +243,36 @@ class NVFP4DenseLinearMethod:
         )
 
     def _wide_m(self, layer, x: torch.Tensor) -> torch.Tensor:
-        """Prefill / extend fallback: dequantise in row chunks and matmul.
+        """The M > 16 path the decode GEMV cannot serve.
 
-        The GEMV is a decode kernel (M <= 16). Wider calls are rare and large, so the
-        right fallback is a real GEMM; dequantising in chunks of output rows keeps the
-        transient at ~80 MB instead of materialising the whole 250 MB BF16 head. Looping
-        the GEMV over 16-row slices instead would re-stream the entire weight per slice.
+        Two regimes, because they have different constraints:
+
+        - **Modest M (<= _CHUNK_M_MAX): loop the GEMV over 16-row slices.** This is the
+          draft-extend path, and draft-extend *is* CUDA-graph captured, so it has to be
+          capture-safe -- no host->device copies, no syncs, no data-dependent shapes.
+          Re-streaming the weight per slice costs bandwidth, but at these M it is a
+          handful of slices.
+        - **Large M: dequantise in row chunks and GEMM.** Real prefill, never captured.
+          Looping the GEMV here would re-read the whole weight ~M/16 times; a GEMM
+          amortises the weight read across all M rows instead. Chunking the dequant by
+          output rows keeps the transient near 80 MB rather than the full BF16 weight.
         """
-        from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import dequantize_nvfp4
+        from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import (
+            dequantize_nvfp4,
+            w4a16_nvfp4_gemv,
+        )
 
         wq, bs, gs = layer.nvfp4_wq, layer.nvfp4_bs, layer.nvfp4_gscale
-        N = wq.shape[0]
-        y = torch.empty((x.shape[0], N), dtype=torch.bfloat16, device=x.device)
+        M, N = x.shape[0], wq.shape[0]
+        y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+        if M <= _CHUNK_M_MAX and x.dtype == torch.bfloat16 and x.is_cuda:
+            for m0 in range(0, M, 16):
+                m1 = min(M, m0 + 16)
+                w4a16_nvfp4_gemv(x[m0:m1], wq, bs, gs, out=y[m0:m1])
+            return y
         for r0 in range(0, N, _FALLBACK_ROW_CHUNK):
             r1 = min(N, r0 + _FALLBACK_ROW_CHUNK)
             w = dequantize_nvfp4(wq[r0:r1], bs[r0:r1], gs).to(torch.bfloat16)
-            torch.mm(x, w.t(), out=y[:, r0:r1])
+            torch.mm(x.to(torch.bfloat16), w.t(), out=y[:, r0:r1])
             del w
         return y

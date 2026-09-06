@@ -466,17 +466,39 @@ def quantize_nvfp4(
     return wq, bs, gscale.reshape(1)
 
 
+#: Per-device e2m1 level LUT. Built once: `torch.tensor(list, device="cuda")` is a
+#: host->device copy, which is illegal inside a CUDA graph capture, and the draft-extend
+#: graph does capture this path.
+_LEVELS: dict = {}
+
+
+def _levels(device) -> torch.Tensor:
+    t = _LEVELS.get(device)
+    if t is None:
+        t = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=device)
+        _LEVELS[device] = t
+    return t
+
+
 def dequantize_nvfp4(wq: torch.Tensor, bs: torch.Tensor, gscale: torch.Tensor,
                      block: int = FP4_SCALE_BLOCK) -> torch.Tensor:
-    """Reference dequant (fp32) for the numerics check and the offline emulation."""
+    """Reference dequant (fp32) for the numerics check, the offline emulation, and the
+    wide-M serving fallback.
+
+    CUDA-graph safe: the level table is cached per device and the global scale stays a
+    tensor. An earlier version built the table per call and used ``gscale.item()``,
+    which made draft-extend graph capture fail with "Cannot copy between CPU and CUDA
+    tensors during CUDA graph capture".
+    """
     N, KH = wq.shape
     K = KH * 2
-    lvl = torch.tensor(_E2M1_LEVELS, dtype=torch.float32, device=wq.device)
+    lvl = _levels(wq.device)
     code = torch.empty((N, K), dtype=torch.uint8, device=wq.device)
     code[:, 0::2] = wq & 0x0F
     code[:, 1::2] = wq >> 4
     mag = lvl[(code & 0x07).long()]
     val = torch.where((code & 0x08) > 0, -mag, mag)
-    s = bs.view(torch.float8_e4m3fn).float() * gscale.float().reshape(-1, 1).to(bs.device) \
-        if gscale.numel() > 1 else bs.view(torch.float8_e4m3fn).float() * gscale.item()
+    g = gscale.to(wq.device, torch.float32).reshape(-1)
+    g = g.reshape(-1, 1) if g.numel() > 1 else g.reshape(1, 1)
+    s = bs.view(torch.float8_e4m3fn).float() * g
     return val * s.repeat_interleave(block, dim=1)
