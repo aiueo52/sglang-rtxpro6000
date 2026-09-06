@@ -32,12 +32,25 @@ DEV = "cuda"
 torch.manual_seed(0)
 
 
+#: Code 8 is *negative zero*. `quantize_nvfp4` emits the sign bit from `a < 0`, which is
+#: False for -0.0, so a well-behaved encoder never produces it -- +0 and -0 both map to
+#: code 0. Its absence is correct, not a gap in coverage.
+_UNREACHABLE_CODES = (8,)
+
+
 def check_code_coverage():
-    """Every one of the 16 codes must decode exactly, at a spread of block scales."""
-    # Build a weight that forces all 8 magnitudes x both signs into one 16-block.
+    """Every reachable code must decode exactly, at a spread of block scales.
+
+    The scales are powers of two spanning 16x on purpose. The global scale is shared by
+    the whole tensor, so a wide spread would push the small rows' block scales toward
+    e4m3 underflow and the round trip would stop being exact for reasons that have
+    nothing to do with the codec -- which is what a first version of this check ran
+    into (17000x spread, 2.1e-3 error). Here every block scale (28, 56, 112, 224, 448)
+    is exactly representable in e4m3, so exactness is a real assertion about the codec.
+    """
     lvl = torch.tensor(_E2M1_LEVELS, dtype=torch.float32)
-    row = torch.cat([lvl, -lvl])  # 16 values, amax 6 -> block scale lands on 1
-    scales = [1.0, 0.5, 3.0, 1e-3, 17.0]
+    row = torch.cat([lvl, -lvl])  # 16 values: all 8 magnitudes x both signs
+    scales = [0.25, 0.5, 1.0, 2.0, 4.0]
     w = torch.stack([row * s for s in scales]).to(DEV).bfloat16()
     wq, bs, gs = quantize_nvfp4(w)
     deq = dequantize_nvfp4(wq, bs, gs)
@@ -102,7 +115,8 @@ if __name__ == "__main__":
     print(f"torch {torch.__version__} device {torch.cuda.get_device_name(0)}")
     rel, codes = check_code_coverage()
     print(f"[codes] all-16-code round trip: max rel err {rel:.3e}, codes seen {codes}")
-    assert codes == list(range(16)), "not all 16 e2m1 codes exercised"
+    want = [c for c in range(16) if c not in _UNREACHABLE_CODES]
+    assert codes == want, f"expected codes {want}, saw {codes}"
     assert rel == 0.0, f"exactly-representable weights must round-trip exactly, got {rel}"
 
     bad, tested = check_bitexact_decode()
