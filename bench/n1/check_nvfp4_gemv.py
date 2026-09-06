@@ -111,8 +111,48 @@ def check_bitexact_decode(N=256, K=2560):
     return bad, tested
 
 
+def smoke_compile():
+    """Compile+launch every tile shape the planner can emit, before anything else.
+
+    A Triton compile error costs a whole GPU-lock window if it only surfaces after the
+    codec tests, so this runs first. It also *collects* failures instead of raising on
+    the first one: two windows were already spent learning one compile error at a time,
+    and the two scale-broadcast paths generate different IR, so one of them failing is
+    exactly when you most want to know whether the other works.
+    """
+    import sglang.srt.layers.quantization.w4a16_nvfp4_gemv as K
+
+    w = (torch.randn(256, 512, device=DEV) * 0.02).bfloat16()
+    wq, bs, gs = quantize_nvfp4(w)
+    ok, bad = [], []
+    for gather in (False, True):
+        K.SCALE_GATHER = gather
+        for M in (1, 4, 16):
+            for cfg in ((32, 128, 1, M > 1, 4, 3), (64, 256, 1, True, 8, 3),
+                        (16, 128, 2, M > 1, 4, 3)):
+                x = torch.randn(M, 512, device=DEV, dtype=torch.bfloat16)
+                tag = f"gather={gather} M={M} cfg={cfg}"
+                try:
+                    w4a16_nvfp4_gemv(x, wq, bs, gs, cfg=cfg)
+                    torch.cuda.synchronize()
+                    ok.append(tag)
+                except Exception as e:
+                    first = str(e).strip().splitlines()
+                    bad.append((tag, f"{type(e).__name__}: {first[-1][:150] if first else ''}"))
+    K.SCALE_GATHER = False
+    for tag, err in bad:
+        print(f"  [smoke FAIL] {tag}\n              {err}")
+    print(f"[smoke] {len(ok)} ok, {len(bad)} failed"
+          + (f"; gather=False ok={sum('gather=False' in t for t in ok)}/9"
+             f" gather=True ok={sum('gather=True' in t for t in ok)}/9"))
+    if not ok:
+        raise SystemExit("every tile variant failed to compile; aborting")
+    return len(ok), len(bad)
+
+
 if __name__ == "__main__":
     print(f"torch {torch.__version__} device {torch.cuda.get_device_name(0)}")
+    smoke_compile()
     rel, codes = check_code_coverage()
     print(f"[codes] all-16-code round trip: max rel err {rel:.3e}, codes seen {codes}")
     want = [c for c in range(16) if c not in _UNREACHABLE_CODES]
