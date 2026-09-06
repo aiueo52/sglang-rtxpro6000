@@ -97,6 +97,7 @@ def _prune_singleton_kernel(
     K,
     TAU_,
     MIN_RANK_,
+    SENTINEL_: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
     KEEP_IDS_: tl.constexpr,
@@ -114,7 +115,7 @@ def _prune_singleton_kernel(
     pdl_wait(USE_PDL)
     offs = tl.arange(0, BLOCK)
     m = offs < N
-    ids = tl.load(ids_ptr + offs, mask=m, other=SENTINEL)
+    ids = tl.load(ids_ptr + offs, mask=m, other=SENTINEL_)
     w = tl.load(w_ptr + offs, mask=m, other=0.0).to(tl.float32)
     row = offs // K
 
@@ -123,7 +124,7 @@ def _prune_singleton_kernel(
     for s in tl.static_range(0, BLOCK, CHUNK):
         o = s + tl.arange(0, CHUNK)
         om = o < N
-        oids = tl.load(ids_ptr + o, mask=om, other=SENTINEL)
+        oids = tl.load(ids_ptr + o, mask=om, other=SENTINEL_)
         ow = tl.load(w_ptr + o, mask=om, other=0.0).to(tl.float32)
         orow = o // K
         eq = (ids[:, None] == oids[None, :]) & om[None, :]
@@ -137,7 +138,7 @@ def _prune_singleton_kernel(
 
     prune = m & (cnt == 1) & (w < TAU_) & (rank >= MIN_RANK_)
     if not KEEP_IDS_:
-        tl.store(ids_ptr + offs, tl.where(prune, SENTINEL, ids), mask=m)
+        tl.store(ids_ptr + offs, tl.where(prune, SENTINEL_, ids), mask=m)
     tl.store(w_ptr + offs, tl.where(prune, 0.0, w).to(w_ptr.dtype.element_ty), mask=m)
     pdl_trigger(USE_PDL)
 
@@ -171,6 +172,7 @@ def maybe_prune_singleton_routes(topk_ids: torch.Tensor, topk_weights: torch.Ten
         K,
         TAU,
         MIN_RANK,
+        SENTINEL_=SENTINEL,
         BLOCK=BLOCK,
         CHUNK=CHUNK,
         KEEP_IDS_=KEEP_IDS,
