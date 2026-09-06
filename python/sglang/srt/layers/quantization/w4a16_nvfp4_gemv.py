@@ -50,6 +50,11 @@ FP4_SCALE_BLOCK = 16
 #: instantiated as constexpr"), and an annotation (`x: tl.constexpr = 16`) does not
 #: count -- it has to be a `tl.constexpr` value.
 _FP4_BLK = tl.constexpr(16)
+#: The bit trick decodes to `e2m1_value * 2^-14`; this undoes it. It is applied ONCE
+#: per output in the epilogue, together with the global scale, rather than inside the k
+#: loop -- the block scale stays the raw e4m3 value there, which keeps `fp4 * scale`
+#: exactly representable in bf16 (2 + 4 significand bits against bf16's 8).
+_FP4_TRICK = tl.constexpr(16384.0)
 #: e2m1 -> the fp16 bit trick returns value * 2^-14; fold the reciprocal into the
 #: global scale so the k loop never touches it.
 FP4_TRICK_SCALE = 16384.0
@@ -184,9 +189,9 @@ def _w4a16_nvfp4_gemv_kernel(
 
     if SPLITS == 1:
         if PER_CHANNEL:
-            acc = acc * tl.load(g_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+            acc = acc * (tl.load(g_ptr + offs_n, mask=n_mask, other=0.0) * _FP4_TRICK)[None, :]
         else:
-            acc = acc * tl.load(g_ptr)
+            acc = acc * (tl.load(g_ptr) * _FP4_TRICK)
         _nvfp4_store(acc, y_ptr, y2_ptr, offs_m, offs_n, stride_ym, stride_yn,
                      stride_y2m, m_mask, n_mask, SPLIT_N)
         pdl_trigger(USE_PDL)
@@ -202,9 +207,9 @@ def _w4a16_nvfp4_gemv_kernel(
         for s_i in tl.static_range(SPLITS):
             tot += tl.load(base + s_i * (M_PAD * BLOCK_N) + slot, cache_modifier=".cg")
         if PER_CHANNEL:
-            tot = tot * tl.load(g_ptr + offs_n, mask=n_mask, other=0.0)[None, :]
+            tot = tot * (tl.load(g_ptr + offs_n, mask=n_mask, other=0.0) * _FP4_TRICK)[None, :]
         else:
-            tot = tot * tl.load(g_ptr)
+            tot = tot * (tl.load(g_ptr) * _FP4_TRICK)
         _nvfp4_store(tot, y_ptr, y2_ptr, offs_m, offs_n, stride_ym, stride_yn,
                      stride_y2m, m_mask, n_mask, SPLIT_N)
         tl.store(cnt_ptr + pid_n, 0)
