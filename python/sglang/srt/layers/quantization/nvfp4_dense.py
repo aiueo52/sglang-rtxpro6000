@@ -28,7 +28,10 @@ from typing import Optional, Sequence
 
 import torch
 
-from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import quantize_nvfp4
+from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import (
+    FP4_SCALE_BLOCK,
+    quantize_nvfp4,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -276,3 +279,69 @@ class NVFP4DenseLinearMethod:
             torch.mm(x.to(torch.bfloat16), w.t(), out=y[:, r0:r1])
             del w
         return y
+
+
+# ---------------------------------------------------------------------------
+# N1 stage C: dense projections
+# ---------------------------------------------------------------------------
+#
+# These are packed inside `Fp8LinearMethod.process_weights_after_loading`, *before* it
+# quantises, rather than by a post-load walk. Two reasons, and the first is decisive:
+#
+# - **The BF16 weight is right there.** A post-load pass would have to re-read the
+#   checkpoint, and these layers do not exist in it under their module names --
+#   `qkv_proj` is fused from q/k/v_proj and `in_proj_qkvz` from in_proj_qkv + in_proj_z
+#   by the loader (`qwen4_exp.py:1923-1932`). Packing at this point gets the true BF16
+#   fused tensor for free and skips replicating that mapping.
+# - It is the same hook that already preallocates the GEMV scratch, so ordering against
+#   CUDA-graph capture is settled.
+
+def _cat_flags():
+    def on(name):
+        return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+
+    cats = []
+    if on("SGLANG_LINEAR_ATTN_NVFP4"):
+        cats.append("in_proj_qkvz")
+    if on("SGLANG_ATTN_NVFP4"):
+        cats.append("qkv_proj")
+    return tuple(cats)
+
+
+def maybe_pack_dense_nvfp4(layer) -> bool:
+    """Pack `layer` to NVFP4 in place and install the GEMV method. True if handled.
+
+    Called at the top of `Fp8LinearMethod.process_weights_after_loading`, where
+    `layer.weight` is still the loaded BF16 tensor. Deliberately NOT applied to the GDN
+    `out_proj`: measured 1.08-1.13x there for 0.22 % of the W16 step, and it is the one
+    shape where the 4-bit GEMV falls to 47-52 % of roof -- below break-even (N1_LOG.md 7).
+    """
+    cats = _cat_flags()
+    if not cats:
+        return False
+    prefix = getattr(layer, "prefix", "") or ""
+    if not any(prefix.endswith(c) or f".{c}" in prefix for c in cats):
+        return False
+    w = getattr(layer, "weight", None)
+    if w is None or w.dim() != 2 or w.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if w.shape[1] % FP4_SCALE_BLOCK:
+        logger.warning("NVFP4 %s: K=%d not a multiple of 16, leaving FP8", prefix, w.shape[1])
+        return False
+
+    from sglang.srt.layers.quantization.w8a16_gemv import prealloc
+
+    wq, bs, gscale = quantize_nvfp4(w.data)
+    prealloc(wq.device)
+    NVFP4DenseLinearMethod.attach(layer, wq, bs, gscale)
+    try:
+        del layer.weight
+    except AttributeError:
+        pass
+    layer.weight = wq
+    layer.weight_scale = None
+    layer.input_scale = None
+    layer.quant_method = NVFP4DenseLinearMethod(prefix)
+    logger.info("NVFP4 dense: %s %s packed", prefix, tuple(wq.shape))
+    return True
+

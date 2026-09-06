@@ -848,6 +848,14 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        # N1 stage C: some dense categories are served as NVFP4 instead of FP8. This has
+        # to happen before the FP8 quantisation below, while layer.weight is still the
+        # loaded BF16 tensor -- see nvfp4_dense.maybe_pack_dense_nvfp4.
+        from sglang.srt.layers.quantization.nvfp4_dense import maybe_pack_dense_nvfp4
+
+        if maybe_pack_dense_nvfp4(layer):
+            return
+
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
