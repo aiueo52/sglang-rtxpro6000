@@ -270,7 +270,16 @@ def _m_bucket(M: int) -> int:
 # metric bench/w8a16v2 uses for the FP8 table. Re-run after a kernel change.
 #
 # key:   (M bucket, N, K)  value: (BLOCK_N, BLOCK_K, SPLITS, USE_DOT, num_warps, num_stages)
-_TUNED: dict = {}
+#
+# BLOCK_K 512 is the pattern here and it is not the FP8 table's: at 512 the per-16 block
+# scales for one row are a 32 B tile, exactly one sector, where BLOCK_K 256 fetches 32 B
+# to use 16. The scales are only 1/8 of the weight bytes but at the wrong granularity
+# they cost a second sector each.
+_TUNED: dict = {
+    # draft lm_head, hot2_49152. Planner default (32,256,...) measured 56.19 us;
+    # this is 52.64 us = 1344.6 GB/s = 83.3 % of the 1615 GB/s roof (sweep 2026-09-06).
+    (1, 49152, 2560): (32, 512, 1, False, 4, 2),
+}
 
 
 def _plan(M: int, N: int, K: int, sms: int):
