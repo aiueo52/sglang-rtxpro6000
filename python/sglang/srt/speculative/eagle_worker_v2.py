@@ -138,6 +138,11 @@ logger = logging.getLogger(__name__)
 _MTP_LMHEAD_NVFP4 = os.environ.get("SGLANG_MTP_LMHEAD_NVFP4", "0").lower() in (
     "1", "true", "yes", "on"
 )
+#: N1 stage B -- serve the TARGET lm_head as NVFP4. Unlike stage A this changes the
+#: model's own output distribution, so it carries the strict quality gate.
+_LMHEAD_NVFP4 = os.environ.get("SGLANG_LMHEAD_NVFP4", "0").lower() in (
+    "1", "true", "yes", "on"
+)
 
 
 def _qsa_index_share_requested(hf_config) -> bool:
@@ -374,6 +379,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_lm_head.quant_method = self._draft_fp8_head_method
             if _MTP_LMHEAD_NVFP4 and self.hot_token_id is not None:
                 self._install_nvfp4_draft_head()
+            # Stage B runs *after* the draft head has been sliced, deliberately: the
+            # draft slice is taken from the target's FP8 head, exactly as in production,
+            # so the control arm is the shipped build and stage B is isolated to the
+            # target's own logits. Doing it earlier would change both at once.
+            if _LMHEAD_NVFP4 and target_lm_head is not None:
+                self._install_nvfp4_target_head(target_lm_head)
 
     def _install_nvfp4_draft_head(self):
         """Replace the draft's hot-vocab FP8 head with an NVFP4 one (N1 stage A).
@@ -405,13 +416,84 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 "keeping the FP8 head"
             )
             return
+        # The NVFP4 GEMV shares w8a16_gemv's split-K scratch, and that scratch must
+        # exist before any CUDA graph is captured or the first split-K call allocates
+        # inside a capture and lands in that graph's private pool. Fp8LinearMethod's
+        # process_weights_after_loading already preallocates it for every FP8 dense
+        # category, but stage B/C drop categories from that list, so do not depend on
+        # someone else having done it.
+        from sglang.srt.layers.quantization.w8a16_gemv import prealloc
+
+        prealloc(wq.device)
         NVFP4DenseLinearMethod.attach(draft_lm_head, wq, bs, gscale)
+        # `weight` is a registered nn.Parameter, so it has to be deleted before a plain
+        # uint8 tensor can take its place -- the same dance set_embed_and_head does.
+        # It must still exist afterwards: should_apply_lm_head_quant_method refuses any
+        # head without a `weight` attribute and would silently fall back to a dense
+        # matmul against the packed codes.
+        try:
+            del draft_lm_head.weight
+        except AttributeError:
+            pass
         draft_lm_head.weight = wq
         draft_lm_head.weight_scale = None
         draft_lm_head.input_scale = None
         draft_lm_head.quant_method = NVFP4DenseLinearMethod("draft lm_head")
         logger.info(
             "Draft lm_head: %d hot rows in NVFP4 (%.1f MB vs %.1f MB FP8)",
+            wq.shape[0],
+            (wq.numel() + bs.numel()) / 1e6,
+            wq.shape[0] * wq.shape[1] * 2 / 1e6,
+        )
+
+    def _install_nvfp4_target_head(self, target_lm_head):
+        """Replace the target model's lm_head with NVFP4 (N1 stage B).
+
+        All 248320 rows, packed from the checkpoint's BF16 rather than from the FP8
+        weight `process_weights_after_loading` has already written, so the two lossy
+        steps are not compounded. Measured 1.570x on this GEMV (250.2 vs 393.0 us at
+        M=1, 88.5 % of the read roof) -- the largest single speedup in the N1 set,
+        because 248320 rows give the widest grid.
+
+        This changes what the model outputs, so it is gated on the full quality battery,
+        not on acceptance.
+        """
+        from sglang.srt.layers.quantization.nvfp4_dense import (
+            NVFP4DenseLinearMethod,
+            build_or_load,
+        )
+        from sglang.srt.layers.quantization.w8a16_gemv import prealloc
+
+        model_dir = self.target_worker.model_runner.model_config.model_path
+        try:
+            wq, bs, gscale = build_or_load(
+                model_dir, "lm_head.weight", None,
+                device=target_lm_head.weight.device, label="target lm_head",
+            )
+        except Exception:
+            logger.exception(
+                "SGLANG_LMHEAD_NVFP4=1 but the target head could not be packed; "
+                "keeping the FP8 head"
+            )
+            return
+        prealloc(wq.device)
+        NVFP4DenseLinearMethod.attach(target_lm_head, wq, bs, gscale)
+        # `weight` is a registered nn.Parameter, so it has to be deleted before a plain
+        # uint8 tensor can take its place -- the same dance set_embed_and_head does.
+        # It must still exist afterwards: should_apply_lm_head_quant_method refuses any
+        # head without a `weight` attribute and would silently fall back to a dense
+        # matmul against the packed codes.
+        try:
+            del target_lm_head.weight
+        except AttributeError:
+            pass
+        target_lm_head.weight = wq
+        target_lm_head.weight_scale = None
+        target_lm_head.input_scale = None
+        target_lm_head.quant_method = NVFP4DenseLinearMethod("target lm_head")
+        torch.cuda.empty_cache()
+        logger.info(
+            "Target lm_head: %d rows in NVFP4 (%.1f MB vs %.1f MB FP8)",
             wq.shape[0],
             (wq.numel() + bs.numel()) / 1e6,
             wq.shape[0] * wq.shape[1] * 2 / 1e6,
