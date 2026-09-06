@@ -384,6 +384,16 @@ class ConfidenceStepSlot:
         self._grace = self.switch_grace_batches
         self._last_dir = 0
         self.switch_margin = float(cfg.get("switch_margin", 0.05))
+        # Asymmetric on purpose, because the two estimates are not equally
+        # trustworthy. Going DOWN uses min(accepted, S), which is exact. Going
+        # UP uses the hazard extrapolation, which measured 8-17% optimistic --
+        # and on the 2026-09-06 server A/B that optimism cost agent-loop 8.6%:
+        # it predicted E@15 = 5.53 (323 tok/s) against a true ~3.5, stepped up
+        # mid-benchmark and had to come back 5 s later. A candidate whose
+        # estimate is extrapolated must therefore clear a wider margin. It
+        # separates cleanly: at S=3 code-edit predicts +88% for the long chain
+        # while agent-loop and the prose workloads predict within +/-5%.
+        self.up_margin = float(cfg.get("up_margin", 0.30))
         # The hazard extrapolation runs 8-17% optimistic against measurement.
         self.tail_bias = float(cfg.get("tail_bias", 0.9))
         # 0 pools every step into one estimate (option 3: a better statistic,
@@ -540,10 +550,13 @@ class ConfidenceStepSlot:
         for s in self.candidate_steps:
             tps = self.value(s)
             if s == self.current_steps:
-                # The only hysteresis: a challenger must clear the incumbent by
-                # this margin, which pays for the cold draft state a switch
-                # leaves behind and covers the upward estimate's known bias.
+                # Hysteresis: a challenger must clear the incumbent, which pays
+                # for the cold draft state a switch leaves behind.
                 tps *= 1.0 + self.switch_margin
+            elif s > self.current_steps:
+                # ... and clear it by more when its own estimate is the
+                # extrapolation rather than an exact observation.
+                tps /= 1.0 + self.up_margin
             if tps > best_tps:
                 best, best_tps = s, tps
         return best, best_tps
