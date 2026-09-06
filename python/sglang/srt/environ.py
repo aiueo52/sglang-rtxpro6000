@@ -1209,6 +1209,16 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # C1: adaptive speculative step choice driven by the draft's own top-1
+    # probability instead of (only) the historical acceptance EMA.
+    #   "ema"        -- shipped behaviour, no confidence machinery at all
+    #   "confidence" -- confidence-gated policy (see adaptive_confidence.py)
+    # Any value other than "ema" turns on the draft confidence side channel.
+    SGLANG_ADAPTIVE_POLICY = EnvStr("ema")
+    # Dump one line per decode step -- (steps, bs, chain top-1 probs, accepted
+    # drafts) -- to this path.  Also turns the confidence side channel on.
+    # Offline-analysis only; never set in production.
+    SGLANG_ADAPTIVE_TRACE = EnvStr("")
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

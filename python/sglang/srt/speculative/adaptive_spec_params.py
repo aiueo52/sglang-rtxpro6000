@@ -368,8 +368,21 @@ class AdaptiveSpeculativeParams:
         self._slots: dict[int, AdaptiveStepSlot] = {}
         self._cuda_graph_bs: list[int] | None = None
 
+        # SGLANG_ADAPTIVE_POLICY=confidence swaps the decision rule (not the
+        # state machinery) for the throughput/confidence slot.  Default "ema"
+        # is the shipped behaviour, byte for byte.
+        from sglang.srt.speculative.adaptive_confidence import (
+            ConfidenceStepSlot,
+            confidence_policy_enabled,
+        )
+
+        slot_cls = (
+            ConfidenceStepSlot if confidence_policy_enabled() else AdaptiveStepSlot
+        )
+        self._confidence = slot_cls is ConfidenceStepSlot
+
         for bs, entry in sorted(bs_entries.items()):
-            self._slots[bs] = AdaptiveStepSlot(
+            self._slots[bs] = slot_cls(
                 initial_steps=initial_steps,
                 cfg={**cfg, **entry},
             )
@@ -392,6 +405,15 @@ class AdaptiveSpeculativeParams:
 
     def get_steps_for_batch(self, batch_size: int) -> int:
         return self._route(batch_size).current_steps
+
+    def observe_confidence(self, confidences: list[float], batch_size: int) -> None:
+        """Feed the draft's position-0 top-1 probabilities to the live slot.
+
+        No-op for the EMA policy, which has nowhere to put them.
+        """
+        if not self._confidence:
+            return
+        self._route(batch_size).observe_confidence(confidences)
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int

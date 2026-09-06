@@ -14,9 +14,11 @@ def _draft_topk1_partial_argmax_kernel(
     logits,
     partial_vals,
     partial_indices,
+    partial_sums,
     logits_row_stride,
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
+    WRITE_PROB: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
@@ -37,12 +39,17 @@ def _draft_topk1_partial_argmax_kernel(
     out_offset = row * num_splits + split
     tl.store(partial_vals + out_offset, max_val)
     tl.store(partial_indices + out_offset, split * BLOCK + local_index)
+    if WRITE_PROB:
+        # Online-softmax partial: sum over this split of exp(v - m_split).
+        # Masked lanes hold -inf (-> exp 0) so they contribute nothing.
+        tl.store(partial_sums + out_offset, tl.sum(tl.exp(vals - max_val), axis=0))
 
 
 @triton.jit
 def _draft_topk1_finalize_kernel(
     partial_vals,
     partial_indices,
+    partial_sums,
     topk_p,
     topk_index,
     positions,
@@ -50,9 +57,12 @@ def _draft_topk1_finalize_kernel(
     draft_tokens,
     draft_tokens_stride,
     draft_token_column,
+    chain_probs,
+    chain_probs_stride,
     num_splits: tl.constexpr,
     HAS_TOKEN_MAP: tl.constexpr,
     WRITE_DRAFT_TOKEN: tl.constexpr,
+    WRITE_PROB: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -65,6 +75,17 @@ def _draft_topk1_finalize_kernel(
     )
 
     split = tl.argmax(vals, axis=0)
+    if WRITE_PROB:
+        # p_top1 = exp(M - logsumexp) = 1 / sum_j s_j * exp(m_j - M), with
+        # M = max_j m_j the global max (== the top-1 logit).
+        m = tl.max(vals, axis=0)
+        sums = tl.load(
+            partial_sums + row * num_splits + offsets, mask=mask, other=0.0
+        )
+        denom = tl.sum(sums * tl.exp(vals - m), axis=0)
+        tl.store(
+            chain_probs + row * chain_probs_stride + draft_token_column, 1.0 / denom
+        )
     index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
     token = tl.load(hot_token_id + index) if HAS_TOKEN_MAP else index
     tl.store(topk_index + row, token)
@@ -82,6 +103,7 @@ def draft_topk1_postprocess(
     draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0,
     hot_token_id: Optional[torch.Tensor] = None,
+    chain_probs: torch.Tensor | None = None,
 ):
     """Argmax draft logits for topk=1 and advance positions.
 
@@ -94,6 +116,17 @@ def draft_topk1_postprocess(
     is also stored into ``draft_tokens[:, draft_token_column]``, mutating the
     caller-owned buffer in place. ``topk_p`` is returned as constant 1.0:
     topk=1 drafting is greedy and the chain probabilities are unused downstream.
+
+    If ``chain_probs`` is given, the softmax probability of the selected token
+    is *additionally* written to ``chain_probs[:, draft_token_column]``.  It is
+    obtained from the same single pass over the vocabulary that the argmax
+    already makes (online softmax: each split stores ``sum(exp(v - m_split))``
+    alongside its max, and the finalize kernel combines them), so it costs one
+    extra fp32 store per split and no extra global traffic.  ``topk_p`` is left
+    at 1.0 so that every existing consumer is bit-identical; the confidence is
+    a side channel for the adaptive speculative controller.  When
+    ``chain_probs`` is ``None`` the kernels specialize back to the original
+    code (``WRITE_PROB`` is a ``tl.constexpr``).
     """
     assert next_token_logits.ndim == 2
     assert next_token_logits.stride(1) == 1
@@ -108,6 +141,14 @@ def draft_topk1_postprocess(
         assert hot_token_id.is_contiguous()
         assert hot_token_id.device == next_token_logits.device
         assert hot_token_id.shape[0] == next_token_logits.shape[1]
+    write_prob = chain_probs is not None
+    if write_prob:
+        assert chain_probs.ndim == 2
+        assert chain_probs.dtype == torch.float32
+        assert chain_probs.device == next_token_logits.device
+        assert chain_probs.shape[0] >= next_token_logits.shape[0]
+        assert chain_probs.stride(1) == 1
+        assert 0 <= draft_token_column < chain_probs.shape[1]
     write_draft_token = draft_tokens is not None
     if write_draft_token:
         assert draft_tokens.ndim == 2
@@ -133,14 +174,21 @@ def draft_topk1_postprocess(
     partial_indices = torch.empty(
         (bs, num_splits), dtype=torch.int32, device=next_token_logits.device
     )
+    partial_sums = (
+        torch.empty((bs, num_splits), dtype=torch.float32, device=next_token_logits.device)
+        if write_prob
+        else partial_vals
+    )
 
     _draft_topk1_partial_argmax_kernel[(bs, num_splits)](
         next_token_logits,
         partial_vals,
         partial_indices,
+        partial_sums,
         next_token_logits.stride(0),
         vocab_size,
         num_splits,
+        WRITE_PROB=write_prob,
         BLOCK=block,
         num_warps=8,
     )
@@ -150,6 +198,7 @@ def draft_topk1_postprocess(
     _draft_topk1_finalize_kernel[(bs,)](
         partial_vals,
         partial_indices,
+        partial_sums,
         topk_p,
         topk_index,
         positions,
@@ -157,9 +206,12 @@ def draft_topk1_postprocess(
         draft_tokens if write_draft_token else topk_index,
         draft_tokens.stride(0) if write_draft_token else 0,
         draft_token_column,
+        chain_probs if write_prob else topk_p,
+        chain_probs.stride(0) if write_prob else 0,
         num_splits,
         HAS_TOKEN_MAP=has_token_map,
         WRITE_DRAFT_TOKEN=write_draft_token,
+        WRITE_PROB=write_prob,
         BLOCK=triton.next_power_of_2(num_splits),
         num_warps=1,
     )

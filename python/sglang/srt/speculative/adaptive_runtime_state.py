@@ -195,6 +195,10 @@ class AdaptiveController:
                 "smaller ones as candidates."
             )
 
+    def observe_confidence(self, confidences: list[float], batch_size: int) -> None:
+        """Draft confidence for the chain that is about to be drafted."""
+        self.params.observe_confidence(confidences, batch_size)
+
     def activate_step_by_batch(self, batch_size: int) -> None:
         target = (
             self._pending_steps

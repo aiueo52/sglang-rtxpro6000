@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -12,6 +13,8 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -58,6 +61,12 @@ class EagleDraftWorkerBase(ABC):
     # topk=1 chain constants for draft_forward's fast path; None when topk > 1.
     _topk1_parents_prealloc: Optional[torch.Tensor] = None
     _topk1_score_indices_prealloc: Optional[torch.Tensor] = None
+    # C1 draft-confidence side channel (topk=1 only). Allocated once, at the
+    # launch step count -- which adaptive guarantees is the largest candidate
+    # -- and never rebuilt, so a state switch cannot free a buffer that an
+    # already-captured draft graph writes into.
+    _chain_conf_buf: Optional[torch.Tensor] = None
+    _conf_channel = None
 
     def __init__(self) -> None:
         self._specialized_graph_memory_usage: dict[str, float] = {}
@@ -142,6 +151,30 @@ class EagleDraftWorkerBase(ABC):
         self._topk1_score_indices_prealloc = torch.arange(
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
+        self._init_confidence_channel(max_bs, num_steps)
+
+    def _init_confidence_channel(self, max_bs: int, num_steps: int) -> None:
+        from sglang.srt.speculative.adaptive_confidence import (
+            ConfidenceChannel,
+            chain_trace_enabled,
+            confidence_enabled,
+        )
+
+        if not confidence_enabled() or self._conf_channel is not None:
+            return
+        if chain_trace_enabled():
+            self._chain_conf_buf = torch.zeros(
+                (max_bs, max(num_steps, 1)), dtype=torch.float32, device=self.device
+            )
+        self._conf_channel = ConfidenceChannel(
+            device=self.device, max_bs=max_bs, max_steps=max(num_steps, 1)
+        )
+        logger.info(
+            "C1 draft-confidence channel enabled (max_bs=%d, steps=%d, chain_trace=%s)",
+            max_bs,
+            num_steps,
+            chain_trace_enabled(),
+        )
 
 
 class BaseSpecWorker(ABC):

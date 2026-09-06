@@ -57,6 +57,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_confidence import (
+    ChainTracer,
+    chain_trace_enabled,
+    top1_prob,
+)
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -671,6 +676,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
+        if (
+            self._conf_channel is not None
+            and self._chain_conf_buf is not None
+            and not forward_batch.forward_mode.is_idle()
+        ):
+            # Copy before draft-extend overwrites column 0 for the next chain.
+            self._conf_channel.record_chain(
+                self._chain_conf_buf,
+                bs=batch.seq_lens.shape[0],
+                steps=self.speculative_num_steps,
+            )
+
         return build_eagle_verify_input(
             batch,
             draft_input,
@@ -737,6 +754,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+
+        # C1: per-position draft confidence (trace only; None in production).
+        # Column 0 was written by the previous iteration's draft-extend, which
+        # is where this chain's first token came from.
+        chain_conf_buf = (
+            self._chain_conf_buf
+            if (
+                draft_tokens_topk1 is not None
+                and self._chain_conf_buf is not None
+                and topk_index.shape[0] <= self._chain_conf_buf.shape[0]
+                and self.speculative_num_steps <= self._chain_conf_buf.shape[1]
+            )
+            else None
+        )
 
         # Forward multiple steps
         scores = None
@@ -811,6 +842,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                                 if draft_tokens_topk1 is not None
                                 else None
                             ),
+                            # C1 trace only: the kernel's argmax pass already
+                            # reads every logit, so the top-1 probability of
+                            # chain position i+1 comes out of the same
+                            # reduction.  ``None`` in production, and the
+                            # kernel specialises WRITE_PROB away.
+                            chain_probs=chain_conf_buf,
                         )
                     else:
                         topk_index = torch.argmax(
@@ -1154,6 +1191,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
+            if self._conf_channel is not None:
+                # C1: the confidence the adaptive controller decides on.  This
+                # is the only chain position whose probability exists before
+                # the next step's state swap, because the draft loop itself is
+                # one captured CUDA graph.  ret_topk_p stays 1.0 so every
+                # existing consumer is unchanged.
+                p0 = top1_prob(draft_logits_output.next_token_logits)
+                self._conf_channel.record_position0(p0)
+                if self._chain_conf_buf is not None:
+                    n = min(p0.shape[0], self._chain_conf_buf.shape[0])
+                    self._chain_conf_buf[:n, 0].copy_(p0[:n])
         else:
             probs = renorm_draft_probs(
                 draft_logits_output.next_token_logits,
@@ -1223,6 +1271,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             nccl_port,
             target_worker,
         )
+
+        # C1 offline trace (SGLANG_ADAPTIVE_TRACE=<path>), debug only.
+        self._chain_tracer: Optional[ChainTracer] = None
+        if chain_trace_enabled():
+            import os as _os
+
+            self._chain_tracer = ChainTracer(
+                _os.environ["SGLANG_ADAPTIVE_TRACE"]
+                + f".rank{getattr(self, 'tp_rank', 0)}"
+            )
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -1484,14 +1542,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
+        if self._chain_tracer is not None:
+            channel = self.draft_worker._conf_channel
+            popped = channel.pop_chain() if channel is not None else None
+            chain, steps = popped if popped is not None else (None, 0)
+            self._chain_tracer.write(
+                steps=steps,
+                bs=batch_size,
+                chain=chain,
+                accepted=num_correct_drafts_per_req,
+            )
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+        if self.adaptive_controller is None:
+            return
+        # The confidence of the chain about to be drafted was staged during the
+        # previous iteration's draft-extend, so this event is already complete.
+        channel = self.draft_worker._conf_channel
+        if channel is not None:
+            confidences = channel.latest_position0()
+            if confidences:
+                self.adaptive_controller.observe_confidence(confidences, batch_size)
+        self.adaptive_controller.activate_step_by_batch(batch_size)
 
     # -- Adaptive speculative decoding protocol --
 
