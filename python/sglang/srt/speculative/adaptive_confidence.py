@@ -128,6 +128,7 @@ class ConfidenceChannel:
         self._p0_bs = [0] * self.RING
         self._p0_write = 0
         self._p0_read = -1  # index of the newest slot with a copy in flight
+        self._p0_cached: Optional[list[float]] = None
 
         self._chain_host = None
         self._chain_event = None
@@ -143,7 +144,7 @@ class ConfidenceChannel:
     # -- producers ---------------------------------------------------------
     def record_position0(self, p0: torch.Tensor) -> None:
         bs = p0.shape[0]
-        if bs == 0 or bs > self.max_bs:
+        if bs == 0 or bs > self.max_bs or torch.cuda.is_current_stream_capturing():
             return
         slot = self._p0_write
         self._p0_host[slot][:bs].copy_(p0.view(-1), non_blocking=True)
@@ -153,7 +154,12 @@ class ConfidenceChannel:
         self._p0_write = (slot + 1) % self.RING
 
     def record_chain(self, chain: torch.Tensor, bs: int, steps: int) -> None:
-        if self._chain_host is None or bs == 0 or bs > self.max_bs:
+        if (
+            self._chain_host is None
+            or bs == 0
+            or bs > self.max_bs
+            or torch.cuda.is_current_stream_capturing()
+        ):
             return
         slot = self._chain_write
         self._chain_host[slot][:bs, :steps].copy_(
@@ -165,17 +171,30 @@ class ConfidenceChannel:
 
     # -- consumers ---------------------------------------------------------
     def latest_position0(self) -> Optional[list[float]]:
-        """Newest position-0 confidences, or None if nothing was recorded yet.
+        """Newest position-0 confidences whose copy has ALREADY landed.
 
-        Synchronises on that slot's event.  In the steady state the copy was
-        issued during the previous iteration's draft-extend, so this is a
-        completed event and the wait returns immediately.
+        Never synchronises.  The scheduler deliberately runs the CPU ahead of
+        the GPU (that is why the adaptive controller is fed from
+        ``batch_result_processor`` after ``accept_lens`` is already on the
+        host, rather than from the worker hot path), so waiting on an event
+        here would collapse the run-ahead and cost far more than the decision
+        is worth.  Instead: walk back from the newest slot to the first one
+        whose event has completed, and cache the value.  In practice that is
+        one or two iterations old, which is inside the lag the controller
+        already tolerates -- ``update()`` samples arrive late by the same
+        mechanism.  Returns the last known value when nothing new has landed.
         """
-        slot = self._p0_read
-        if slot < 0:
-            return None
-        self._p0_event[slot].synchronize()
-        return self._p0_host[slot][: self._p0_bs[slot]].tolist()
+        newest = self._p0_read
+        if newest < 0:
+            return self._p0_cached
+        for k in range(self.RING):
+            slot = (newest - k) % self.RING
+            if self._p0_bs[slot] == 0:
+                continue
+            if self._p0_event[slot].query():
+                self._p0_cached = self._p0_host[slot][: self._p0_bs[slot]].tolist()
+                return self._p0_cached
+        return self._p0_cached
 
     def pop_chain(self) -> Optional[tuple[list[list[float]], int]]:
         """Oldest recorded chain, paired FIFO with the verify results."""
