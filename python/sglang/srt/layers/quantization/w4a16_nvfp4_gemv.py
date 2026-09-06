@@ -80,9 +80,21 @@ def _unpack_dequant(b, BLOCK_N: tl.constexpr, BLOCK_KB: tl.constexpr):
 @triton.jit
 def _load_block_scales(
     s_ptr, offs_n, kb0, n_mask, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    stride_sn, NB: tl.constexpr, E4M3_NATIVE: tl.constexpr,
+    stride_sn, NB: tl.constexpr, E4M3_NATIVE: tl.constexpr, GATHER: tl.constexpr,
 ):
-    """[BLOCK_N, BLOCK_K//16] e4m3 scales, broadcast to [BLOCK_N, BLOCK_K] bf16."""
+    """[BLOCK_N, BLOCK_K//16] e4m3 scales, broadcast to [BLOCK_N, BLOCK_K] bf16.
+
+    GATHER False loads NB scales per row and expands them in registers; GATHER True
+    re-reads each scale 16 times (an L1 hit) with no reshape. The first is fewer
+    instructions, the second is the fallback if a Triton version refuses to reshape a
+    broadcast value. They are numerically identical.
+    """
+    if GATHER:
+        offs_k = tl.arange(0, BLOCK_K)
+        p = s_ptr + offs_n[:, None] * stride_sn + (kb0 + offs_k // FP4_SCALE_BLOCK)[None, :]
+        if E4M3_NATIVE:
+            return tl.load(p, mask=n_mask[:, None], other=0.0).to(tl.bfloat16)
+        return tl.load(p, mask=n_mask[:, None], other=0).to(tl.bfloat16)
     offs_b = kb0 + tl.arange(0, NB)
     p = s_ptr + offs_n[:, None] * stride_sn + offs_b[None, :]
     if E4M3_NATIVE:
@@ -122,6 +134,7 @@ def _w4a16_nvfp4_gemv_kernel(
     SPLITS: tl.constexpr,
     USE_DOT: tl.constexpr,
     E4M3_NATIVE: tl.constexpr,
+    SCALE_GATHER: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
 ):
     pid_n = tl.program_id(0)
@@ -148,7 +161,7 @@ def _w4a16_nvfp4_gemv_kernel(
         w = _unpack_dequant(qb, BLOCK_N, BLOCK_KB)
         s = _load_block_scales(
             s_ptr, offs_n, k0 // FP4_SCALE_BLOCK, n_mask,
-            BLOCK_N, BLOCK_K, stride_sn, NB, E4M3_NATIVE,
+            BLOCK_N, BLOCK_K, stride_sn, NB, E4M3_NATIVE, SCALE_GATHER,
         )
         w = w * s
         if USE_DOT:
@@ -232,6 +245,9 @@ from sglang.srt.layers.quantization.w8a16_gemv import (  # noqa: E402
 )
 
 E4M3_NATIVE = True
+#: Fallback scale broadcast (see _load_block_scales); set if the reshape path fails
+#: to compile on a given Triton build.
+SCALE_GATHER = _env_flag("SGLANG_NVFP4_GEMV_SCALE_GATHER")
 
 
 def _m_bucket(M: int) -> int:
@@ -357,6 +373,7 @@ def w4a16_nvfp4_gemv(
         SPLITS=splits,
         USE_DOT=use_dot,
         E4M3_NATIVE=E4M3_NATIVE,
+        SCALE_GATHER=SCALE_GATHER,
         USE_PDL=PDL,
         launch_pdl=PDL,
         num_warps=num_warps,

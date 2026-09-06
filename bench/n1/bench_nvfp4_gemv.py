@@ -117,9 +117,16 @@ def run_sweep(M, N, K):
     """Tile sweep for the NVFP4 kernel. BLOCK_K must divide K and be a multiple of 16."""
     b4 = fp4_bytes(N, K)
     c4 = copies_for(b4)
+    # Kept deliberately small: every distinct config is a fresh Triton compile
+    # (~5-20 s), so the full cross product is hours of wall clock for a decision that a
+    # few dozen points already make. Split-K is only offered where the n grid does NOT
+    # already fill the machine -- at N=49152, BLOCK_N=32 is 1536 CTAs on 188 SMs, so
+    # splitting can only add reduction traffic.
+    n_full = triton.cdiv(N, 32) >= 2 * 188
+    splits = (1,) if n_full else (1, 2, 5, 10)
     cands = []
     for bn, bk, sp, warps, stages in itertools.product(
-        (16, 32, 64, 128), (64, 128, 256, 512), (1, 2, 5, 10), (2, 4, 8), (2, 3, 4)
+        (32, 64, 128), (128, 256, 512), splits, (4, 8), (2, 3)
     ):
         if K % bk or (bk // 16) * bn > 8192:
             continue
