@@ -65,6 +65,7 @@ from sglang.srt.speculative.adaptive_confidence import (
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    adaptive_target_graph_warmup,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -1795,12 +1796,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
                 _backup_private_t = _set_private(True)
-                target_graph_runner = TargetGraphRunnerCls(
-                    target_model_runner,
-                    attn_backend=target_attn_backend,
-                    speculative_num_steps=speculative_num_steps,
-                    speculative_num_draft_tokens=speculative_num_draft_tokens,
-                )
+                with adaptive_target_graph_warmup(
+                    target_model_runner, target_attn_backend
+                ):
+                    target_graph_runner = TargetGraphRunnerCls(
+                        target_model_runner,
+                        attn_backend=target_attn_backend,
+                        speculative_num_steps=speculative_num_steps,
+                        speculative_num_draft_tokens=speculative_num_draft_tokens,
+                    )
                 if "no_gdn_recovery" not in split:
                     target_model_runner.maybe_capture_gdn_recovery_graphs(
                         attn_backend=target_attn_backend,
