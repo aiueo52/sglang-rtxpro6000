@@ -384,6 +384,27 @@ class ConfidenceStepSlot:
         self._grace = self.switch_grace_batches
         self._last_dir = 0
         self.switch_margin = float(cfg.get("switch_margin", 0.05))
+        # Optional downward thresholds, independent of the upward incumbent
+        # bonus. A scalar applies to all downshifts; a mapping is keyed by
+        # destination steps (e.g. {"3": .03, "7": .12}). Missing destinations
+        # retain switch_margin. Leave the legacy score arithmetic untouched
+        # when the key is absent.
+        down_margin = cfg.get("down_margin")
+        self.down_margin = (
+            {int(s): float(v) for s, v in down_margin.items()}
+            if isinstance(down_margin, dict)
+            else float(down_margin) if down_margin is not None else None
+        )
+        margins = (
+            self.down_margin.values()
+            if isinstance(self.down_margin, dict)
+            else [self.down_margin] if self.down_margin is not None else []
+        )
+        if any(not math.isfinite(v) or v < 0 for v in margins):
+            raise ValueError("down_margin must contain finite non-negative values")
+        self.adjacent_only_promotion = cfg.get("adjacent_only_promotion", False)
+        if not isinstance(self.adjacent_only_promotion, bool):
+            raise ValueError("adjacent_only_promotion must be a boolean")
         # Asymmetric on purpose, because the two estimates are not equally
         # trustworthy. Going DOWN uses min(accepted, S), which is exact. Going
         # UP uses the hazard extrapolation, which measured 8-17% optimistic --
@@ -547,7 +568,14 @@ class ConfidenceStepSlot:
 
     def best_steps(self) -> tuple[int, float]:
         best, best_tps = self.current_steps, -1.0
+        next_up = (
+            next((s for s in self.candidate_steps if s > self.current_steps), None)
+            if self.adjacent_only_promotion
+            else None
+        )
         for s in self.candidate_steps:
+            if self.adjacent_only_promotion and s > self.current_steps and s != next_up:
+                continue
             tps = self.value(s)
             if s == self.current_steps:
                 # Hysteresis: a challenger must clear the incumbent, which pays
@@ -557,6 +585,16 @@ class ConfidenceStepSlot:
                 # ... and clear it by more when its own estimate is the
                 # extrapolation rather than an exact observation.
                 tps /= 1.0 + self.up_margin
+            elif self.down_margin is not None:
+                margin = (
+                    self.down_margin.get(s)
+                    if isinstance(self.down_margin, dict)
+                    else self.down_margin
+                )
+                if margin is not None:
+                    # Compare against the same incumbent score while requiring
+                    # only (1 + down_margin) for this exact, downward estimate.
+                    tps *= (1.0 + self.switch_margin) / (1.0 + margin)
             if tps > best_tps:
                 best, best_tps = s, tps
         return best, best_tps
