@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """KV pools carrying the QSA sparse-attention indexer caches.
 
 ``QSATokenToKVPool`` (compressed, Qwen4-Exp) adds the per-token BF16 index-key

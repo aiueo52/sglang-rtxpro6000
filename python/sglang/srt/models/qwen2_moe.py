@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team

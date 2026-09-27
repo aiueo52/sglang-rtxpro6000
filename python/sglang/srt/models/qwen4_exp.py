@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math

@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """Adaptive speculative decoding parameters.
 
 Adjusts speculative_num_steps at runtime based on observed acceptance lengths.

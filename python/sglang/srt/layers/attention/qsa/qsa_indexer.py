@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """QSA indexer for Qwen4-Exp checkpoints."""
 
 from __future__ import annotations

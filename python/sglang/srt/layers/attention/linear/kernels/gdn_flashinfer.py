@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """FlashInfer-based kernels for GDN (Gated Delta Network) linear attention.
 
 Both SM90 and SM100 use the same pool layout: [pool, HV, V, K] (K-last).

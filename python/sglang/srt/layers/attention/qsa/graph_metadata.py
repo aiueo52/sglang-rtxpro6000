@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """GPU builders for QSA CUDA-graph replay metadata.
 
 Compressed addressing is pure arithmetic over the page-aligned full-KV

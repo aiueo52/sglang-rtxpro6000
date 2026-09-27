@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """Sparse-attention backend for Qwen4-Exp models with an indexer.
 
 The backend is installed as the full-attention side of Qwen4-Exp's hybrid backend;

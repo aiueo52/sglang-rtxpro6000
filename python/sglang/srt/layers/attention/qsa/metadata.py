@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """Metadata owned by the simple QSA implementation.
 
 QSA intentionally does not inherit the NSA metadata abstraction. This module

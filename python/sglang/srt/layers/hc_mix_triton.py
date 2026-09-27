@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """Fused HC low-rank mix for decode-size batches.
 
 `GatedResidual._mix_compute` lowers to a five-kernel chain per call

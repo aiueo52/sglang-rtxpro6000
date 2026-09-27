@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 """Equivalence tests for the EagleDraftWorker topk=1 chain fast path.
 
 For topk=1 the draft tree degenerates to a chain, so `draft_forward` skips the
