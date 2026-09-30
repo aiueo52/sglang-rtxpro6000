@@ -1226,6 +1226,9 @@ class Envs:
     # Honor min_p in the sampling verify and the RS draft proposal, as the
     # non-speculative sampler does; off = the verify's top-k/top-p only.
     SGLANG_SPEC_MIN_P = EnvBool(False)
+    # Target-only sampling verify on the top-KP logits instead of full-vocabulary
+    # probabilities, when every request has top_k <= 248; off = the dense verify.
+    SGLANG_OPT_SPEC_SPARSE_VERIFY = EnvBool(False)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

@@ -182,6 +182,7 @@ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.T
 
 RS_DRAFT_TOPK = envs.SGLANG_RS_DRAFT_TOPK.get()
 SPEC_MIN_P = envs.SGLANG_SPEC_MIN_P.get()
+SPEC_SPARSE_VERIFY = envs.SGLANG_OPT_SPEC_SPARSE_VERIFY.get()
 
 
 def sample_draft_proposal_truncated(

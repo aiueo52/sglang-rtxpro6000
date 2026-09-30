@@ -29,7 +29,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.speculative.spec_utils import SPEC_MIN_P
+from sglang.srt.speculative.spec_utils import SPEC_MIN_P, SPEC_SPARSE_VERIFY
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -651,6 +651,18 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _sparse_verify_kp(batch: ScheduleBatch, sampling_info: SamplingBatchInfo) -> int:
+    """Support width of the sparse target-only verify for this batch, or 0 for
+    the dense verify. Reads top_k from the requests on the CPU (no sync)."""
+    if not SPEC_SPARSE_VERIFY or not sampling_info.need_top_k_sampling:
+        return 0
+    if get_spec().speculative_use_rejection_sampling:
+        return 0
+    from sglang.kernels.ops.speculative.sparse_verify import sparse_verify_width
+
+    return sparse_verify_width(max(r.sampling_params.top_k for r in batch.reqs))
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -757,6 +769,59 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif sparse_kp := _sparse_verify_kp(batch, sampling_info):
+        # Target-only verify on the top-KP logits (SGLANG_OPT_SPEC_SPARSE_VERIFY);
+        # same distribution as the dense branch below up to rounding.
+        from sglang.kernels.ops.speculative.sparse_verify import (
+            sparse_target_probs,
+            tree_speculative_sampling_target_only_sparse,
+        )
+
+        num_draft = verify_input.draft_token_num
+        target_probs, target_index = sparse_target_probs(
+            next_token_logits,
+            sampling_info.temperatures,
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            sampling_info.min_ps,
+            num_draft,
+            sparse_kp,
+            apply_top_p=sampling_info.need_top_p_sampling,
+            apply_min_p=SPEC_MIN_P and sampling_info.need_min_p_sampling,
+        )
+        maybe_detect_nan(target_probs, "sparse verify: target_probs")
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=num_draft,
+            candidates=candidates,
+            device=device,
+        )
+        tree_speculative_sampling_target_only_sparse(
+            predicts=predict,  # mutable
+            accept_index=accept_index,  # mutable
+            accept_token_num=num_correct_drafts,  # mutable
+            candidates=candidates,
+            retrive_index=verify_input.retrieve_index,
+            retrive_next_token=verify_input.retrieve_next_token,
+            retrive_next_sibling=verify_input.retrieve_next_sibling,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=coins_for_final_sampling,
+            target_probs=target_probs.view(bs, num_draft, sparse_kp),
+            target_index=target_index.view(bs, num_draft, sparse_kp),
+            vocab_size=next_token_logits.shape[-1],
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
+        )
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
