@@ -1053,6 +1053,9 @@ class Envs:
     # becomes the prologue of layer L+1's attention HC mix K0. Needs the
     # combine deferred across the model loop, so it is a separate flag.
     SGLANG_HC_LAYER_APPLY_FUSED = EnvBool(False)
+    # GDN verify front, stream placement only: the MOVED combine gate forks onto the
+    # GDN alt stream after HC mix K0, and qkvz takes the alt stream so b/a launches first.
+    SGLANG_OPT_GDN_FRONT_OVERLAP = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at

@@ -55,6 +55,7 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -156,6 +157,7 @@ _gdn_use_alt_stream = _is_cuda or (
 # SGLANG_GDN_ALT_STREAM=0 forces the in_proj_ba projection onto the main stream
 # (no multi-stream branch inside the CUDA graph).
 _gdn_use_alt_stream = _gdn_use_alt_stream and _os.environ.get("SGLANG_GDN_ALT_STREAM", "1") == "1"
+_GDN_FRONT_OVERLAP = envs.SGLANG_OPT_GDN_FRONT_OVERLAP.get()
 _qknorm_use_alt_stream = _is_cuda or (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
@@ -828,6 +830,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.in_proj_ba.weight.device,
         )
 
+    def _direct_use_alt(self, num_tokens: int) -> bool:
+        """Whether `_forward_input_proj_direct` splits qkvz and b/a over two streams."""
+        # Same dual-stream gate as `_forward_input_proj`, including the
+        # TC-piecewise prefill graph which forces the threshold to 0.
+        dual_stream_threshold = (
+            0 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE) else 1024
+        )
+        return (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and num_tokens < dual_stream_threshold
+            and _gdn_use_alt_stream
+        )
+
+    def front_gate_stream(self, num_tokens: int) -> Optional[torch.cuda.Stream]:
+        """Stream for this layer's attention combine gate, or None to keep it inline.
+
+        Only a direct projection that runs on two streams joins the alt stream
+        before the MLP seam reads the gate partials, so only that case says yes.
+        """
+        if not (
+            _GDN_FRONT_OVERLAP
+            and _GDN_PROJ_DIRECT_LAYOUT
+            and 0 < num_tokens <= 16
+            and self._direct_layout_ok()
+            and self._direct_use_alt(num_tokens)
+        ):
+            return None
+        return self.alt_stream
+
     def _forward_input_proj_direct(self, hidden_states: torch.Tensor, ab_out):
         """Project straight into (mixed_qkv, z, b, a); None if not applicable."""
         if not self._direct_layout_ok():
@@ -865,38 +897,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 split_n=self.num_v_heads,
             )
 
-        # Same dual-stream gate as `_forward_input_proj`, including the
-        # TC-piecewise prefill graph which forces the threshold to 0.
-        dual_stream_threshold = (
-            0 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE) else 1024
-        )
-        use_alt = (
-            self.alt_stream is not None
-            and get_is_capture_mode()
-            and num_tokens < dual_stream_threshold
-            and _gdn_use_alt_stream
-        )
-        if use_alt:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            written = self.in_proj_qkvz.quant_method.apply_into_split(
+        def _run_qkvz() -> bool:
+            return self.in_proj_qkvz.quant_method.apply_into_split(
                 self.in_proj_qkvz,
                 hidden_states,
                 mixed_qkv,
                 z.view(num_tokens, -1),
                 qkv_dim,
             )
+
+        if self._direct_use_alt(num_tokens) and _GDN_FRONT_OVERLAP:
+            # Measured: b/a's 3 CTAs on the alt stream start ~26 us late, behind the
+            # qkvz wave; on the main stream their PDL launch goes first.
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                written = _run_qkvz()
+            _run_ba()
+            # Also joins the combine gate forked by `front_gate_stream`.
+            current_stream.wait_stream(self.alt_stream)
+        elif self._direct_use_alt(num_tokens):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            written = _run_qkvz()
             with torch.cuda.stream(self.alt_stream):
                 _run_ba()
             current_stream.wait_stream(self.alt_stream)
         else:
-            written = self.in_proj_qkvz.quant_method.apply_into_split(
-                self.in_proj_qkvz,
-                hidden_states,
-                mixed_qkv,
-                z.view(num_tokens, -1),
-                qkv_dim,
-            )
+            written = _run_qkvz()
             _run_ba()
         if not written:
             # The qkvz projection could not take the GEMV path (an unexpected

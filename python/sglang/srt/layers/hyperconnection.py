@@ -155,7 +155,13 @@ class HyperConnectionBase(nn.Module):
         self.hidden_size = config.hidden_size
         self.params_dtype = config.params_dtype
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        *,
+        gate_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        # No combine gate here, so `gate_stream` is unused.
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         mixed_input = hyper_input.view(
             *hyper_input.shape[:-1], self.hc_count, self.hidden_size
@@ -485,7 +491,14 @@ class GatedResidual(HyperConnectionBase):
             for w in weights
         )
 
-    def mix(self, hyper_input: torch.Tensor):
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        *,
+        gate_stream: Optional[torch.cuda.Stream] = None,
+    ):
+        """`gate_stream` lets the MOVED combine gate run beside the rest of the mix;
+        the caller must join it into the current stream before the combine."""
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
@@ -521,6 +534,7 @@ class GatedResidual(HyperConnectionBase):
                         gate_partials,
                     )
                 return mixed_input, self._early_gate(hyper_input, hyper_input_normed)
+            side_gate, side_partials = self._side_gate(hyper_input, gate_stream)
             mixed_input, hyper_input_normed = hc_norm_mix2(
                 hyper_input,
                 self.hc_norm.weight,
@@ -532,7 +546,10 @@ class GatedResidual(HyperConnectionBase):
                 None,
                 s_down,
                 s_up,
+                after_normed=side_gate,
             )
+            if side_partials is not None:
+                return mixed_input, (hyper_input, hyper_input_normed, side_partials)
             if self._gate_early_ok(hyper_input):
                 return mixed_input, self._early_gate(hyper_input, hyper_input_normed)
             return mixed_input, (hyper_input, hyper_input_normed)
@@ -680,6 +697,38 @@ class GatedResidual(HyperConnectionBase):
         )
         return hyper_input, hyper_input_normed, partials
 
+    def _side_gate(
+        self, hyper_input: torch.Tensor, gate_stream: Optional[torch.cuda.Stream]
+    ):
+        """`_early_gate` as an `hc_norm_mix2` `after_normed` hook on `gate_stream`.
+
+        Returns ``(hook, partials)``, or ``(None, None)`` to keep the gate inline.
+        """
+        from sglang.srt.environ import HCGateEarly
+
+        if (
+            gate_stream is None
+            or not self._gate_early_ok(hyper_input)
+            or self._gate_early != HCGateEarly.MOVED
+        ):
+            return None, None
+        from sglang.kernels.ops.elementwise.hc_combine import hc_combine_gate
+
+        partials = self._early_partials_buf[: hyper_input.shape[0]]
+
+        def hook(hyper_input_normed: torch.Tensor) -> None:
+            gate_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(gate_stream):
+                hc_combine_gate(
+                    hyper_input_normed,
+                    self.block_inject_weight.weight.data,
+                    self.hc_count,
+                    self.hidden_size,
+                    partials=partials,
+                )
+
+        return hook, partials
+
     def combine(
         self,
         block_output: torch.Tensor,
@@ -806,6 +855,7 @@ class GatedResidual(HyperConnectionBase):
         shared_output: Optional[torch.Tensor] = None,
         shared_gate: Optional[torch.Tensor] = None,
         fused_attr: str = "_apply_mix_fused",
+        gate_stream: Optional[torch.cuda.Stream] = None,
     ):
         """Combine this boundary and norm/mix the next one in one launch.
 
@@ -813,7 +863,7 @@ class GatedResidual(HyperConnectionBase):
         which the fused prologue folds in the way `hc_combine_apply` would.
         `fused_attr` names the flag that authorises the fold: R7's
         `_apply_mix_fused` for the attention->MoE seam inside a layer, H2's
-        `_layer_apply_fused` for the layer->layer one.
+        `_layer_apply_fused` for the layer->layer one. `gate_stream` is as in `mix`.
         """
         hyper_input, hyper_input_normed = residuals[0], residuals[1]
         gate_partials = residuals[2] if len(residuals) > 2 else None
@@ -853,6 +903,7 @@ class GatedResidual(HyperConnectionBase):
                 # branch CTA that norms the row is the one that would have
                 # written it, so the apply launch and the residual round trip
                 # both go away.
+                side_gate, side_partials = next_hc._side_gate(hyper_input, gate_stream)
                 mixed, normed, next_partials, applied = hc_norm_mix2(
                     hyper_input,
                     next_hc.hc_norm.weight,
@@ -879,8 +930,11 @@ class GatedResidual(HyperConnectionBase):
                             shared_gate,
                         )
                     ),
+                    after_normed=side_gate,
                 )
                 assert applied is not None
+                if side_partials is not None:
+                    return mixed, (applied, normed, side_partials)
                 if next_partials is None:
                     return mixed, next_hc._early_gate(applied, normed)
                 return mixed, (applied, normed, next_partials)
@@ -918,7 +972,8 @@ class GatedResidual(HyperConnectionBase):
             )
             return mixed, (new_residual, normed)
         return next_hc.mix(
-            self.combine(block_output, residuals, shared_output, shared_gate)
+            self.combine(block_output, residuals, shared_output, shared_gate),
+            gate_stream=gate_stream,
         )
 
 

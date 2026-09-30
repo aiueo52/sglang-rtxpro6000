@@ -42,6 +42,7 @@ scale, both exact w.r.t. the split. ``SGLANG_HC_MIX2_FP8=1`` turns it on in
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 
 import msgspec
 import torch
@@ -574,6 +575,8 @@ def hc_norm_mix2(
     s_up: torch.Tensor | None = None,
     inject_weight: torch.Tensor | None = None,
     apply_inputs: tuple | None = None,
+    *,
+    after_normed: Callable[[torch.Tensor], None] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-branch Gemma RMSNorm followed by the gated low-rank mix.
 
@@ -593,6 +596,10 @@ def hc_norm_mix2(
     and the return grows to ``(mixed, normed, gate_partials, applied)`` where
     ``applied`` is the combined residual. Check
     `hc_apply_norm_mix2_supported` before passing it.
+
+    ``after_normed(normed)`` is called right after the launch that completes
+    ``normed`` (K0 in the "norm" stats mode, K1 otherwise), so a caller can
+    fork work that only reads it onto another stream.
     """
     w_fp8 = w_down.dtype == torch.float8_e4m3fn
     if config is None:
@@ -695,6 +702,8 @@ def hc_norm_mix2(
             launch_pdl=PDL,
             num_warps=config.stats_warps,
         )
+        if after_normed is not None and read_normed:
+            after_normed(normed)
 
     _hc_down_kernel[
         (k // (config.block_k * config.block_g), triton.cdiv(lowrank, config.block_n))
@@ -725,6 +734,8 @@ def hc_norm_mix2(
         launch_pdl=PDL,
         num_warps=config.down_warps,
     )
+    if after_normed is not None and not read_normed:
+        after_normed(normed)
 
     _hc_up_kernel[(triton.cdiv(hs, config.block_j),)](
         normed,

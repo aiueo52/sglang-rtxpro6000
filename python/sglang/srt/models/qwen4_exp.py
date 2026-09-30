@@ -1348,7 +1348,9 @@ class Qwen4ExpLayerExtensionMixin:
         forward_batch: ForwardBatch,
         *,
         ple_batch: Optional[_PLEBatch],
+        gate_stream: Optional[torch.cuda.Stream] = None,
     ):
+        """`gate_stream` goes to the attention HC mix; the block must join it."""
         if isinstance(hidden_states, _PendingHCCombine):
             pending = hidden_states
             if self.ple is None:
@@ -1362,6 +1364,7 @@ class Qwen4ExpLayerExtensionMixin:
                     shared_output=pending.shared_output,
                     shared_gate=pending.shared_gate,
                     fused_attr="_layer_apply_fused",
+                    gate_stream=gate_stream,
                 )
             # The PLE reads the combined residual as its query, so it has to
             # exist before the mix; `_hc_defer_to_next_layer` keeps the
@@ -1390,7 +1393,9 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, gate_stream=gate_stream
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1524,6 +1529,18 @@ class Qwen4ExpLinearDecoderLayer(
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
 
+    def _attn_gate_stream(
+        self, hidden_states, forward_batch: ForwardBatch
+    ) -> Optional[torch.cuda.Stream]:
+        """Side stream for the attention combine gate, joined by `linear_attn`."""
+        if forward_batch.forward_mode.is_idle():
+            return None
+        if isinstance(hidden_states, _PendingHCCombine):
+            num_tokens = hidden_states.block_output.shape[0]
+        else:
+            num_tokens = hidden_states.shape[0]
+        return self.linear_attn.front_gate_stream(num_tokens)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1537,6 +1554,7 @@ class Qwen4ExpLinearDecoderLayer(
             residual,
             forward_batch,
             ple_batch=kwargs.get("ple_batch"),
+            gate_stream=self._attn_gate_stream(hidden_states, forward_batch),
         )
 
         if not forward_batch.forward_mode.is_idle():
