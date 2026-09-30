@@ -100,8 +100,10 @@ from sglang.srt.speculative.spec_utils import (
     fast_sample,
     get_plan_stream,
     load_token_map,
+    RS_DRAFT_TOPK,
     renorm_draft_probs,
     sample_draft_proposal,
+    sample_draft_proposal_truncated,
     select_top_k_tokens,
     spec_stage_span,
 )
@@ -245,19 +247,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
-            target_vocab_size = self.target_worker.model_config.vocab_size
-            draft_vocab_size = (
-                self.hot_token_id.shape[0]
-                if self.hot_token_id is not None
-                else target_vocab_size
-            )
-            # FIXME: support reduced (hot) draft vocab by scattering draft probs
-            # into the target vocab via the d2t map before the sampling kernel.
-            if draft_vocab_size != target_vocab_size:
+            # A reduced (hot) draft vocab is fine: every draft q is scattered
+            # into the target vocab (zero off the hot set) before it reaches
+            # the verify, see _rs_draft_proposal. The draft graph's draft_probs
+            # buffer is sized by the draft config, so the two must agree.
+            self._rs_vocab_size = self.target_worker.model_config.vocab_size
+            draft_config_vocab = self.draft_runner.model_config.vocab_size
+            if draft_config_vocab != self._rs_vocab_size:
                 raise ValueError(
-                    "--speculative-use-rejection-sampling requires the draft and "
-                    f"target to share one vocab, but the draft vocab "
-                    f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
+                    "--speculative-use-rejection-sampling needs the draft config "
+                    f"vocab ({draft_config_vocab}) to equal the target vocab "
+                    f"({self._rs_vocab_size})."
                 )
 
     def init_attention_backends(self):
@@ -837,6 +837,64 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             device=self.device,
         )
 
+    def _record_position0_confidence(self, next_token_logits: torch.Tensor):
+        # C1: the confidence the adaptive controller decides on. This is the
+        # only chain position whose probability exists before the next step's
+        # state swap, because the draft loop itself is one captured CUDA graph.
+        if self._conf_channel is None:
+            return
+        p0 = top1_prob(next_token_logits)
+        self._conf_channel.record_position0(p0)
+        if self._chain_conf_buf is not None:
+            n = min(p0.shape[0], self._chain_conf_buf.shape[0])
+            self._chain_conf_buf[:n, 0].copy_(p0[:n])
+
+    def _rs_draft_proposal(
+        self,
+        next_token_logits: torch.Tensor,
+        sampling_info,
+        out: Optional[torch.Tensor] = None,
+    ):
+        """Rejection-sampling draft proposal on the target vocab.
+
+        Returns (q, q(X), X): q is (bs, target vocab) and zero off the draft's
+        support, X is a draft-vocab id (the callers map it through
+        hot_token_id). `out`, when given, must be zero-filled (bs, vocab) and
+        receives q in place.
+        """
+        bs = next_token_logits.shape[0]
+        if RS_DRAFT_TOPK > 0:
+            probs, ids, topk_p, topk_index = sample_draft_proposal_truncated(
+                next_token_logits,
+                sampling_info.temperatures,
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                RS_DRAFT_TOPK,
+            )
+            if self.hot_token_id is not None:
+                ids = self.hot_token_id[ids]
+        else:
+            probs, topk_p, topk_index = sample_draft_proposal(
+                next_token_logits, sampling_info.temperatures
+            )
+            ids = self.hot_token_id
+            if ids is None:
+                if out is None:
+                    return probs, topk_p, topk_index
+                out.copy_(probs)
+                return out, topk_p, topk_index
+        if out is None:
+            out = torch.zeros(
+                (bs, self._rs_vocab_size),
+                dtype=torch.float32,
+                device=next_token_logits.device,
+            )
+        if ids.dim() == 1:
+            out.index_copy_(1, ids, probs.float())
+        else:
+            out.scatter_(1, ids, probs)
+        return out, topk_p, topk_index
+
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -866,8 +924,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+        # Rejection sampling: q per chain position on the target vocab. Row 0
+        # came from the previous draft-extend; each draft step fills the next
+        # row in place, so no per-step stack of vocab-wide rows is needed.
+        draft_probs = None
         if get_spec().speculative_use_rejection_sampling:
-            draft_probs_list: List[torch.Tensor] = [spec_info.draft_probs]
+            draft_probs = torch.zeros(
+                (
+                    topk_index.shape[0],
+                    self.speculative_num_steps,
+                    spec_info.draft_probs.shape[-1],
+                ),
+                dtype=torch.float32,
+                device=spec_info.draft_probs.device,
+            )
+            draft_probs[:, 0].copy_(spec_info.draft_probs)
 
         topk1_chain_fits = (
             self.topk == 1
@@ -958,11 +1029,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
                 if get_spec().speculative_use_rejection_sampling:
-                    probs, topk_p, topk_index = sample_draft_proposal(
+                    _, topk_p, topk_index = self._rs_draft_proposal(
                         logits_output.next_token_logits,
-                        forward_batch.sampling_info.temperatures,
+                        forward_batch.sampling_info,
+                        out=draft_probs[:, i + 1],
                     )
-                    draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1 and not _is_hip:
                     if _is_cuda:
@@ -1011,12 +1082,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None and draft_tokens_topk1 is None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
-
-        draft_probs = (
-            torch.stack(draft_probs_list, dim=1)
-            if get_spec().speculative_use_rejection_sampling
-            else None
-        )
 
         # Organize the results
         if draft_tokens_topk1 is not None:
@@ -1166,20 +1231,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             prefill_dsa_topk = self.dsa_extend_topk_buf[:bs].clone()
 
         # Assemble the next-iter draft spec_info from the extend output.
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        draft_probs = None
+        if get_spec().speculative_use_rejection_sampling:
+            draft_probs, topk_p, topk_index = self._rs_draft_proposal(
+                logits_output.next_token_logits, batch.sampling_info
+            )
         else:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits, batch.sampling_info, False
+            )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
-            draft_probs=probs if use_rejection_sampling else None,
+            draft_probs=draft_probs,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -1313,10 +1378,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
         if get_spec().speculative_use_rejection_sampling:
-            ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
-                draft_logits_output.next_token_logits,
-                batch.sampling_info.temperatures,
+            ret_draft_probs, ret_topk_p, ret_topk_index = self._rs_draft_proposal(
+                draft_logits_output.next_token_logits, batch.sampling_info
             )
+            self._record_position0_confidence(draft_logits_output.next_token_logits)
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
@@ -1325,17 +1390,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
-            if self._conf_channel is not None:
-                # C1: the confidence the adaptive controller decides on.  This
-                # is the only chain position whose probability exists before
-                # the next step's state swap, because the draft loop itself is
-                # one captured CUDA graph.  ret_topk_p stays 1.0 so every
-                # existing consumer is unchanged.
-                p0 = top1_prob(draft_logits_output.next_token_logits)
-                self._conf_channel.record_position0(p0)
-                if self._chain_conf_buf is not None:
-                    n = min(p0.shape[0], self._chain_conf_buf.shape[0])
-                    self._chain_conf_buf[:n, 0].copy_(p0[:n])
+            # ret_topk_p stays 1.0 so every existing consumer is unchanged.
+            self._record_position0_confidence(draft_logits_output.next_token_logits)
         else:
             probs = renorm_draft_probs(
                 draft_logits_output.next_token_logits,

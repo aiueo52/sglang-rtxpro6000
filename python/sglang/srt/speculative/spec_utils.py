@@ -180,6 +180,51 @@ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.T
     return probs, topk_p, topk_index
 
 
+# Support cap of the truncated rejection-sampling proposal; 0 = the untruncated
+# sample_draft_proposal above (A/B only: it also samples greedy requests' drafts).
+RS_DRAFT_TOPK = int(os.environ.get("SGLANG_RS_DRAFT_TOPK", "64"))
+
+
+def sample_draft_proposal_truncated(
+    next_token_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    k_cap: int,
+):
+    """Leviathan draft proposal on a truncated support.
+
+    q is softmax(logits / T) restricted to the k_cap largest draft logits, then
+    to the request's own top-k and top-p (the filters the verify applies to p),
+    renormalised. Any q keeps the verify lossless as long as X ~ q and that same
+    q reaches the verify; truncating like p only moves q's mass off tokens p can
+    never emit, which raises sum(min(p, q)). A greedy request (top_k == 1) gets
+    q one-hot on the draft argmax, i.e. the ordinary greedy chain.
+
+    Returns (q on the support (bs, K), support ids (bs, K) in the draft vocab,
+    q(X) (bs, 1), X (bs, 1) in the draft vocab); K = min(k_cap, draft vocab).
+    """
+    k = min(k_cap, next_token_logits.shape[-1])
+    top_logits, top_ids = torch.topk(next_token_logits.float(), k, dim=-1)
+    weights = torch.exp((top_logits - top_logits[:, :1]) / temperatures)
+    ranks = torch.arange(k, device=weights.device)
+    top_ks = top_ks.unsqueeze(1)
+    # top_k <= 0 (the draft graph's capture-time filler) means no top-k.
+    weights = weights * ((ranks < top_ks) | (top_ks <= 0))
+    probs = weights / weights.sum(dim=-1, keepdim=True)
+    # Keep the shortest prefix reaching top_p (exclusive cumsum < top_p), the
+    # same rule top_p_renorm_prob applies to p; rank 0 always survives.
+    exclusive = torch.cumsum(probs, dim=-1) - probs
+    probs = probs * (exclusive < top_ps.unsqueeze(1))
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+    # X ~ probs by the exponential race (Gumbel-max); zero-mass slots score 0
+    # and rank 0 always has mass, so they are never drawn.
+    race = torch.empty_like(probs).exponential_(1.0)
+    race.clamp_min_(torch.finfo(torch.float32).tiny)
+    pick = (probs / race).argmax(dim=-1, keepdim=True)
+    return probs, top_ids, probs.gather(1, pick), top_ids.gather(1, pick)
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
