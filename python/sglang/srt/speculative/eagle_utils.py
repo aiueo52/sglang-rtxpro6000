@@ -29,6 +29,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.speculative.spec_utils import SPEC_MIN_P
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -807,6 +808,14 @@ def eagle_sample(
                 maybe_detect_nan(
                     target_probs, "v2 verify: target_probs after top_p_renorm"
                 )
+            if SPEC_MIN_P and sampling_info.need_min_p_sampling:
+                # Same rule as the non-speculative sampler: drop p < min_p * max(p).
+                min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, verify_input.draft_token_num, dim=0
+                ).unsqueeze(1)
+                keep = target_probs >= target_probs.amax(dim=-1, keepdim=True) * min_ps
+                target_probs = target_probs * keep
+                target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True)
             target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
             draft_probs = (
                 verify_input.draft_probs

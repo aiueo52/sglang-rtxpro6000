@@ -101,6 +101,7 @@ from sglang.srt.speculative.spec_utils import (
     get_plan_stream,
     load_token_map,
     RS_DRAFT_TOPK,
+    SPEC_MIN_P,
     renorm_draft_probs,
     sample_draft_proposal,
     sample_draft_proposal_truncated,
@@ -870,6 +871,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 sampling_info.top_ks,
                 sampling_info.top_ps,
                 RS_DRAFT_TOPK,
+                min_ps=sampling_info.min_ps if SPEC_MIN_P else None,
             )
             if self.hot_token_id is not None:
                 ids = self.hot_token_id[ids]

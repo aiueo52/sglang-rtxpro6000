@@ -180,9 +180,8 @@ def sample_draft_proposal(next_token_logits: torch.Tensor, temperatures: torch.T
     return probs, topk_p, topk_index
 
 
-# Support cap of the truncated rejection-sampling proposal; 0 = the untruncated
-# sample_draft_proposal above (A/B only: it also samples greedy requests' drafts).
-RS_DRAFT_TOPK = int(os.environ.get("SGLANG_RS_DRAFT_TOPK", "64"))
+RS_DRAFT_TOPK = envs.SGLANG_RS_DRAFT_TOPK.get()
+SPEC_MIN_P = envs.SGLANG_SPEC_MIN_P.get()
 
 
 def sample_draft_proposal_truncated(
@@ -191,6 +190,7 @@ def sample_draft_proposal_truncated(
     top_ks: torch.Tensor,
     top_ps: torch.Tensor,
     k_cap: int,
+    min_ps: Optional[torch.Tensor] = None,
 ):
     """Leviathan draft proposal on a truncated support.
 
@@ -216,6 +216,9 @@ def sample_draft_proposal_truncated(
     # same rule top_p_renorm_prob applies to p; rank 0 always survives.
     exclusive = torch.cumsum(probs, dim=-1) - probs
     probs = probs * (exclusive < top_ps.unsqueeze(1))
+    if min_ps is not None:
+        # Column 0 is the row max (sorted, and never masked above).
+        probs = probs * (probs >= probs[:, :1] * min_ps.unsqueeze(1))
     probs = probs / probs.sum(dim=-1, keepdim=True)
     # X ~ probs by the exponential race (Gumbel-max); zero-mass slots score 0
     # and rank 0 always has mass, so they are never drawn.
