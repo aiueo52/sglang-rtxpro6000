@@ -5,11 +5,13 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
+SPEC_SPARSE_RS = envs.SGLANG_OPT_SPEC_SPARSE_RS.get()
 
 
 @dataclass
@@ -30,6 +32,8 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+    draft_support_probs: torch.Tensor = None
+    draft_support_tokens: torch.Tensor = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -150,6 +154,8 @@ class EagleDraftInput(SpecInput):
     # Draft proposal q from draft-extend, only set under rejection sampling:
     # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
     draft_probs: torch.Tensor = None
+    draft_support_probs: torch.Tensor = None
+    draft_support_tokens: torch.Tensor = None
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).
@@ -200,7 +206,16 @@ class EagleDraftInput(SpecInput):
             draft_probs=(
                 torch.empty((0, vocab_size), device=device, dtype=torch.float32)
                 if get_spec().speculative_use_rejection_sampling
+                and not SPEC_SPARSE_RS
                 else None
+            ),
+            draft_support_probs=(
+                torch.empty((0, envs.SGLANG_RS_DRAFT_TOPK.get()), device=device, dtype=torch.float32)
+                if SPEC_SPARSE_RS else None
+            ),
+            draft_support_tokens=(
+                torch.empty((0, envs.SGLANG_RS_DRAFT_TOPK.get()), device=device, dtype=torch.int64)
+                if SPEC_SPARSE_RS else None
             ),
             capture_hidden_mode=capture_hidden_mode,
         )
@@ -218,6 +233,9 @@ class EagleDraftInput(SpecInput):
         self.topk_index = self.topk_index[new_indices]
         if self.draft_probs is not None:
             self.draft_probs = self.draft_probs[new_indices]
+        if self.draft_support_probs is not None:
+            self.draft_support_probs = self.draft_support_probs[new_indices]
+            self.draft_support_tokens = self.draft_support_tokens[new_indices]
         if self.hidden_states is not None:
             self.hidden_states = self.hidden_states[new_indices]
         self.bonus_tokens = self.bonus_tokens[new_indices]
@@ -245,6 +263,8 @@ class EagleDraftInput(SpecInput):
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             self.draft_probs = spec_info.draft_probs
+            self.draft_support_probs = spec_info.draft_support_probs
+            self.draft_support_tokens = spec_info.draft_support_tokens
             self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
@@ -266,6 +286,9 @@ class EagleDraftInput(SpecInput):
             self.dsa_topk_indices = None
         if self.draft_probs is not None and spec_info.draft_probs is not None:
             self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
+        if self.draft_support_probs is not None and spec_info.draft_support_probs is not None:
+            self.draft_support_probs = torch.cat([self.draft_support_probs, spec_info.draft_support_probs])
+            self.draft_support_tokens = torch.cat([self.draft_support_tokens, spec_info.draft_support_tokens])
 
 
 @dataclass

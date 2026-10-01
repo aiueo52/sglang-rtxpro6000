@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.kernels.ops.speculative.sparse_rs import rs_draft_proposal_sparse
 from sglang.kernels.ops.speculative.topk1 import (
     draft_extend_select_topk1,
     draft_topk1_postprocess,
@@ -106,6 +107,7 @@ from sglang.srt.speculative.spec_utils import (
     load_token_map,
     RS_DRAFT_TOPK,
     SPEC_MIN_P,
+    SPEC_SPARSE_RS,
     renorm_draft_probs,
     sample_draft_proposal,
     sample_draft_proposal_truncated,
@@ -187,6 +189,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Args for easy access
         self.device = get_device().device
+        self.sparse_rs = SPEC_SPARSE_RS
+        if self.sparse_rs:
+            if not get_spec().speculative_use_rejection_sampling or RS_DRAFT_TOPK <= 0:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires rejection sampling and SGLANG_RS_DRAFT_TOPK > 0")
+            if server_args.enable_multi_layer_eagle:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS does not support multi-layer EAGLE")
+            logger.info(f"SGLANG_OPT_SPEC_SPARSE_RS on: sparse chain RS, draft support K={RS_DRAFT_TOPK}")
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
@@ -273,13 +282,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
-            # A reduced (hot) draft vocab is fine: every draft q is scattered
-            # into the target vocab (zero off the hot set) before it reaches
-            # the verify, see _rs_draft_proposal. The draft graph's draft_probs
-            # buffer is sized by the draft config, so the two must agree.
+            # Only dense RS graph buffers require matching configured vocab sizes.
             self._rs_vocab_size = self.target_worker.model_config.vocab_size
             draft_config_vocab = self.draft_runner.model_config.vocab_size
-            if draft_config_vocab != self._rs_vocab_size:
+            if not self.sparse_rs and draft_config_vocab != self._rs_vocab_size:
                 raise ValueError(
                     "--speculative-use-rejection-sampling needs the draft config "
                     f"vocab ({draft_config_vocab}) to equal the target vocab "
@@ -820,9 +826,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
-                )
+                draft_result = self.cuda_graph_runner.execute(forward_batch)
             else:
                 if (
                     not forward_batch.forward_mode.is_idle()
@@ -832,9 +836,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # `draft_forward` only does sample in this case.
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
-                parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
-                )
+                draft_result = self.draft_forward(forward_batch)
+
+        draft_support_probs = draft_support_tokens = None
+        if self.sparse_rs:
+            parent_list, top_scores_index, draft_tokens, draft_probs, draft_support_probs, draft_support_tokens = draft_result
+        else:
+            parent_list, top_scores_index, draft_tokens, draft_probs = draft_result
 
         if (
             self._conf_channel is not None
@@ -849,12 +857,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
         return build_eagle_verify_input(
-            batch,
-            draft_input,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            draft_probs,
+            batch=batch,
+            draft_input=draft_input,
+            parent_list=parent_list,
+            top_scores_index=top_scores_index,
+            draft_tokens=draft_tokens,
+            draft_probs=draft_probs,
+            draft_support_probs=draft_support_probs,
+            draft_support_tokens=draft_support_tokens,
             target_worker=self.target_worker,
             topk=self.topk,
             num_steps=self.speculative_num_steps,
@@ -923,6 +933,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             out.scatter_(1, ids, probs)
         return out, topk_p, topk_index
 
+    def _rs_sparse_proposal(self, *, next_token_logits, sampling_info):
+        return rs_draft_proposal_sparse(
+            next_token_logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            min_ps=sampling_info.min_ps if SPEC_MIN_P else None,
+            uniforms=torch.rand((next_token_logits.shape[0],), device=next_token_logits.device),
+            hot_token_id=self.hot_token_id,
+            k=RS_DRAFT_TOPK,
+        )
+
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -956,7 +978,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # came from the previous draft-extend; each draft step fills the next
         # row in place, so no per-step stack of vocab-wide rows is needed.
         draft_probs = None
-        if get_spec().speculative_use_rejection_sampling:
+        draft_support_probs = draft_support_tokens = uniforms = None
+        if self.sparse_rs:
+            bs, support_size = spec_info.draft_support_probs.shape
+            draft_support_probs = torch.empty(
+                (bs, self.speculative_num_steps, support_size), dtype=torch.float32, device=topk_index.device,
+            )
+            draft_support_tokens = torch.empty(
+                (bs, self.speculative_num_steps, support_size), dtype=torch.int64, device=topk_index.device,
+            )
+            draft_support_probs[:, 0].copy_(spec_info.draft_support_probs)
+            draft_support_tokens[:, 0].copy_(spec_info.draft_support_tokens)
+            uniforms = torch.rand((bs, self.speculative_num_steps - 1), device=topk_index.device)
+        elif get_spec().speculative_use_rejection_sampling:
             draft_probs = torch.zeros(
                 (
                     topk_index.shape[0],
@@ -979,7 +1013,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if (
             topk1_chain_fits
             and _is_cuda
-            and not get_spec().speculative_use_rejection_sampling
+            and (self.sparse_rs or not get_spec().speculative_use_rejection_sampling)
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -987,6 +1021,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 device=topk_index.device,
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
+
+        if self.sparse_rs and draft_tokens_topk1 is None:
+            draft_tokens_topk1 = torch.empty(
+                (topk_index.shape[0], self.speculative_num_steps), dtype=topk_index.dtype, device=topk_index.device,
+            )
+            draft_tokens_topk1[:, :1].copy_(topk_index)
+            if not topk1_chain_fits:
+                raise ValueError("RS2 batch exceeds the topk1 chain preallocations")
 
         # C1: per-position draft confidence (trace only; None in production).
         # Column 0 was written by the previous iteration's draft-extend, which
@@ -1056,7 +1098,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if self.sparse_rs:
+                    _, _, topk_p, topk_index = rs_draft_proposal_sparse(
+                        next_token_logits=logits_output.next_token_logits,
+                        temperatures=forward_batch.sampling_info.temperatures,
+                        top_ks=forward_batch.sampling_info.top_ks,
+                        top_ps=forward_batch.sampling_info.top_ps,
+                        min_ps=forward_batch.sampling_info.min_ps if SPEC_MIN_P else None,
+                        uniforms=uniforms[:, i], k=RS_DRAFT_TOPK,
+                        hot_token_id=self.hot_token_id, positions=forward_batch.positions,
+                        draft_tokens=draft_tokens_topk1, draft_token_column=i + 1,
+                        draft_support_probs=draft_support_probs[:, i + 1],
+                        draft_support_tokens=draft_support_tokens[:, i + 1],
+                    )
+                elif get_spec().speculative_use_rejection_sampling:
                     _, topk_p, topk_index = self._rs_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info,
@@ -1116,6 +1171,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             bs = draft_tokens_topk1.shape[0]
             top_scores_index = self._topk1_score_indices_prealloc[:bs]
             parent_list = self._topk1_parents_prealloc[:bs]
+            if self.sparse_rs:
+                return parent_list, top_scores_index, draft_tokens_topk1, None, draft_support_probs, draft_support_tokens
             return parent_list, top_scores_index, draft_tokens_topk1, draft_probs
 
         if topk1_chain_fits:
@@ -1161,7 +1218,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ):
                 self.draft_runner.forward(forward_batch)
 
-        return None, None, None, None
+        return (None,) * (6 if self.sparse_rs else 4)
 
     def draft_extend(self):
         pass
@@ -1260,7 +1317,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         draft_probs = None
-        if get_spec().speculative_use_rejection_sampling:
+        draft_support_probs = draft_support_tokens = None
+        if self.sparse_rs:
+            draft_support_probs, draft_support_tokens, topk_p, topk_index = self._rs_sparse_proposal(
+                next_token_logits=logits_output.next_token_logits, sampling_info=batch.sampling_info,
+            )
+        elif get_spec().speculative_use_rejection_sampling:
             draft_probs, topk_p, topk_index = self._rs_draft_proposal(
                 logits_output.next_token_logits, batch.sampling_info
             )
@@ -1273,6 +1335,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            draft_support_probs=draft_support_probs,
+            draft_support_tokens=draft_support_tokens,
             hidden_states=logits_output.hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
@@ -1444,7 +1508,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if get_spec().speculative_use_rejection_sampling:
+        if self.sparse_rs:
+            ret_support_probs, ret_support_tokens, ret_topk_p, ret_topk_index = self._rs_sparse_proposal(
+                next_token_logits=draft_logits_output.next_token_logits, sampling_info=batch.sampling_info,
+            )
+            ret_draft_probs = None
+            self._record_position0_confidence(draft_logits_output.next_token_logits)
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = self._rs_draft_proposal(
                 draft_logits_output.next_token_logits, batch.sampling_info
             )
@@ -1480,7 +1550,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_index,
             ret_hidden_states,
         )
-        if get_spec().speculative_use_rejection_sampling:
+        if self.sparse_rs:
+            next_draft_input.draft_support_probs = ret_support_probs
+            next_draft_input.draft_support_tokens = ret_support_tokens
+            next_draft_input.draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             next_draft_input.draft_probs = ret_draft_probs
         if self.seed_dsa_topk_from_draft_extend:
             next_draft_input.dsa_topk_indices = dsa_seed_topk_indices

@@ -263,6 +263,17 @@ class SpeculativeAlgorithm(Enum):
         from sglang.srt.arg_groups.overrides import resolving_view
 
         cfg = resolving_view(server_args)
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_OPT_SPEC_SPARSE_RS.get():
+            if not cfg.speculative_use_rejection_sampling:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires rejection sampling")
+            if envs.SGLANG_RS_DRAFT_TOPK.get() <= 0:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires SGLANG_RS_DRAFT_TOPK > 0")
+            if cfg.speculative_eagle_topk != 1:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires speculative_eagle_topk == 1")
+            if self not in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3) or cfg.enable_multi_layer_eagle:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS supports only single-layer EAGLE/MTP")
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -347,6 +358,10 @@ class SpecInput(ABC):
     # ragged_verify_layout) so scheduler/relay/attention code reads them
     # uniformly on any SpecInput; only the EAGLE-family inputs override them.
     dsa_topk_indices: Optional[torch.Tensor] = None
+    # Sparse RS support crosses the relay; class defaults avoid overwriting
+    # dataclass constructor fields when __post_init__ calls super().__init__.
+    draft_support_probs: Optional[torch.Tensor] = None
+    draft_support_tokens: Optional[torch.Tensor] = None
     future_dsa_topk_indices_available: bool = False
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
 

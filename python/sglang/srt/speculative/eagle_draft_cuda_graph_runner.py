@@ -43,7 +43,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_utils import RS_DRAFT_TOPK, SPEC_SPARSE_RS, resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -75,6 +75,8 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    draft_support_probs: Optional[torch.Tensor] = None
+    draft_support_tokens: Optional[torch.Tensor] = None
     dsa_seed_topk: Optional[torch.Tensor] = None
 
 
@@ -198,7 +200,22 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     dtype=torch.float32,
                 )
                 if self.model_runner.server_args.speculative_use_rejection_sampling
+                and not SPEC_SPARSE_RS
                 else None
+            )
+            support_size = min(
+                RS_DRAFT_TOPK,
+                self.eagle_worker.hot_token_id.numel()
+                if self.eagle_worker.hot_token_id is not None
+                else self.model_runner.model_config.vocab_size,
+            ) if SPEC_SPARSE_RS else 0
+            draft_support_probs = (
+                torch.zeros((self.max_bs, support_size), dtype=torch.float32)
+                if SPEC_SPARSE_RS else None
+            )
+            draft_support_tokens = (
+                torch.zeros((self.max_bs, support_size), dtype=torch.int64)
+                if SPEC_SPARSE_RS else None
             )
             _hidden_size, _hidden_dtype = get_draft_recurrent_hidden_state_spec(
                 model_runner
@@ -265,6 +282,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            draft_support_probs=draft_support_probs,
+            draft_support_tokens=draft_support_tokens,
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
@@ -421,6 +440,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_p=topk_p,
             topk_index=topk_index,
             draft_probs=draft_probs,
+            draft_support_probs=(buffers.draft_support_probs[:num_seqs] if SPEC_SPARSE_RS else None),
+            draft_support_tokens=(buffers.draft_support_tokens[:num_seqs] if SPEC_SPARSE_RS else None),
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
         )
@@ -523,10 +544,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
-        parent_list, top_scores_index, draft_tokens, draft_probs = (
-            t[:raw_bs] if t is not None else None for t in out
-        )
-        return parent_list, top_scores_index, draft_tokens, draft_probs
+        return tuple(t[:raw_bs] if t is not None else None for t in out)
 
     # -----------------------------------------------------------------
     # Replay
@@ -564,6 +582,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.topk_index.zero_()
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
+            if SPEC_SPARSE_RS:
+                buffers.draft_support_probs.zero_()
+                buffers.draft_support_tokens.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
             if buffers.dsa_seed_topk is not None:
@@ -613,6 +634,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         ):
             copy_dsts.append(buffers.bootstrap_room_ids_int[:raw_bs])
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
+        if SPEC_SPARSE_RS:
+            copy_dsts.extend([buffers.draft_support_probs[:raw_bs], buffers.draft_support_tokens[:raw_bs]])
+            copy_srcs.extend([forward_batch.spec_info.draft_support_probs, forward_batch.spec_info.draft_support_tokens])
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync

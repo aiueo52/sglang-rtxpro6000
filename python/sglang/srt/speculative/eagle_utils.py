@@ -32,6 +32,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.speculative.spec_utils import (
     SPEC_MIN_P,
+    SPEC_SPARSE_RS,
     SPEC_SPARSE_TOPK,
     SPEC_SPARSE_VERIFY,
 )
@@ -703,6 +704,14 @@ def _sparse_verify_kp(batch: ScheduleBatch, sampling_info: SamplingBatchInfo) ->
     return sparse_verify_width(max(r.sampling_params.top_k for r in batch.reqs))
 
 
+def _sparse_rs_verify_kp(*, batch: ScheduleBatch, sampling_info: SamplingBatchInfo) -> int:
+    if not sampling_info.need_top_k_sampling:
+        return 0
+    from sglang.kernels.ops.speculative.sparse_verify import sparse_verify_width
+
+    return sparse_verify_width(max(r.sampling_params.top_k for r in batch.reqs))
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -809,9 +818,11 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif sparse_kp := _sparse_verify_kp(batch, sampling_info):
-        # Target-only verify on the top-KP logits (SGLANG_OPT_SPEC_SPARSE_VERIFY);
-        # same distribution as the dense branch below up to rounding.
+    elif sparse_kp := (
+        _sparse_rs_verify_kp(batch=batch, sampling_info=sampling_info)
+        if SPEC_SPARSE_RS else _sparse_verify_kp(batch, sampling_info)
+    ):
+        # Both sparse verifies use the dense target distribution up to rounding.
         from sglang.kernels.ops.speculative.sparse_verify import (
             sparse_target_probs,
             tree_speculative_sampling_target_only_sparse,
@@ -838,22 +849,36 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        tree_speculative_sampling_target_only_sparse(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs.view(bs, num_draft, sparse_kp),
-            target_index=target_index.view(bs, num_draft, sparse_kp),
-            vocab_size=next_token_logits.shape[-1],
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-        )
+        if SPEC_SPARSE_RS:
+            from sglang.kernels.ops.speculative.sparse_rs import chain_speculative_sampling_sparse
+
+            chain_speculative_sampling_sparse(
+                predicts=predict, accept_index=accept_index, accept_token_num=num_correct_drafts,
+                candidates=candidates, retrive_index=verify_input.retrieve_index,
+                uniform_samples=coins, uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs.view(bs, num_draft, sparse_kp),
+                target_index=target_index.view(bs, num_draft, sparse_kp),
+                draft_support_probs=verify_input.draft_support_probs,
+                draft_support_tokens=verify_input.draft_support_tokens,
+                vocab_size=next_token_logits.shape[-1],
+            )
+        else:
+            tree_speculative_sampling_target_only_sparse(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs.view(bs, num_draft, sparse_kp),
+                target_index=target_index.view(bs, num_draft, sparse_kp),
+                vocab_size=next_token_logits.shape[-1],
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+            )
         tp_group = (
             get_parallel().attn_tp_group
             if is_dp_attention_enabled()
@@ -928,6 +953,13 @@ def eagle_sample(
                 if use_rejection_sampling
                 else torch.zeros_like(target_probs)
             )
+            if SPEC_SPARSE_RS:
+                draft_probs = torch.zeros(
+                    (*verify_input.draft_support_probs.shape[:2], target_probs.shape[-1]),
+                    dtype=torch.float32, device=device,
+                )
+                draft_probs.scatter_(dim=2, index=verify_input.draft_support_tokens,
+                                     src=verify_input.draft_support_probs)
             # Defense-in-depth behind the spec_hook startup allowlist: validate
             # the actual kernel inputs before the Triton kernel.
             if use_rejection_sampling and (

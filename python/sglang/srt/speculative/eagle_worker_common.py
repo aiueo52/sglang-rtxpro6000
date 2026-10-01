@@ -328,6 +328,8 @@ def build_eagle_verify_input(
     tree_mask_mode: TreeMaskMode,
     device: str,
     chain_topk1: bool = False,
+    draft_support_probs: Optional[torch.Tensor] = None,
+    draft_support_tokens: Optional[torch.Tensor] = None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -402,6 +404,8 @@ def build_eagle_verify_input(
         seq_lens_sum=None,
         seq_lens_cpu=None,
         draft_probs=draft_probs,
+        draft_support_probs=draft_support_probs,
+        draft_support_tokens=draft_support_tokens,
     )
 
 
