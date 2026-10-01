@@ -321,6 +321,9 @@ class Envs:
     # Select the FP8 (deep_gemm) tokenwise QSA indexer; only the BF16 reference
     # path is ported, so setting this fails loudly instead of degrading.
     SGLANG_QWEN_DSA_USE_FP8_INDEXER = EnvBool(False)
+    # QSA sparse decode/verify attention as one split-KV Triton kernel over the
+    # fp8 KV pool (layers/attention/qsa/decode_attn.py) instead of compaction + XQA.
+    SGLANG_OPT_TRITON_DECODE_ATTN = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
@@ -1271,6 +1274,9 @@ class Envs:
     # Draft-extend position-0 confidence from the fused argmax pass instead of
     # torch top1_prob. Needs SGLANG_OPT_DRAFT_TAIL; not bit-exact (fp32 order).
     SGLANG_OPT_DRAFT_TAIL_FUSED_CONF = EnvBool(False)
+    # Index-shared MTP draft rows put the drafted tail right after the valid frozen
+    # entries; the packed sparse attention path attends only a valid prefix.
+    SGLANG_ENABLE_QSA_SHARED_TAIL_PREFIX = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
