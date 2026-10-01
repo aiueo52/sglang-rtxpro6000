@@ -18,8 +18,8 @@ def _logit_keys(vals, indices):
 
 @triton.jit
 def _draft_partial_topk_kernel(
-    Logits, Keys, stride_l, VOCAB: tl.constexpr, SPLITS: tl.constexpr,
-    KB: tl.constexpr, BLOCK: tl.constexpr,
+    Logits, Keys, TopKs, stride_l, VOCAB: tl.constexpr, SPLITS: tl.constexpr,
+    KB: tl.constexpr, GREEDY_FAST: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
@@ -28,7 +28,13 @@ def _draft_partial_topk_kernel(
                    other=-float("inf")).to(tl.float32)
     keys = _logit_keys(vals=vals, indices=indices.to(tl.int64))
     keys = tl.where(condition=indices < VOCAB, x=keys, y=-9223372036854775807 - 1)
-    best = tl.topk(x=keys, k=KB)
+    if GREEDY_FAST:
+        if tl.load(pointer=TopKs + row) == 1:
+            best = tl.full(shape=(KB,), value=0, dtype=tl.int64) + tl.max(input=keys, axis=0)
+        else:
+            best = tl.topk(x=keys, k=KB)
+    else:
+        best = tl.topk(x=keys, k=KB)
     tl.store(pointer=Keys + (row * SPLITS + split) * KB + tl.arange(start=0, end=KB), value=best)
 
 
@@ -49,14 +55,20 @@ def _draft_finalize_kernel(
     stride_q, stride_t, stride_u, stride_chain, column, temp_scale, onehot_above,
     CANDIDATES: tl.constexpr, K: tl.constexpr, KB: tl.constexpr,
     HAS_MIN_P: tl.constexpr, HAS_MAP: tl.constexpr,
-    HAS_TEMP_SCALE: tl.constexpr, HAS_ONEHOT: tl.constexpr,
+    HAS_TEMP_SCALE: tl.constexpr, HAS_ONEHOT: tl.constexpr, GREEDY_FAST: tl.constexpr,
     WRITE_POSITION: tl.constexpr, WRITE_CHAIN: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offs = tl.arange(start=0, end=BLOCK)
     keys = tl.load(pointer=Keys + row * CANDIDATES + offs, mask=offs < CANDIDATES,
                    other=-9223372036854775807 - 1)
-    best = tl.topk(x=keys, k=KB)
+    if GREEDY_FAST:
+        if tl.load(pointer=TopKs + row) == 1:
+            best = tl.full(shape=(KB,), value=0, dtype=tl.int64) + tl.max(input=keys, axis=0)
+        else:
+            best = tl.topk(x=keys, k=KB)
+    else:
+        best = tl.topk(x=keys, k=KB)
     indices = 0xFFFFFFFF - (best & 0xFFFFFFFF)
     ordered = ((best >> 32) + 0x80000000).to(tl.uint32)
     bits = tl.where(condition=ordered & 0x80000000 != 0, x=ordered ^ 0x80000000, y=ordered ^ 0xFFFFFFFF)
@@ -105,7 +117,7 @@ def _draft_finalize_kernel(
         tl.store(pointer=Positions + row, value=tl.load(Positions + row) + 1)
 
 
-def _proposal_topk_keys(*, logits, k_block, topk_impl):
+def _proposal_topk_keys(*, logits, top_ks, k_block, topk_impl, greedy_fast):
     n, vocab = logits.shape
     if topk_impl == "torch":
         vals = torch.nan_to_num(input=logits.float(), nan=-float("inf"),
@@ -123,8 +135,8 @@ def _proposal_topk_keys(*, logits, k_block, topk_impl):
     splits = triton.cdiv(x=vocab, y=block)
     keys = torch.empty(size=(n, splits * k_block), dtype=torch.int64, device=logits.device)
     _draft_partial_topk_kernel[(n, splits)](
-        Logits=logits, Keys=keys, stride_l=logits.stride(0), VOCAB=vocab,
-        SPLITS=splits, KB=k_block, BLOCK=block, num_warps=4,
+        Logits=logits, Keys=keys, TopKs=top_ks, stride_l=logits.stride(0), VOCAB=vocab,
+        SPLITS=splits, KB=k_block, GREEDY_FAST=greedy_fast, BLOCK=block, num_warps=4,
     )
     return keys
 
@@ -136,7 +148,7 @@ def rs_draft_proposal_sparse(
     positions: torch.Tensor | None = None, draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0, draft_support_probs: torch.Tensor | None = None,
     draft_support_tokens: torch.Tensor | None = None, topk_impl: str = "triton",
-    temp_scale: float = 1.0, onehot_above: float = 0.0,
+    temp_scale: float = 1.0, onehot_above: float = 0.0, greedy_fast: bool = False,
 ):
     assert temp_scale > 0 and 0 <= onehot_above <= 1
     assert next_token_logits.ndim == 2 and next_token_logits.stride(1) == 1
@@ -172,7 +184,10 @@ def rs_draft_proposal_sparse(
     topk_index = torch.empty(size=(n, 1), dtype=torch.int64, device=device)
     if n == 0:
         return probs, tokens, topk_p, topk_index
-    keys = _proposal_topk_keys(logits=next_token_logits, k_block=k_block, topk_impl=topk_impl)
+    keys = _proposal_topk_keys(
+        logits=next_token_logits, top_ks=top_ks, k_block=k_block,
+        topk_impl=topk_impl, greedy_fast=greedy_fast,
+    )
     _draft_finalize_kernel[(n,)](
         Keys=keys, Temps=temperatures, TopKs=top_ks, TopPs=top_ps,
         MinPs=min_ps if min_ps is not None else top_ps, Uniforms=uniforms,
@@ -185,7 +200,7 @@ def rs_draft_proposal_sparse(
         column=draft_token_column, temp_scale=temp_scale, onehot_above=onehot_above,
         CANDIDATES=keys.shape[1], K=k, KB=k_block,
         HAS_MIN_P=min_ps is not None, HAS_MAP=hot_token_id is not None,
-        HAS_TEMP_SCALE=temp_scale != 1.0, HAS_ONEHOT=onehot_above > 0,
+        HAS_TEMP_SCALE=temp_scale != 1.0, HAS_ONEHOT=onehot_above > 0, GREEDY_FAST=greedy_fast,
         WRITE_POSITION=positions is not None, WRITE_CHAIN=draft_tokens is not None,
         BLOCK=triton.next_power_of_2(keys.shape[1]), num_warps=4,
     )

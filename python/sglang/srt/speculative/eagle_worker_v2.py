@@ -108,6 +108,7 @@ from sglang.srt.speculative.spec_utils import (
     RS_DRAFT_TOPK,
     RS_DRAFT_TEMP_SCALE,
     RS_DRAFT_ONEHOT_ABOVE,
+    RS_GREEDY_FAST,
     SPEC_MIN_P,
     SPEC_SPARSE_RS,
     renorm_draft_probs,
@@ -197,7 +198,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires rejection sampling and SGLANG_RS_DRAFT_TOPK > 0")
             if server_args.enable_multi_layer_eagle:
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS does not support multi-layer EAGLE")
-            logger.info(f"SGLANG_OPT_SPEC_SPARSE_RS on: sparse chain RS, draft support K={RS_DRAFT_TOPK}, temp_scale={RS_DRAFT_TEMP_SCALE}, onehot_above={RS_DRAFT_ONEHOT_ABOVE}")
+            logger.info(f"SGLANG_OPT_SPEC_SPARSE_RS on: sparse chain RS, draft support K={RS_DRAFT_TOPK}, temp_scale={RS_DRAFT_TEMP_SCALE}, onehot_above={RS_DRAFT_ONEHOT_ABOVE}, greedy_fast={RS_GREEDY_FAST}")
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
@@ -946,6 +947,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             hot_token_id=self.hot_token_id,
             k=RS_DRAFT_TOPK,
             temp_scale=RS_DRAFT_TEMP_SCALE, onehot_above=RS_DRAFT_ONEHOT_ABOVE,
+            **({"greedy_fast": True} if RS_GREEDY_FAST else {}),
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
@@ -1110,6 +1112,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         min_ps=forward_batch.sampling_info.min_ps if SPEC_MIN_P else None,
                         uniforms=uniforms[:, i], k=RS_DRAFT_TOPK,
                         temp_scale=RS_DRAFT_TEMP_SCALE, onehot_above=RS_DRAFT_ONEHOT_ABOVE,
+                        **({"greedy_fast": True} if RS_GREEDY_FAST else {}),
                         hot_token_id=self.hot_token_id, positions=forward_batch.positions,
                         draft_tokens=draft_tokens_topk1, draft_token_column=i + 1,
                         draft_support_probs=draft_support_probs[:, i + 1],
