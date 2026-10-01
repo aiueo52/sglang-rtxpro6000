@@ -339,9 +339,7 @@ def _draft_extend_select_finalize_kernel(
     split = tl.argmax(vals, axis=0)
     if WRITE_PROB:
         m = tl.max(vals, axis=0)
-        sums = tl.load(
-            partial_sums + row * num_splits + offsets, mask=mask, other=0.0
-        )
+        sums = tl.load(partial_sums + row * num_splits + offsets, mask=mask, other=0.0)
         tl.store(conf_out + row, 1.0 / tl.sum(sums * tl.exp(vals - m), axis=0))
     index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
     tl.store(topk_index + row, index)
@@ -454,3 +452,103 @@ def draft_extend_select_topk1(
         num_warps=1,
     )
     return topk_p, topk_index, hidden_out, rows_out, conf
+
+
+@triton.jit
+def _chain_tree_topk1_kernel(
+    bonus_tokens,
+    draft_tokens,
+    seq_lens,
+    tree_mask,
+    positions,
+    retrieve,
+    tokens_out,
+    draft_tokens_stride,
+    bs,
+    num_tokens: tl.constexpr,
+    FULL_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    b = pid.to(tl.int64)
+    i = tl.arange(0, BLOCK)
+    valid = i < num_tokens
+    base = b * num_tokens
+    seq_len = tl.load(seq_lens + b).to(tl.int64)
+    tl.store(positions + base + i, seq_len + i, mask=valid)
+    # retrieve is [3, bs, num_tokens]: flat token index, next token, next sibling.
+    plane = bs * num_tokens
+    tl.store(retrieve + base + i, base + i, mask=valid)
+    next_token = tl.where(i < num_tokens - 1, i + 1, -1)
+    tl.store(retrieve + plane + base + i, next_token, mask=valid)
+    tl.store(
+        retrieve + 2 * plane + base + i, tl.full([BLOCK], -1, tl.int64), mask=valid
+    )
+    bonus = tl.load(bonus_tokens + b)
+    draft = tl.load(
+        draft_tokens + b * draft_tokens_stride + i - 1, mask=valid & (i > 0), other=0
+    )
+    tl.store(tokens_out + base + i, tl.where(i == 0, bonus, draft), mask=valid)
+    # Row x of the tree block attends to draft tokens 0..x.
+    x = tl.arange(0, BLOCK)[:, None]
+    j = tl.arange(0, BLOCK)[None, :]
+    if FULL_MASK:
+        prefix = seq_len * 0
+        for k in range(0, pid):
+            prefix += tl.load(seq_lens + k).to(tl.int64)
+        row = (
+            num_tokens * num_tokens * b
+            + prefix * num_tokens
+            + (seq_len + num_tokens) * x
+        )
+        offs = row + seq_len + j
+    else:
+        offs = num_tokens * num_tokens * b + num_tokens * x + j
+    tl.store(tree_mask + offs, j <= x, mask=(x < num_tokens) & (j < num_tokens))
+
+
+def build_chain_tree_topk1(
+    bonus_tokens: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    tree_mask: torch.Tensor,
+    full_mask: bool,
+):
+    """topk=1 ``build_tree_kernel_efficient``: the draft tree is a chain.
+
+    Writes the tree cells of the FULL_MASK or QLEN_ONLY bool ``tree_mask`` and
+    returns (positions, retrieve_index, retrieve_next_token, retrieve_next_sibling, tokens).
+    """
+    bs, num_steps = draft_tokens.shape
+    num_tokens = num_steps + 1
+    assert bonus_tokens.shape == (bs,) and bonus_tokens.is_contiguous()
+    assert seq_lens.shape == (bs,) and seq_lens.is_contiguous()
+    assert draft_tokens.stride(1) == 1
+    assert tree_mask.dtype == torch.bool
+    device = draft_tokens.device
+    positions = torch.empty((bs * num_tokens,), dtype=torch.long, device=device)
+    retrieve = torch.empty((3, bs, num_tokens), dtype=torch.long, device=device)
+    # torch.cat promotes the int32 bonus tokens to the draft dtype.
+    tokens = torch.empty(
+        (bs * num_tokens,),
+        dtype=torch.promote_types(bonus_tokens.dtype, draft_tokens.dtype),
+        device=device,
+    )
+    if bs > 0:
+        _chain_tree_topk1_kernel[(bs,)](
+            bonus_tokens,
+            draft_tokens,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve,
+            tokens,
+            draft_tokens.stride(0),
+            bs,
+            num_tokens=num_tokens,
+            FULL_MASK=full_mask,
+            BLOCK=triton.next_power_of_2(num_tokens),
+            num_warps=1,
+        )
+    retrieve_index, retrieve_next_token, retrieve_next_sibling = retrieve
+    return positions, retrieve_index, retrieve_next_token, retrieve_next_sibling, tokens

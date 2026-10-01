@@ -6,7 +6,11 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.speculative.spec_tree import (
+    sgl_build_tree_kernel_efficient_triton,
+)
 from sglang.kernels.ops.speculative.topk1 import (
+    build_chain_tree_topk1,
     draft_extend_select_topk1,
     draft_topk1_postprocess,
 )
@@ -212,6 +216,67 @@ class TestSpecTopk1Triton(CustomTestCase):
         )
         torch.testing.assert_close(index_from_accept, topk_index, rtol=0, atol=0)
         torch.testing.assert_close(hidden_from_accept, hidden_out, rtol=0, atol=0)
+
+    def test_chain_tree_matches_reference_tree_build(self):
+        g = torch.Generator(device=self.device).manual_seed(5)
+        for bs, steps, full_mask in ((1, 3, True), (3, 7, True), (2, 15, False)):
+            T = steps + 1
+            seq_lens = torch.randint(
+                3, 400, (bs,), generator=g, device=self.device, dtype=torch.int64
+            )
+            numel = T * T * bs + (int(seq_lens.sum()) * T if full_mask else 0)
+            init = torch.randint(0, 2, (numel,), generator=g, device=self.device).bool()
+            parents = torch.arange(
+                -1, steps - 1, dtype=torch.long, device=self.device
+            ).repeat(bs, 1)
+            scores = torch.arange(steps, dtype=torch.long, device=self.device).repeat(
+                bs, 1
+            )
+            bonus = torch.randint(
+                0, 1000, (bs,), generator=g, device=self.device, dtype=torch.int32
+            )
+            draft = torch.randint(
+                0, 1000, (bs, steps), generator=g, device=self.device, dtype=torch.int64
+            )
+            mask_ref = init.clone()
+            retrieve_ref = torch.full(
+                (3, bs, T), -1, dtype=torch.long, device=self.device
+            )
+            positions_ref = torch.empty((bs * T,), dtype=torch.long, device=self.device)
+            sgl_build_tree_kernel_efficient_triton[(bs,)](
+                parents,
+                scores,
+                seq_lens,
+                torch.cumsum(seq_lens, dim=0) - seq_lens,
+                mask_ref,
+                positions_ref,
+                retrieve_ref[0],
+                retrieve_ref[1],
+                retrieve_ref[2],
+                topk=1,
+                depth=steps,
+                draft_token_num=T,
+                tree_mask_mode=0 if full_mask else 1,
+                batch_size=bs,
+                parent_list_stride=parents.stride(0),
+                selected_index_stride=scores.stride(0),
+            )
+            mask = init.clone()
+            positions, index, next_token, next_sibling, tokens = build_chain_tree_topk1(
+                bonus_tokens=bonus,
+                draft_tokens=draft,
+                seq_lens=seq_lens,
+                tree_mask=mask,
+                full_mask=full_mask,
+            )
+            self.assertTrue(torch.equal(mask, mask_ref))
+            self.assertTrue(torch.equal(positions, positions_ref))
+            self.assertTrue(torch.equal(index, retrieve_ref[0]))
+            self.assertTrue(torch.equal(next_token, retrieve_ref[1]))
+            self.assertTrue(torch.equal(next_sibling, retrieve_ref[2]))
+            self.assertTrue(
+                torch.equal(tokens, torch.cat((bonus[:, None], draft), dim=1).flatten())
+            )
 
 
 if __name__ == "__main__":

@@ -327,6 +327,7 @@ def build_eagle_verify_input(
     num_draft_tokens: int,
     tree_mask_mode: TreeMaskMode,
     device: str,
+    chain_topk1: bool = False,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -383,6 +384,7 @@ def build_eagle_verify_input(
         mask_mode,
         tree_mask_buf,
         fill_prefix_mask=fill_mask,
+        chain_topk1=chain_topk1,
     )
 
     return EagleVerifyInput(

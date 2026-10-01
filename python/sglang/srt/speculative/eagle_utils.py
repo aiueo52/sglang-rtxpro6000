@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
     verify_tree_greedy_kernel_triton,
 )
+from sglang.kernels.ops.speculative.topk1 import build_chain_tree_topk1
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -166,8 +167,19 @@ def build_tree_kernel_efficient(
     tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
     tree_mask_buf: Optional[torch.Tensor] = None,
     fill_prefix_mask: bool = True,
+    chain_topk1: bool = False,
 ):
-    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
+    # SGLANG_OPT_DRAFT_TAIL, topk=1: the tree is a chain; one kernel builds it.
+    chain_topk1 = (
+        chain_topk1
+        and _is_cuda
+        and tree_mask_mode in (TreeMaskMode.FULL_MASK, TreeMaskMode.QLEN_ONLY)
+        and (tree_mask_buf is None or tree_mask_buf.dtype == torch.bool)
+    )
+    if not chain_topk1:
+        draft_tokens = torch.cat(
+            (bonus_tokens.unsqueeze(1), draft_tokens), dim=1
+        ).flatten()
 
     # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
     bs = seq_lens.numel()
@@ -217,6 +229,30 @@ def build_tree_kernel_efficient(
         )
     else:
         raise NotImplementedError(f"Invalid tree mask: {tree_mask_mode=}")
+
+    if chain_topk1:
+        assert draft_tokens.shape[1] + 1 == num_verify_tokens
+        (
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            tokens,
+        ) = build_chain_tree_topk1(
+            bonus_tokens=bonus_tokens,
+            draft_tokens=draft_tokens,
+            seq_lens=seq_lens,
+            tree_mask=tree_mask,
+            full_mask=tree_mask_mode == TreeMaskMode.FULL_MASK,
+        )
+        return (
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            tokens,
+        )
 
     # TODO: make them torch.empty and fuse them into `sgl_build_tree_kernel`
     retrieve_buf = torch.full(

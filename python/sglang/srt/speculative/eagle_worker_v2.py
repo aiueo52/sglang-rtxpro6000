@@ -244,11 +244,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._draft_tail_fused_conf = (
             self._draft_tail_select and envs.SGLANG_OPT_DRAFT_TAIL_FUSED_CONF.get()
         )
+        # Chain tree build in the draft phase epilogue (build_tree_kernel_efficient).
+        self._draft_tail_chain = envs.SGLANG_OPT_DRAFT_TAIL.get() and self.topk == 1
         if envs.SGLANG_OPT_DRAFT_TAIL.get():
             logger.info(
-                "SGLANG_OPT_DRAFT_TAIL on: draft-extend select %s, fused conf %s",
+                "SGLANG_OPT_DRAFT_TAIL on: draft-extend select %s, fused conf %s, "
+                "chain tree %s",
                 self._draft_tail_select,
                 self._draft_tail_fused_conf,
+                self._draft_tail_chain,
             )
 
     def alloc_memory_pool(
@@ -857,6 +861,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_draft_tokens=self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
+            chain_topk1=self._draft_tail_chain,
         )
 
     def _record_position0_confidence(self, next_token_logits: torch.Tensor):
