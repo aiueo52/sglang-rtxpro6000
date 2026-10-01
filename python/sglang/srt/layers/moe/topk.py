@@ -158,9 +158,8 @@ def _get_zero_bias(num_experts: int, device: torch.device) -> torch.Tensor:
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
-# RT1 (2026-10-01): softmax router with one packed-key reduction per pick
-# (kernels/ops/moe/moe_router_softmax_fast.py), bit-identical to the Triton router
-# for the fused_topk call. Default off.
+# Packed-key softmax router for bf16 logits (moe_router_softmax_fast.py): the Triton
+# router's weights and ids bit for bit, one warp reduction per pick. Default off.
 _router_fast_topk = get_bool_env_var("SGLANG_ROUTER_FAST_TOPK", "False")
 
 
@@ -896,6 +895,7 @@ def fused_topk(
         # ===== END TO BE REFACTORED ====
         elif _is_cuda:
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
+            from sglang.kernels.ops.moe import moe_router_softmax_fast as _rfast
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
             )
@@ -903,11 +903,9 @@ def fused_topk(
             zero_bias = _get_zero_bias(
                 gating_output.shape[1], gating_output.device
             )
-            if _router_fast_topk:
-                from sglang.kernels.ops.moe import moe_router_softmax_fast as _rfast
             if _router_fast_topk and _rfast.covered(gating_output, zero_bias, topk):
                 topk_weights, topk_ids = _rfast.route_softmax_fast(
-                    gating_output, zero_bias, topk, renormalize
+                    gating_output, zero_bias, topk, renormalize=renormalize
                 )
             else:
                 topk_weights, topk_ids = _jit_moe_fused_gate(
