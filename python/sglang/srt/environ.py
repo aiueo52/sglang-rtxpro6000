@@ -1258,6 +1258,12 @@ class Envs:
     # grows to claim them and a deployment tuned against the old (wasteful)
     # footprint loses that much runtime headroom.
     SGLANG_DRAFT_SKIP_VOCAB_WEIGHTS = EnvBool(False)
+    # Draft tail glue, bit-exact: no eager input copy in the draft graph, fp32
+    # draft logits buffer, fused draft-extend row select + argmax (topk=1).
+    SGLANG_OPT_DRAFT_TAIL = EnvBool(False)
+    # Draft-extend position-0 confidence from the fused argmax pass instead of
+    # torch top1_prob. Needs SGLANG_OPT_DRAFT_TAIL; not bit-exact (fp32 order).
+    SGLANG_OPT_DRAFT_TAIL_FUSED_CONF = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing

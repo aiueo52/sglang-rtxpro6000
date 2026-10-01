@@ -217,3 +217,240 @@ def draft_topk1_postprocess(
         num_warps=1,
     )
     return topk_p, topk_index
+
+
+@triton.jit
+def _select_split_argmax(
+    logits_row,
+    rows_out_row,
+    partial_vals,
+    partial_indices,
+    partial_sums,
+    out_offset,
+    split,
+    vocab_size: tl.constexpr,
+    WRITE_ROWS: tl.constexpr,
+    WRITE_PROB: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = split * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < vocab_size
+    vals = tl.load(logits_row + offsets, mask=mask, other=-float("inf"))
+    if WRITE_ROWS:
+        tl.store(rows_out_row + offsets, vals, mask=mask)
+    vals = vals.to(tl.float32)
+    vals = tl.where(vals == vals, vals, -1e30)
+    max_val = tl.max(vals, axis=0)
+    tl.store(partial_vals + out_offset, max_val)
+    tl.store(partial_indices + out_offset, split * BLOCK + tl.argmax(vals, axis=0))
+    if WRITE_PROB:
+        tl.store(partial_sums + out_offset, tl.sum(tl.exp(vals - max_val), axis=0))
+
+
+@triton.jit
+def _draft_extend_select_partial_kernel(
+    logits,
+    row_src,
+    partial_vals,
+    partial_indices,
+    partial_sums,
+    rows_out,
+    hidden,
+    hidden_out,
+    logits_row_stride,
+    hidden_row_stride,
+    num_rows,
+    hidden_num_rows,
+    num_tokens_per_req,
+    vocab_size: tl.constexpr,
+    hidden_size: tl.constexpr,
+    num_splits: tl.constexpr,
+    ROW_FROM_ACCEPT: tl.constexpr,
+    WRITE_ROWS: tl.constexpr,
+    WRITE_PROB: tl.constexpr,
+    COPY_HIDDEN: tl.constexpr,
+    BLOCK: tl.constexpr,
+    HIDDEN_BLOCK: tl.constexpr,
+):
+    # One program per (output row, vocab split); with COPY_HIDDEN the extra
+    # split index num_splits copies the selected hidden-state row instead.
+    out_row = tl.program_id(0).to(tl.int64)
+    split = tl.program_id(1)
+    row = tl.load(row_src + out_row).to(tl.int64)
+    if ROW_FROM_ACCEPT:
+        row = out_row * num_tokens_per_req + row - 1
+    # Negative rows wrap like torch advanced indexing.
+    lrow = tl.where(row < 0, row + num_rows, row)
+    if COPY_HIDDEN:
+        if split == num_splits:
+            hrow = tl.where(row < 0, row + hidden_num_rows, row)
+            offsets = tl.arange(0, HIDDEN_BLOCK)
+            mask = offsets < hidden_size
+            h = tl.load(hidden + hrow * hidden_row_stride + offsets, mask=mask)
+            tl.store(hidden_out + out_row * hidden_size + offsets, h, mask=mask)
+        else:
+            _select_split_argmax(
+                logits + lrow * logits_row_stride,
+                rows_out + out_row * vocab_size,
+                partial_vals,
+                partial_indices,
+                partial_sums,
+                out_row * num_splits + split,
+                split,
+                vocab_size,
+                WRITE_ROWS,
+                WRITE_PROB,
+                BLOCK,
+            )
+    else:
+        _select_split_argmax(
+            logits + lrow * logits_row_stride,
+            rows_out + out_row * vocab_size,
+            partial_vals,
+            partial_indices,
+            partial_sums,
+            out_row * num_splits + split,
+            split,
+            vocab_size,
+            WRITE_ROWS,
+            WRITE_PROB,
+            BLOCK,
+        )
+
+
+@triton.jit
+def _draft_extend_select_finalize_kernel(
+    partial_vals,
+    partial_indices,
+    partial_sums,
+    topk_p,
+    topk_index,
+    conf_out,
+    num_splits: tl.constexpr,
+    WRITE_PROB: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < num_splits
+    vals = tl.load(
+        partial_vals + row * num_splits + offsets, mask=mask, other=-float("inf")
+    )
+    split = tl.argmax(vals, axis=0)
+    if WRITE_PROB:
+        m = tl.max(vals, axis=0)
+        sums = tl.load(
+            partial_sums + row * num_splits + offsets, mask=mask, other=0.0
+        )
+        tl.store(conf_out + row, 1.0 / tl.sum(sums * tl.exp(vals - m), axis=0))
+    index = tl.load(partial_indices + row * num_splits + split).to(tl.int64)
+    tl.store(topk_index + row, index)
+    tl.store(topk_p + row, 1.0)
+
+
+def draft_extend_select_topk1(
+    next_token_logits: torch.Tensor,
+    select_index: Optional[torch.Tensor] = None,
+    hidden_states: Optional[torch.Tensor] = None,
+    write_rows: bool = False,
+    write_prob: bool = False,
+    accept_lens: Optional[torch.Tensor] = None,
+    num_tokens_per_req: int = 0,
+):
+    """topk=1 draft-extend tail: argmax and hidden row of each selected row.
+
+    Rows are ``select_index``, or ``i * num_tokens_per_req + accept_lens[i] - 1``.
+    Returns (topk_p, topk_index, hidden, rows, conf); rows/conf are None unless asked.
+    """
+    assert next_token_logits.ndim == 2
+    assert next_token_logits.stride(1) == 1
+    assert (select_index is None) != (accept_lens is None)
+    row_from_accept = accept_lens is not None
+    row_src = accept_lens if row_from_accept else select_index
+    assert row_src.ndim == 1
+    assert row_src.is_contiguous()
+    assert row_src.device == next_token_logits.device
+    if row_from_accept:
+        assert accept_lens.dtype in (torch.int32, torch.int64)
+        assert num_tokens_per_req > 0
+    else:
+        assert select_index.dtype == torch.int64
+    copy_hidden = hidden_states is not None
+    # Rows may carry trailing dims (e.g. HC streams); the kernel copies flat rows.
+    hidden_rows = hidden_states.flatten(1) if copy_hidden else None
+    if copy_hidden:
+        assert hidden_rows.stride(1) == 1
+        assert hidden_states.device == next_token_logits.device
+
+    device = next_token_logits.device
+    bs = row_src.shape[0]
+    vocab_size = next_token_logits.shape[1]
+    topk_p = torch.empty((bs, 1), dtype=torch.float32, device=device)
+    topk_index = torch.empty((bs, 1), dtype=torch.int64, device=device)
+    hidden_out = (
+        torch.empty(
+            (bs, *hidden_states.shape[1:]), dtype=hidden_states.dtype, device=device
+        )
+        if copy_hidden
+        else None
+    )
+    rows_out = (
+        torch.empty((bs, vocab_size), dtype=next_token_logits.dtype, device=device)
+        if write_rows
+        else None
+    )
+    conf = (
+        torch.empty((bs,), dtype=torch.float32, device=device) if write_prob else None
+    )
+    if bs == 0:
+        return topk_p, topk_index, hidden_out, rows_out, conf
+
+    block = _DRAFT_TOPK1_BLOCK
+    num_splits = triton.cdiv(vocab_size, block)
+    partial_vals = torch.empty((bs, num_splits), dtype=torch.float32, device=device)
+    partial_indices = torch.empty((bs, num_splits), dtype=torch.int32, device=device)
+    partial_sums = (
+        torch.empty((bs, num_splits), dtype=torch.float32, device=device)
+        if write_prob
+        else partial_vals
+    )
+    hidden_size = hidden_rows.shape[1] if copy_hidden else 0
+    # Disabled operands get a valid dummy pointer; constexpr flags gate them off.
+    _draft_extend_select_partial_kernel[(bs, num_splits + int(copy_hidden))](
+        next_token_logits,
+        row_src,
+        partial_vals,
+        partial_indices,
+        partial_sums,
+        rows_out if write_rows else next_token_logits,
+        hidden_rows if copy_hidden else next_token_logits,
+        hidden_out if copy_hidden else next_token_logits,
+        next_token_logits.stride(0),
+        hidden_rows.stride(0) if copy_hidden else 0,
+        next_token_logits.shape[0],
+        hidden_rows.shape[0] if copy_hidden else 0,
+        num_tokens_per_req,
+        vocab_size,
+        hidden_size,
+        num_splits,
+        ROW_FROM_ACCEPT=row_from_accept,
+        WRITE_ROWS=write_rows,
+        WRITE_PROB=write_prob,
+        COPY_HIDDEN=copy_hidden,
+        BLOCK=block,
+        HIDDEN_BLOCK=triton.next_power_of_2(max(hidden_size, 1)),
+        num_warps=8,
+    )
+    _draft_extend_select_finalize_kernel[(bs,)](
+        partial_vals,
+        partial_indices,
+        partial_sums,
+        topk_p,
+        topk_index,
+        conf if write_prob else topk_p,
+        num_splits,
+        WRITE_PROB=write_prob,
+        BLOCK=triton.next_power_of_2(num_splits),
+        num_warps=1,
+    )
+    return topk_p, topk_index, hidden_out, rows_out, conf

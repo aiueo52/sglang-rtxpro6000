@@ -6,7 +6,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_extend_select_topk1,
+    draft_topk1_postprocess,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -157,6 +160,58 @@ class TestSpecTopk1Triton(CustomTestCase):
             )
         with self.assertRaises(AssertionError):
             draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
+
+    def test_draft_extend_select_matches_torch_tail(self):
+        # Bit-identical to logits[sel].argmax / hidden[sel] (the torch tail it
+        # replaces), incl. first-max ties that span vocab splits.
+        bs, width, vocab_size, hidden_size = 3, 8, 49152, 640
+        g = torch.Generator(device=self.device).manual_seed(0)
+        logits = torch.randn(
+            (bs * width, vocab_size), device=self.device, generator=g
+        ).bfloat16()
+        logits = logits.float()
+        logits[:, [100, 9000, 40000]] = 10.0
+        hidden = torch.randn(
+            (bs * width, hidden_size), device=self.device, generator=g
+        ).bfloat16()
+        select_index = torch.tensor([5, 8, 23], device=self.device)
+
+        topk_p, topk_index, hidden_out, rows, _ = draft_extend_select_topk1(
+            next_token_logits=logits,
+            select_index=select_index,
+            hidden_states=hidden,
+            write_rows=True,
+        )
+        _, _, _, _, conf = draft_extend_select_topk1(
+            next_token_logits=logits, select_index=select_index, write_prob=True
+        )
+
+        expected_rows = logits[select_index]
+        torch.testing.assert_close(
+            topk_index,
+            torch.argmax(expected_rows, dim=-1, keepdim=True),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(topk_index.view(-1).tolist(), [100] * bs)
+        torch.testing.assert_close(topk_p, torch.ones_like(topk_p), rtol=0, atol=0)
+        torch.testing.assert_close(hidden_out, hidden[select_index], rtol=0, atol=0)
+        torch.testing.assert_close(rows, expected_rows, rtol=0, atol=0)
+        expected_conf = (
+            expected_rows.amax(dim=-1) - torch.logsumexp(expected_rows, dim=-1)
+        ).exp()
+        torch.testing.assert_close(conf, expected_conf, rtol=1e-5, atol=0)
+
+        # Same rows from accept_lens: i * width + accept_lens[i] - 1.
+        accept_lens = torch.tensor([6, 1, 8], dtype=torch.int32, device=self.device)
+        _, index_from_accept, hidden_from_accept, _, _ = draft_extend_select_topk1(
+            next_token_logits=logits,
+            hidden_states=hidden,
+            accept_lens=accept_lens,
+            num_tokens_per_req=width,
+        )
+        torch.testing.assert_close(index_from_accept, topk_index, rtol=0, atol=0)
+        torch.testing.assert_close(hidden_from_accept, hidden_out, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

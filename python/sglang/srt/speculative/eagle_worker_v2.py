@@ -8,7 +8,10 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.kernels.ops.speculative.topk1 import (
+    draft_extend_select_topk1,
+    draft_topk1_postprocess,
+)
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -28,6 +31,7 @@ from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_a2a_backend_context,
@@ -229,6 +233,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+        # SGLANG_OPT_DRAFT_TAIL: fused row select + argmax for the topk=1 tail of
+        # _draft_extend_for_decode; FUSED_CONF also takes p0 from that pass.
+        self._draft_tail_select = (
+            envs.SGLANG_OPT_DRAFT_TAIL.get()
+            and self.topk == 1
+            and _is_cuda
+            and not get_spec().speculative_use_rejection_sampling
+        )
+        self._draft_tail_fused_conf = (
+            self._draft_tail_select and envs.SGLANG_OPT_DRAFT_TAIL_FUSED_CONF.get()
+        )
+        if envs.SGLANG_OPT_DRAFT_TAIL.get():
+            logger.info(
+                "SGLANG_OPT_DRAFT_TAIL on: draft-extend select %s, fused conf %s",
+                self._draft_tail_select,
+                self._draft_tail_fused_conf,
+            )
 
     def alloc_memory_pool(
         self,
@@ -1267,6 +1288,33 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    def _draft_extend_select_tail(
+        self,
+        next_draft_input: EagleDraftInput,
+        draft_logits_output: LogitsProcessorOutput,
+        accept_lens: torch.Tensor,
+    ):
+        # The topk == 1 branch of _draft_extend_for_decode in two launches; p0 is
+        # top1_prob of the gathered rows (bit-exact) unless FUSED_CONF is on.
+        conf_on = self._conf_channel is not None
+        topk_p, topk_index, hidden_states, rows, conf = draft_extend_select_topk1(
+            next_token_logits=draft_logits_output.next_token_logits,
+            hidden_states=draft_logits_output.hidden_states,
+            write_rows=conf_on and not self._draft_tail_fused_conf,
+            write_prob=conf_on and self._draft_tail_fused_conf,
+            accept_lens=accept_lens,
+            num_tokens_per_req=self.speculative_num_draft_tokens,
+        )
+        if conf_on:
+            p0 = conf if self._draft_tail_fused_conf else top1_prob(rows)
+            self._conf_channel.record_position0(p0)
+            if self._chain_conf_buf is not None:
+                n = min(p0.shape[0], self._chain_conf_buf.shape[0])
+                self._chain_conf_buf[:n, 0].copy_(p0[:n])
+        next_draft_input.topk_p = topk_p
+        next_draft_input.topk_index = topk_index
+        next_draft_input.hidden_states = hidden_states
+
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
@@ -1281,16 +1329,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_per_req=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
-        select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+        # The fused draft tail derives these rows from accept_lens in-kernel.
+        select_index = None
+        if not self._draft_tail_select or self.seed_dsa_topk_from_draft_extend:
+            select_index = (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
-        )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
@@ -1370,6 +1421,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
+        if self._draft_tail_select:
+            self._draft_extend_select_tail(
+                next_draft_input=batch_result.next_draft_input,
+                draft_logits_output=draft_logits_output,
+                accept_lens=batch_result.accept_lens,
+            )
+            if self.seed_dsa_topk_from_draft_extend:
+                batch_result.next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+            return
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index
         ]

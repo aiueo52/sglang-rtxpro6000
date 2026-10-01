@@ -271,6 +271,25 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
+        # fp32 target for the draft lm_head (SGLANG_DRAFT_LOGITS_OUT) so no
+        # per-forward bf16->fp32 cast is captured; private, never aliased.
+        hot_token_id = self.eagle_worker.hot_token_id
+        self.draft_logits_buffer = (
+            torch.zeros(
+                (
+                    self.max_num_token,
+                    (
+                        hot_token_id.shape[0]
+                        if hot_token_id is not None
+                        else model_runner.model_config.vocab_size
+                    ),
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if envs.SGLANG_OPT_DRAFT_TAIL.get()
+            else None
+        )
 
         self.backend = resolve_decode_backend(self)
 
@@ -446,6 +465,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             bootstrap_room_ids_int=bootstrap_room_ids_int,
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            ),
+            next_token_logits_buffer=(
+                self.draft_logits_buffer[:num_tokens]
+                if self.draft_logits_buffer is not None
+                else None
             ),
         )
 

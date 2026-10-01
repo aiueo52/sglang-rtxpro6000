@@ -143,6 +143,11 @@ class EagerRunner(BaseRunner):
             ),
             dp_size=get_parallel().config.dp_size,
         )
+        # The draft decode graph already feeds its own static buffers; a copy
+        # captured into it would only be replayed every draft forward.
+        self._draft_capture_no_copy = (
+            envs.SGLANG_OPT_DRAFT_TAIL.get() and mr.is_draft_worker
+        )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
 
@@ -177,7 +182,11 @@ class EagerRunner(BaseRunner):
         """Copy the live batch into the fixed-max eager static buffers (sliced to
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
-        if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+        if envs.SGLANG_EAGER_INPUT_NO_COPY.get() or (
+            self._draft_capture_no_copy
+            and forward_batch.forward_mode.is_decode()
+            and torch.cuda.is_current_stream_capturing()
+        ):
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
