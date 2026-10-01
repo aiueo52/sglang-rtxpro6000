@@ -212,7 +212,7 @@ def _chain_sampling_sparse_kernel(
     Predicts, AcceptIndex, AcceptTokenNum, Candidates, RetriveIndex,
     Coins, CoinsFinal, P, PI, Q, QI,
     NUM_SLOTS: tl.constexpr, K: tl.constexpr, KQ: tl.constexpr,
-    KP: tl.constexpr, VOCAB: tl.constexpr,
+    KP: tl.constexpr, VOCAB: tl.constexpr, BLOCK_VERIFY: tl.constexpr,
 ):
     bx = tl.program_id(0).to(tl.int64)
     poffs = tl.arange(start=0, end=KP)
@@ -221,38 +221,85 @@ def _chain_sampling_sparse_kernel(
     last = tl.load(RetriveIndex + base)
     tl.store(pointer=AcceptIndex + base, value=last)
     num_correct = 0
-    walking = 1
-    step = 1
-    while (step < NUM_SLOTS) & (walking == 1):
-        token = tl.load(Candidates + base + step)
-        p = tl.load(P + (base + step - 1) * KP + poffs)
-        pi = tl.load(PI + (base + step - 1) * KP + poffs)
-        qbase = (bx * (NUM_SLOTS - 1) + step - 1) * K
-        q = tl.load(pointer=Q + qbase + qoffs, mask=qoffs < K, other=0.0)
-        qi = tl.load(pointer=QI + qbase + qoffs, mask=qoffs < K, other=-1)
-        q = tl.where(condition=q == q, x=q, y=0.0)
-        pt = tl.sum(tl.where(condition=pi == token, x=p, y=0.0), axis=0)
-        qt = tl.sum(tl.where(condition=qi == token, x=q, y=0.0), axis=0)
-        coin = tl.load(Coins + base + step - 1)
-        if coin * qt < pt:
-            tl.store(pointer=Predicts + last, value=token)
-            last = tl.load(RetriveIndex + base + step)
-            num_correct += 1
-            tl.store(pointer=AcceptIndex + base + num_correct, value=last)
+    if BLOCK_VERIFY:
+        path_pi = tl.full(shape=(), value=1.0, dtype=tl.float32)
+        final_pi = path_pi
+        step = 1
+        while (step < NUM_SLOTS) & (path_pi > 0):
+            token = tl.load(pointer=Candidates + base + step)
+            p = tl.load(pointer=P + (base + step - 1) * KP + poffs).to(dtype=tl.float32)
+            pi = tl.load(pointer=PI + (base + step - 1) * KP + poffs)
+            qbase = (bx * (NUM_SLOTS - 1) + step - 1) * K
+            q = tl.load(pointer=Q + qbase + qoffs, mask=qoffs < K, other=0.0).to(dtype=tl.float32)
+            qi = tl.load(pointer=QI + qbase + qoffs, mask=qoffs < K, other=-1)
+            q = tl.where(condition=q == q, x=q, y=0.0)
+            pt = tl.sum(input=tl.where(condition=pi == token, x=p, y=0.0), axis=0)
+            qt = tl.sum(input=tl.where(condition=qi == token, x=q, y=0.0), axis=0)
+            path_pi = tl.where(condition=pt <= 0, x=0.0,
+                               y=tl.where(condition=qt == 0, x=1.0, y=tl.minimum(x=path_pi * pt / qt, y=1.0)))
+            h = path_pi
+            if step < NUM_SLOTS - 1:
+                p = tl.load(pointer=P + (base + step) * KP + poffs).to(dtype=tl.float32)
+                pi = tl.load(pointer=PI + (base + step) * KP + poffs)
+                qbase = (bx * (NUM_SLOTS - 1) + step) * K
+                q = tl.load(pointer=Q + qbase + qoffs, mask=qoffs < K, other=0.0).to(dtype=tl.float32)
+                qi = tl.load(pointer=QI + qbase + qoffs, mask=qoffs < K, other=-1)
+                q = tl.where(condition=q == q, x=q, y=0.0)
+                matched = tl.sum(input=tl.where(condition=pi[:, None] == qi[None, :], x=q[None, :], y=0.0), axis=1)
+                n = tl.sum(input=tl.maximum(x=path_pi * p - matched, y=0.0), axis=0)
+                denominator = n + 1.0 - path_pi
+                h = tl.where(condition=denominator > 0, x=n / denominator, y=1.0)
+            if tl.load(pointer=Coins + base + step - 1) < h:
+                num_correct = step
+                final_pi = path_pi
             step += 1
-        else:
-            walking = 0
+        step = 1
+        while step <= num_correct:
+            token = tl.load(pointer=Candidates + base + step)
+            tl.store(pointer=Predicts + last, value=token)
+            last = tl.load(pointer=RetriveIndex + base + step)
+            tl.store(pointer=AcceptIndex + base + step, value=last)
+            step += 1
+    else:
+        walking = 1
+        step = 1
+        while (step < NUM_SLOTS) & (walking == 1):
+            token = tl.load(Candidates + base + step)
+            p = tl.load(P + (base + step - 1) * KP + poffs)
+            pi = tl.load(PI + (base + step - 1) * KP + poffs)
+            qbase = (bx * (NUM_SLOTS - 1) + step - 1) * K
+            q = tl.load(pointer=Q + qbase + qoffs, mask=qoffs < K, other=0.0)
+            qi = tl.load(pointer=QI + qbase + qoffs, mask=qoffs < K, other=-1)
+            q = tl.where(condition=q == q, x=q, y=0.0)
+            pt = tl.sum(tl.where(condition=pi == token, x=p, y=0.0), axis=0)
+            qt = tl.sum(tl.where(condition=qi == token, x=q, y=0.0), axis=0)
+            coin = tl.load(Coins + base + step - 1)
+            if coin * qt < pt:
+                tl.store(pointer=Predicts + last, value=token)
+                last = tl.load(RetriveIndex + base + step)
+                num_correct += 1
+                tl.store(pointer=AcceptIndex + base + num_correct, value=last)
+                step += 1
+            else:
+                walking = 0
     tl.store(pointer=AcceptTokenNum + bx, value=num_correct)
     p = tl.load(P + (base + num_correct) * KP + poffs)
     pi = tl.load(PI + (base + num_correct) * KP + poffs)
+    if BLOCK_VERIFY:
+        p = p.to(tl.float32)
     weights = p
     if num_correct < NUM_SLOTS - 1:
         qbase = (bx * (NUM_SLOTS - 1) + num_correct) * K
         q = tl.load(pointer=Q + qbase + qoffs, mask=qoffs < K, other=0.0)
         qi = tl.load(pointer=QI + qbase + qoffs, mask=qoffs < K, other=-1)
+        if BLOCK_VERIFY:
+            q = q.to(tl.float32)
         q = tl.where(condition=q == q, x=q, y=0.0)
         matched = tl.sum(tl.where(condition=pi[:, None] == qi[None, :], x=q[None, :], y=0.0), axis=1)
-        weights = tl.maximum(x=p - matched, y=0.0)
+        if BLOCK_VERIFY:
+            weights = tl.maximum(x=final_pi * p - matched, y=0.0)
+        else:
+            weights = tl.maximum(x=p - matched, y=0.0)
         # Deliberately draw P on a zero residual; dense RS returns VOCAB - 1.
         weights = tl.where(condition=tl.sum(weights, axis=0) > 0, x=weights, y=p)
     order_keys = (pi << 32) | poffs.to(tl.int64)
@@ -273,7 +320,7 @@ def chain_speculative_sampling_sparse(
     candidates: torch.Tensor, retrive_index: torch.Tensor, uniform_samples: torch.Tensor,
     uniform_samples_for_final_sampling: torch.Tensor, target_probs: torch.Tensor,
     target_index: torch.Tensor, draft_support_probs: torch.Tensor,
-    draft_support_tokens: torch.Tensor, vocab_size: int,
+    draft_support_tokens: torch.Tensor, vocab_size: int, block_verify: bool = False,
 ):
     bs, num_slots = candidates.shape
     kp = target_probs.shape[-1]
@@ -290,6 +337,6 @@ def chain_speculative_sampling_sparse(
         Coins=uniform_samples.contiguous(), CoinsFinal=uniform_samples_for_final_sampling.contiguous(),
         P=target_probs.contiguous(), PI=target_index.contiguous(),
         Q=draft_support_probs.contiguous(), QI=draft_support_tokens.contiguous(),
-        NUM_SLOTS=num_slots, K=k, KQ=triton.next_power_of_2(k), KP=kp, VOCAB=vocab_size,
+        NUM_SLOTS=num_slots, K=k, KQ=triton.next_power_of_2(k), KP=kp, VOCAB=vocab_size, BLOCK_VERIFY=block_verify,
         num_warps=4,
     )

@@ -265,6 +265,8 @@ class SpeculativeAlgorithm(Enum):
         cfg = resolving_view(server_args)
         from sglang.srt.environ import envs
 
+        if envs.SGLANG_RS_BLOCK_VERIFY.get() and not envs.SGLANG_OPT_SPEC_SPARSE_RS.get():
+            raise ValueError("SGLANG_RS_BLOCK_VERIFY requires SGLANG_OPT_SPEC_SPARSE_RS")
         if envs.SGLANG_OPT_SPEC_SPARSE_RS.get():
             if not cfg.speculative_use_rejection_sampling:
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires rejection sampling")

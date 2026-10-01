@@ -109,6 +109,7 @@ from sglang.srt.speculative.spec_utils import (
     RS_DRAFT_TEMP_SCALE,
     RS_DRAFT_ONEHOT_ABOVE,
     RS_GREEDY_FAST,
+    RS_BLOCK_VERIFY,
     SPEC_MIN_P,
     SPEC_SPARSE_RS,
     renorm_draft_probs,
@@ -198,7 +199,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires rejection sampling and SGLANG_RS_DRAFT_TOPK > 0")
             if server_args.enable_multi_layer_eagle:
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS does not support multi-layer EAGLE")
-            logger.info(f"SGLANG_OPT_SPEC_SPARSE_RS on: sparse chain RS, draft support K={RS_DRAFT_TOPK}, temp_scale={RS_DRAFT_TEMP_SCALE}, onehot_above={RS_DRAFT_ONEHOT_ABOVE}, greedy_fast={RS_GREEDY_FAST}")
+            logger.info(f"SGLANG_OPT_SPEC_SPARSE_RS on: sparse chain RS, draft support K={RS_DRAFT_TOPK}, temp_scale={RS_DRAFT_TEMP_SCALE}, onehot_above={RS_DRAFT_ONEHOT_ABOVE}, greedy_fast={RS_GREEDY_FAST}, block_verify={RS_BLOCK_VERIFY}")
         self.topk = get_spec().speculative_eagle_topk
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"

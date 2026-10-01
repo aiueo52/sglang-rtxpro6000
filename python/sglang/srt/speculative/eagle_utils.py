@@ -58,6 +58,7 @@ _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 RS_DUMP_DIR = envs.SGLANG_RS_DUMP_DIR.get()
+RS_BLOCK_VERIFY = envs.SGLANG_RS_BLOCK_VERIFY.get()
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -863,6 +864,7 @@ def eagle_sample(
                 draft_support_probs=verify_input.draft_support_probs,
                 draft_support_tokens=verify_input.draft_support_tokens,
                 vocab_size=next_token_logits.shape[-1],
+                **({"block_verify": RS_BLOCK_VERIFY} if RS_BLOCK_VERIFY else {}),
             )
             if RS_DUMP_DIR:
                 from sglang.srt.speculative.rs_dump import record_verify
