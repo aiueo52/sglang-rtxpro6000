@@ -46,9 +46,10 @@ def _sum_compensated(left_hi, left_lo, right_hi, right_lo):
 def _draft_finalize_kernel(
     Keys, Temps, TopKs, TopPs, MinPs, Uniforms, HotTokens,
     Probs, Tokens, TopkP, TopkIndex, Positions, DraftTokens,
-    stride_q, stride_t, stride_u, stride_chain, column,
+    stride_q, stride_t, stride_u, stride_chain, column, temp_scale, onehot_above,
     CANDIDATES: tl.constexpr, K: tl.constexpr, KB: tl.constexpr,
     HAS_MIN_P: tl.constexpr, HAS_MAP: tl.constexpr,
+    HAS_TEMP_SCALE: tl.constexpr, HAS_ONEHOT: tl.constexpr,
     WRITE_POSITION: tl.constexpr, WRITE_CHAIN: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -63,7 +64,10 @@ def _draft_finalize_kernel(
     vals = tl.where(condition=ranks < K, x=bits.to(tl.float32, bitcast=True), y=-float("inf"))
     maximum = tl.max(vals, axis=0)
     temperature = tl.load(Temps + row).to(tl.float32)
-    temperature = tl.where(condition=temperature > 0, x=temperature, y=1.0)
+    if HAS_TEMP_SCALE:
+        temperature = tl.where(condition=temperature > 0, x=temperature * temp_scale, y=1.0)
+    else:
+        temperature = tl.where(condition=temperature > 0, x=temperature, y=1.0)
     weights = tl.where(condition=vals == maximum, x=1.0, y=tl.exp((vals - maximum) / temperature))
     top_k = tl.load(TopKs + row)
     weights = tl.where(condition=(ranks < K) & ((ranks < top_k) | (top_k <= 0)), x=weights, y=0.0)
@@ -78,6 +82,9 @@ def _draft_finalize_kernel(
         p0 = tl.sum(tl.where(condition=ranks == 0, x=probs, y=0.0), axis=0)
         probs = tl.where(condition=probs >= p0 * tl.load(MinPs + row), x=probs, y=0.0)
     probs = probs / tl.sum(probs, axis=0)
+    if HAS_ONEHOT:
+        p0 = tl.sum(tl.where(condition=ranks == 0, x=probs, y=0.0), axis=0)
+        probs = tl.where(condition=p0 >= onehot_above, x=(ranks == 0).to(tl.float32), y=probs)
     cdf = tl.cumsum(probs, axis=0)
     u = tl.load(Uniforms + row * stride_u) * tl.sum(probs, axis=0)
     pick = tl.min(tl.where(condition=(cdf > u) & (probs > 0), x=ranks, y=KB), axis=0)
@@ -129,7 +136,9 @@ def rs_draft_proposal_sparse(
     positions: torch.Tensor | None = None, draft_tokens: torch.Tensor | None = None,
     draft_token_column: int = 0, draft_support_probs: torch.Tensor | None = None,
     draft_support_tokens: torch.Tensor | None = None, topk_impl: str = "triton",
+    temp_scale: float = 1.0, onehot_above: float = 0.0,
 ):
+    assert temp_scale > 0 and 0 <= onehot_above <= 1
     assert next_token_logits.ndim == 2 and next_token_logits.stride(1) == 1
     n, vocab = next_token_logits.shape
     assert k > 0 and vocab > 0
@@ -173,8 +182,10 @@ def rs_draft_proposal_sparse(
         DraftTokens=draft_tokens if draft_tokens is not None else topk_index,
         stride_q=probs.stride(0), stride_t=tokens.stride(0), stride_u=uniforms.stride(0),
         stride_chain=draft_tokens.stride(0) if draft_tokens is not None else 0,
-        column=draft_token_column, CANDIDATES=keys.shape[1], K=k, KB=k_block,
+        column=draft_token_column, temp_scale=temp_scale, onehot_above=onehot_above,
+        CANDIDATES=keys.shape[1], K=k, KB=k_block,
         HAS_MIN_P=min_ps is not None, HAS_MAP=hot_token_id is not None,
+        HAS_TEMP_SCALE=temp_scale != 1.0, HAS_ONEHOT=onehot_above > 0,
         WRITE_POSITION=positions is not None, WRITE_CHAIN=draft_tokens is not None,
         BLOCK=triton.next_power_of_2(keys.shape[1]), num_warps=4,
     )

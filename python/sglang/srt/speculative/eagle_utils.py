@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.spec_tree import (
     verify_tree_greedy_kernel_triton,
 )
 from sglang.kernels.ops.speculative.topk1 import build_chain_tree_topk1
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
@@ -56,6 +57,7 @@ _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
+RS_DUMP_DIR = envs.SGLANG_RS_DUMP_DIR.get()
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -862,6 +864,22 @@ def eagle_sample(
                 draft_support_tokens=verify_input.draft_support_tokens,
                 vocab_size=next_token_logits.shape[-1],
             )
+            if RS_DUMP_DIR:
+                from sglang.srt.speculative.rs_dump import record_verify
+
+                tp_group = get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+                if tp_group.world_size != 1:
+                    raise ValueError("SGLANG_RS_DUMP_DIR supports TP = 1 only")
+                record_verify(
+                    directory=RS_DUMP_DIR, reqs=batch.reqs, candidates=candidates,
+                    target_probs=target_probs.view(bs, num_draft, sparse_kp),
+                    target_index=target_index.view(bs, num_draft, sparse_kp),
+                    draft_support_probs=verify_input.draft_support_probs,
+                    draft_support_tokens=verify_input.draft_support_tokens,
+                    accept_len=num_correct_drafts, temperatures=sampling_info.temperatures,
+                    top_ks=sampling_info.top_ks, top_ps=sampling_info.top_ps,
+                    min_ps=sampling_info.min_ps,
+                )
         else:
             tree_speculative_sampling_target_only_sparse(
                 predicts=predict,  # mutable

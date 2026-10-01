@@ -270,6 +270,10 @@ class SpeculativeAlgorithm(Enum):
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires rejection sampling")
             if envs.SGLANG_RS_DRAFT_TOPK.get() <= 0:
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires SGLANG_RS_DRAFT_TOPK > 0")
+            if not envs.SGLANG_RS_DRAFT_TEMP_SCALE.get() > 0:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires SGLANG_RS_DRAFT_TEMP_SCALE > 0")
+            if not 0 <= envs.SGLANG_RS_DRAFT_ONEHOT_ABOVE.get() <= 1:
+                raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires 0 <= SGLANG_RS_DRAFT_ONEHOT_ABOVE <= 1")
             if cfg.speculative_eagle_topk != 1:
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS requires speculative_eagle_topk == 1")
             if self not in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3) or cfg.enable_multi_layer_eagle:

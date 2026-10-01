@@ -1230,6 +1230,9 @@ class Envs:
     # Support cap of the truncated rejection-sampling draft proposal; 0 = the
     # untruncated proposal (A/B only: it also samples greedy requests' drafts).
     SGLANG_RS_DRAFT_TOPK = EnvInt(64)
+    SGLANG_RS_DRAFT_TEMP_SCALE = EnvFloat(1.0)
+    SGLANG_RS_DRAFT_ONEHOT_ABOVE = EnvFloat(0.0)
+    SGLANG_RS_DUMP_DIR = EnvStr("")
     # Honor min_p in the sampling verify and the RS draft proposal, as the
     # non-speculative sampler does; off = the verify's top-k/top-p only.
     SGLANG_SPEC_MIN_P = EnvBool(False)
