@@ -29,7 +29,11 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.speculative.spec_utils import SPEC_MIN_P, SPEC_SPARSE_VERIFY
+from sglang.srt.speculative.spec_utils import (
+    SPEC_MIN_P,
+    SPEC_SPARSE_TOPK,
+    SPEC_SPARSE_VERIFY,
+)
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -779,15 +783,16 @@ def eagle_sample(
 
         num_draft = verify_input.draft_token_num
         target_probs, target_index = sparse_target_probs(
-            next_token_logits,
-            sampling_info.temperatures,
-            sampling_info.top_ks,
-            sampling_info.top_ps,
-            sampling_info.min_ps,
-            num_draft,
-            sparse_kp,
+            logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            min_ps=sampling_info.min_ps,
+            num_draft_tokens=num_draft,
+            kp=sparse_kp,
             apply_top_p=sampling_info.need_top_p_sampling,
             apply_min_p=SPEC_MIN_P and sampling_info.need_min_p_sampling,
+            use_flashinfer_topk=SPEC_SPARSE_TOPK,
         )
         maybe_detect_nan(target_probs, "sparse verify: target_probs")
         coins, coins_for_final_sampling = _verify_coins(

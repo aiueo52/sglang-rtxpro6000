@@ -8,7 +8,8 @@ makes a full-row pass for the final draw. When every request has
 top_k <= KP, only the KP largest logits of a row can end up non-zero, so this
 path works on those:
 
-1. torch.topk over the logits (sorted, KP >= max top_k + a margin for ties).
+1. The KP largest logits, sorted (KP >= max top_k + a margin for ties):
+   torch.topk, or FlashInfer's radix top-k with SGLANG_OPT_SPEC_SPARSE_TOPK.
 2. `_sparse_target_probs_kernel`, one program per row: temperature, softmax
    over the kept entries, top-k keeping ties (FlashInfer: p >= pivot), top-p
    keeping ties (AIR top-p: p >= the value where the cumulative mass reaches
@@ -26,6 +27,7 @@ cut (KP leaves a margin of at least 8 entries past max top_k).
 import torch
 import triton
 import triton.language as tl
+from flashinfer import top_k as flashinfer_top_k
 
 # Largest top_k the sparse verify accepts; larger (or TOP_K_ALL) -> dense path.
 SPARSE_VERIFY_MAX_K = 248
@@ -95,10 +97,15 @@ def sparse_target_probs(
     kp: int,
     apply_top_p: bool,
     apply_min_p: bool,
+    use_flashinfer_topk: bool,
 ):
     """Returns (probs [N, kp] float32, token ids [N, kp] int64) for the
     N = bs * num_draft_tokens rows of `logits`."""
-    vals, idx = torch.topk(logits, kp, dim=-1, largest=True, sorted=True)
+    if use_flashinfer_topk:
+        # deterministic=True sorts inside the top-k kernel (no torch.sort + gather).
+        vals, idx = flashinfer_top_k(input=logits, k=kp, sorted=True, deterministic=True)
+    else:
+        vals, idx = torch.topk(input=logits, k=kp, dim=-1, largest=True, sorted=True)
     out = torch.empty((logits.shape[0], kp), dtype=torch.float32, device=logits.device)
     _sparse_target_probs_kernel[(logits.shape[0],)](
         vals,

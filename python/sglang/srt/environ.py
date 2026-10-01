@@ -1236,6 +1236,9 @@ class Envs:
     # Target-only sampling verify on the top-KP logits instead of full-vocabulary
     # probabilities, when every request has top_k <= 248; off = the dense verify.
     SGLANG_OPT_SPEC_SPARSE_VERIFY = EnvBool(False)
+    # FlashInfer radix top-k in that verify instead of torch.topk; the FlashInfer cache
+    # must already hold a built topk module, or the first call JIT-compiles it.
+    SGLANG_OPT_SPEC_SPARSE_TOPK = EnvBool(False)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
