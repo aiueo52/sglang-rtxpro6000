@@ -1121,6 +1121,10 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # Draft (MTP/NEXTN) MoE layers on the FlashInfer CUTLASS NVFP4 runner: run
+    # one-token calls as a W4A16 Triton GEMV (layers/moe/draft_moe_gemv.py).
+    # Changes draft numerics only (bf16 activations instead of FP4).
+    SGLANG_OPT_DRAFT_MOE_GEMV = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE

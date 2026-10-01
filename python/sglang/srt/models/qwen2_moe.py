@@ -429,6 +429,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             num_fused_shared_experts=self.num_fused_shared_experts,
             inplace=not _needs_hidden_after_experts,
         )
+        if is_nextn and envs.SGLANG_OPT_DRAFT_MOE_GEMV.get():
+            from sglang.srt.layers.moe.draft_moe_gemv import enable_draft_moe_gemv
+
+            enable_draft_moe_gemv(self.experts)
 
         gate_prefix = add_prefix("gate", prefix)
         gate_quant_config = None
