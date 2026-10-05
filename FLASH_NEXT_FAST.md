@@ -1,6 +1,6 @@
 # flash-next-fast branch
 
-This branch is a fork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) (itself a fork of [SGLang](https://github.com/sgl-project/sglang)). It adds a series of 105 commits on top of `16e5682aad` (`pennyroyal-main-sm120-final`, 2026-08-27) that speed up single-stream decoding of Qwen3.8-Flash-Next (NVFP4) on one NVIDIA RTX PRO 6000 Blackwell Max-Q.
+This branch is a fork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) (itself a fork of [SGLang](https://github.com/sgl-project/sglang)). It adds a series of 121 commits on top of `16e5682aad` (`pennyroyal-main-sm120-final`, 2026-08-27) that speed up single-stream decoding of Qwen3.8-Flash-Next (NVFP4) on one NVIDIA RTX PRO 6000 Blackwell Max-Q. Commits 1–105 are the 2026-09-08 measured state; 106–121 (2026-10-01/02) add the sampling-mode work (sparse verify, sparse rejection sampling, min_p in the speculative path) and the 2026-10-02 production build. Two comment-only commits (after 105 and after 121) add the modification headers and `MODIFICATIONS.md`.
 
 Many thanks to jpezzulli: this work builds directly on that fork.
 

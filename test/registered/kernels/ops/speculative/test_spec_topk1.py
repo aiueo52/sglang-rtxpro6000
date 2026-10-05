@@ -1,3 +1,4 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
