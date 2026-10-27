@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 import contextlib
 import logging
 import os
@@ -8,7 +9,10 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.speculative.sparse_rs import rs_draft_proposal_sparse
+from sglang.kernels.ops.speculative.sparse_rs import (
+    rs_draft_extend_proposal_sparse,
+    rs_draft_proposal_sparse,
+)
 from sglang.kernels.ops.speculative.topk1 import (
     draft_extend_select_topk1,
     draft_topk1_postprocess,
@@ -99,7 +103,16 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.mtp_recur_head import is_recur_head_mode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.vt_policy import vt_grammar_enabled, vt_tau
+from sglang.srt.speculative.dl_policy import dl_hostw_enabled, dl_tau
+from sglang.srt.speculative.hostw_policy import (
+    read_max_length,
+    select_verify_steps,
+    trim_draft_payload,
+    validate_hostw_config,
+)
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_sample,
@@ -173,6 +186,39 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def _validate_hostw_startup(server_args, *hf_configs):
+    if not dl_hostw_enabled():
+        return
+    decode = get_exec().graph.cuda_graph_config.decode
+    validate_hostw_config(
+        max_running_requests=get_schedule().max_running_requests,
+        decode_max_bs=decode.max_bs,
+        capture_bs=decode.bs,
+        disable_padding=server_args.disable_cuda_graph_padding,
+        index_sharing=any(
+            _qsa_index_share_requested(config)
+            or bool(getattr(config, "index_share_for_mtp_iteration", False))
+            for config in hf_configs
+        ),
+    )
+
+
+def _validate_vt_startup():
+    max_bs = get_schedule().max_running_requests
+    if max_bs == 1:
+        return
+    decode = get_exec().graph.cuda_graph_config.decode
+    if (
+        not max_bs
+        or decode.backend != Backend.FULL
+        or not set(range(1, max_bs + 1)).issubset(decode.bs or ())
+    ):
+        raise ValueError(
+            "VT with concurrent requests requires full CUDA graphs capturing every "
+            "batch size from 1 through --max-running-requests"
+        )
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -201,6 +247,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 raise ValueError("SGLANG_OPT_SPEC_SPARSE_RS does not support multi-layer EAGLE")
             logger.info(f"SGLANG_OPT_SPEC_SPARSE_RS on: sparse chain RS, draft support K={RS_DRAFT_TOPK}, temp_scale={RS_DRAFT_TEMP_SCALE}, onehot_above={RS_DRAFT_ONEHOT_ABOVE}, greedy_fast={RS_GREEDY_FAST}, block_verify={RS_BLOCK_VERIFY}")
         self.topk = get_spec().speculative_eagle_topk
+        self._vt_enabled = vt_tau() > 0
+        # Grammar-constrained requests run on the VT path unless SGLANG_RND_VT_GRAMMAR=0 (0/1 only, checked here at start).
+        self._vt_grammar = vt_grammar_enabled() if self._vt_enabled else True
+        self._dl_tau = dl_tau()
+        self._dl_enabled = self._dl_tau > 0
+        _validate_hostw_startup(server_args, target_worker.model_runner.model_config.hf_config)
+        if self._vt_enabled and (self.topk != 1 or not _is_cuda):
+            raise ValueError("VT requires CUDA and speculative_eagle_topk=1")
+        if self._vt_enabled:
+            _validate_vt_startup()
         if get_spec().speculative_use_rejection_sampling:
             assert self.topk == 1, "Chain speculative sampling supports only topk=1"
         self.speculative_num_steps = get_spec().speculative_num_steps
@@ -209,7 +265,46 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             get_spec().speculative_algorithm
         )
 
+        if self._vt_enabled:
+            hf_config = target_worker.model_runner.model_config.hf_config
+            architectures = (
+                getattr(hf_config, "architectures", None)
+                or getattr(getattr(hf_config, "text_config", None), "architectures", None)
+                or ()
+            )
+            if (
+                "Qwen4ExpForConditionalGeneration" not in architectures
+                or self.speculative_algorithm != SpeculativeAlgorithm.EAGLE
+                or server_args.enable_multi_layer_eagle
+                or getattr(server_args, "enable_lora", False)
+                or get_parallel().tp_size != 1
+                or get_parallel().pp_size != 1
+                or get_parallel().attn_dp_size != 1
+                or server_args.dp_size != 1
+            ):
+                raise ValueError(
+                    "VT requires single-GPU Qwen4ExpForConditionalGeneration, "
+                    "single-layer EAGLE/MTP, and no LoRA"
+                )
+
         self._rebuild_topk1_chain_buffers()
+        if self._vt_enabled:
+            # Sized from the scheduler's shared request pool before capture.
+            self._hostw_position0 = None
+        if self._dl_enabled:
+            from sglang.srt.speculative.dl_graph import require_conditional_support
+            from sglang.srt.speculative.vt_kernels import length_buffer
+
+            require_conditional_support()
+            if (
+                get_exec().graph.cuda_graph_config.decode.backend != Backend.FULL
+                or get_exec().features.enable_memory_saver
+            ):
+                raise ValueError("DL requires full CUDA graphs without memory saver")
+            self._dl_lengths = length_buffer(self._vt_conf_buf.device)
+            self._dl_product = torch.ones_like(self._dl_lengths, dtype=torch.float32)
+            self._dl_predicate = torch.zeros(1, dtype=torch.bool, device=self.device)
+            self._dl_forwards = torch.zeros(1, dtype=torch.int32, device=self.device)
 
         # Load draft model weights only.
         if (
@@ -259,6 +354,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # Chain tree build in the draft phase epilogue (build_tree_kernel_efficient).
         self._draft_tail_chain = envs.SGLANG_OPT_DRAFT_TAIL.get() and self.topk == 1
+        # SGLANG_OPT_RS_EXTEND_TAIL: the sparse-RS draft-extend tail reads its rows
+        # in-kernel; FUSED_CONF also takes p0 from that pass.
+        self._rs_extend_tail = self.sparse_rs and envs.SGLANG_OPT_RS_EXTEND_TAIL.get()
+        self._draft_extend_lens_fused = envs.SGLANG_OPT_DRAFT_EXTEND_LENS.get()
+        if self._draft_extend_lens_fused:
+            logger.info("SGLANG_OPT_DRAFT_EXTEND_LENS on: draft-extend lengths fused")
+        self._rs_extend_fused_conf = (
+            self._rs_extend_tail and envs.SGLANG_OPT_RS_EXTEND_FUSED_CONF.get()
+        )
+        if envs.SGLANG_OPT_RS_EXTEND_TAIL.get():
+            logger.info(
+                "SGLANG_OPT_RS_EXTEND_TAIL on: active %s, fused conf %s",
+                self._rs_extend_tail,
+                self._rs_extend_fused_conf,
+            )
         if envs.SGLANG_OPT_DRAFT_TAIL.get():
             logger.info(
                 "SGLANG_OPT_DRAFT_TAIL on: draft-extend select %s, fused conf %s, "
@@ -277,6 +387,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        if self._vt_enabled and get_schedule().max_running_requests > 1:
+            self._hostw_position0 = torch.zeros(
+                req_to_token_pool.req_to_token.shape[0],
+                dtype=torch.float32, device=self.device,
+            )
         self.draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -323,6 +438,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Populate DSA index-share fields from the draft runner's hf_config.
         # Reused by the attention unit-test harnesses, which skip __init__.
         hf_config = self.draft_runner.model_config.hf_config
+        if dl_hostw_enabled():
+            _validate_hostw_startup(self.server_args, hf_config)
         # Reuse the first draft step's DSA indexer topk across the rest;
         # topk == 1 only (select_top_k_tokens reorders rows, desyncing indices).
         self.index_share_for_mtp_iteration = (
@@ -352,10 +469,33 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def init_lm_head(self):
         from sglang.srt.lora.layers import unwrap_lora_layer
 
+        self.recur_hot_token_id = getattr(self, "recur_hot_token_id", None)
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = unwrap_lora_layer(
             getattr(self.target_worker.model_runner.model, "lm_head", None)
         )
+        self._draft_ctx_vocab = None
+        ctxv_rows = int(os.environ.get("SGLANG_RND_DRAFT_CTX_VOCAB", "0"))
+        if ctxv_rows < 0:
+            raise ValueError("SGLANG_RND_DRAFT_CTX_VOCAB must be nonnegative")
+        if ctxv_rows and (
+            self.speculative_algorithm != SpeculativeAlgorithm.EAGLE
+            or self.hot_token_id is None
+            or head.dtype != torch.float8_e4m3fn
+            or not head.is_cuda
+            or get_parallel().tp_size != 1
+            or get_parallel().pp_size != 1
+            or get_parallel().attn_dp_size != 1
+            or getattr(self.server_args, "enable_lora", False)
+            or any(
+                getattr(getattr(target_lm_head, "quant_method", None), name, False)
+                for name in ("use_marlin", "block_quant", "use_mxfp8")
+            )
+        ):
+            raise ValueError(
+                "SGLANG_RND_DRAFT_CTX_VOCAB requires single-layer EAGLE/MTP, "
+                "single-GPU CUDA per-row FP8 target rows, a speculative token map, and no LoRA"
+            )
 
         def maybe_share_target_lm_head():
             if (
@@ -383,6 +523,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.hot_token_id = self.draft_runner.model.hot_token_id.to(
                     embed.device
                 )
+            self._install_recur_head(target_lm_head)
 
         else:
             if self.hot_token_id is not None:
@@ -392,9 +533,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     # Gather the hot rows and keep them FP8 in the same layout so the
                     # draft head runs through the target's Fp8LinearMethod (W8A16 GEMV).
                     weight_scale = target_lm_head.weight_scale.reshape(-1).float()
-                    hot_rows = head.t()[self.hot_token_id].contiguous()  # [H, K] fp8
-                    hot_scale = weight_scale[self.hot_token_id].unsqueeze(1).contiguous()
-                    head = torch.nn.Parameter(hot_rows.t(), requires_grad=False)  # [K, H]
+                    if ctxv_rows:
+                        from sglang.srt.speculative.draft_context_vocab import (
+                            DraftContextVocab,
+                        )
+
+                        self._draft_ctx_vocab = DraftContextVocab(
+                            head, weight_scale, self.hot_token_id, ctxv_rows,
+                            separate_tail=_MTP_LMHEAD_NVFP4,
+                        )
+                        logger.info("Draft context vocabulary: %d fixed FIFO rows", ctxv_rows)
+                        if self._draft_ctx_vocab.target_topk:
+                            logger.info(
+                                "Draft context target candidates: top-%d after committed tokens",
+                                self._draft_ctx_vocab.target_topk,
+                            )
+                    if ctxv_rows and not _MTP_LMHEAD_NVFP4:
+                        self.hot_token_id = self._draft_ctx_vocab.hot_token_id
+                        hot_head = self._draft_ctx_vocab.weight
+                        hot_scale = self._draft_ctx_vocab.weight_scale
+                    else:
+                        hot_rows = head.t()[self.hot_token_id].contiguous()  # [H, K] fp8
+                        hot_head = hot_rows.t()
+                        hot_scale = weight_scale[self.hot_token_id].unsqueeze(1).contiguous()
+                    head = torch.nn.Parameter(hot_head, requires_grad=False)  # [K, H+R]
                     self._draft_fp8_head_scale = torch.nn.Parameter(
                         hot_scale, requires_grad=False
                     )
@@ -415,8 +577,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_lm_head.weight_scale = self._draft_fp8_head_scale
                 draft_lm_head.input_scale = None
                 draft_lm_head.quant_method = self._draft_fp8_head_method
+                if self._draft_ctx_vocab is not None and not _MTP_LMHEAD_NVFP4:
+                    draft_lm_head._rnd_ctx_vocab = self._draft_ctx_vocab
+                    self.draft_runner.model.logits_processor.vocab_size = (
+                        self.hot_token_id.numel()
+                    )
             if _MTP_LMHEAD_NVFP4 and self.hot_token_id is not None:
                 self._install_nvfp4_draft_head()
+                if self._draft_ctx_vocab is not None:
+                    # Pack only the immutable hot prefix. The FIFO keeps the
+                    # target FP8 bytes/scales, even if NVFP4 packing fell back.
+                    self.hot_token_id = self._draft_ctx_vocab.attach_head(
+                        self.draft_runner.model.lm_head, self.hot_token_id
+                    )
+                    self.draft_runner.model.logits_processor.vocab_size = (
+                        self.hot_token_id.numel()
+                    )
+                    logger.info(
+                        "Draft mixed lm_head: %d static rows + %d FP8 FIFO rows",
+                        len(self._draft_ctx_vocab.hot_ids), ctxv_rows,
+                    )
+            self._install_recur_head(target_lm_head)
             # Stage B runs *after* the draft head has been sliced, deliberately: the
             # draft slice is taken from the target's FP8 head, exactly as in production,
             # so the control arm is the shipped build and stage B is isolated to the
@@ -424,17 +605,93 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if _LMHEAD_NVFP4 and target_lm_head is not None:
                 self._install_nvfp4_target_head(target_lm_head)
 
+    def _install_recur_head(self, target_lm_head):
+        path = os.environ.get("SGLANG_RND_MTP_RECUR_HEAD")
+        if not path:
+            return
+        from sglang.srt.speculative.mtp_recur_head import (
+            RecurrentHeadLogitsProcessor,
+            build_fp8_recur_head,
+            build_nvfp4_recur_head,
+            load_recur_token_map,
+        )
+
+        try:
+            model = self.draft_runner.model
+            if (
+                type(model).__name__ != "Qwen4ExpForCausalLMMTP"
+                or self.speculative_algorithm != SpeculativeAlgorithm.EAGLE
+                or self.topk != 1
+                or getattr(self.server_args, "enable_multi_layer_eagle", False)
+                or getattr(self.server_args, "enable_lora", False)
+                or not _is_cuda
+                or get_parallel().tp_size != 1
+                or get_parallel().pp_size != 1
+                or get_parallel().attn_dp_size != 1
+            ):
+                raise ValueError("supported only for single-GPU, single-layer Qwen4 MTP EAGLE topk=1 without LoRA (not FrozenKV)")
+            if isinstance(model.logits_processor, RecurrentHeadLogitsProcessor):
+                raise ValueError("recurrent head is already installed; hot reload is unsupported")
+            vocab_size = self.target_worker.model_config.vocab_size
+            ctxv = getattr(self, "_draft_ctx_vocab", None)
+            first_rows = (
+                len(ctxv.hot_ids) if ctxv is not None
+                else self.hot_token_id.numel() if self.hot_token_id is not None else vocab_size
+            )
+            min_rows = RS_DRAFT_TOPK if self.sparse_rs else 1
+            ids = load_recur_token_map(
+                path, vocab_size=vocab_size, first_head_rows=first_rows, min_rows=min_rows,
+            )
+            device = model.lm_head.weight.device
+            if _MTP_LMHEAD_NVFP4:
+                method = model.lm_head.quant_method
+                method = getattr(method, "prefix_method", method)
+                if type(method).__name__ != "NVFP4DenseLinearMethod":
+                    raise ValueError("first MTP head fell back from NVFP4; keeping the same head for DECODE")
+                cache_dir = os.environ.get("SGLANG_NVFP4_CACHE_DIR")
+                if not cache_dir:
+                    raise ValueError("set SGLANG_NVFP4_CACHE_DIR to a private cache for recurrent NVFP4 packing")
+                recurrent_head = build_nvfp4_recur_head(
+                    self.target_worker.model_runner.model_config.model_path,
+                    ids, vocab_size=vocab_size, hidden_size=model.hidden_size, device=device,
+                )
+            else:
+                recurrent_head = build_fp8_recur_head(
+                    target_lm_head, ids, vocab_size=vocab_size, hidden_size=model.hidden_size,
+                )
+            from sglang.srt.layers.quantization.w8a16_gemv import prealloc
+
+            prealloc(device)
+            ids = ids.to(device)
+            if ctxv is not None:
+                ids = ctxv.attach_head(recurrent_head, ids)
+            processor = RecurrentHeadLogitsProcessor(model.logits_processor, recurrent_head)
+        except Exception as exc:
+            logger.warning(
+                "FLASH_NEXT_RECUR_HEAD (SGLANG_RND_MTP_RECUR_HEAD)=%s unavailable: %s; keeping the original MTP head and token map",
+                path, exc,
+            )
+            return
+        # Publish together, before either decode or extend graphs are captured.
+        model.logits_processor = processor
+        self.recur_hot_token_id = ids
+        logger.info(
+            "MTP recurrent head: %d rows in %s%s for DECODE only; first/extend head unchanged",
+            ids.numel(), "NVFP4" if _MTP_LMHEAD_NVFP4 else "FP8",
+            " + shared FP8 FIFO" if ctxv is not None else "",
+        )
+
     def _install_nvfp4_draft_head(self):
         """Replace the draft's hot-vocab FP8 head with an NVFP4 one (N1 stage A).
 
         The rows are re-read from the checkpoint shard rather than taken from the FP8
         head this method just built: `head` is already FP8 by the time we get here, and
-        quantising FP8 -> NVFP4 compounds two lossy steps and costs argmax
+        quantising FP8 -> NVFP4 compounds two lossy steps for ~2 points of argmax
         agreement (N1_LOG.md 4). The packed result is cached on disk keyed by shard
         identity + row set, so only the first start pays the ~2 s.
 
-        Measured: 1.487x on the draft-head GEMV (52.6 vs 78.3 us).
-        Off by default; SGLANG_MTP_LMHEAD_NVFP4=1 turns it on.
+        Measured: 1.487x on the draft-head GEMV (52.6 vs 78.3 us) for -0.64 % held-out
+        acceptance at k=7. Off by default; SGLANG_MTP_LMHEAD_NVFP4=1 turns it on.
         """
         from sglang.srt.layers.quantization.nvfp4_dense import (
             NVFP4DenseLinearMethod,
@@ -798,7 +1055,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
-    def draft(self, batch: ScheduleBatch):
+    def draft(self, batch: ScheduleBatch, hostw_states=None):
+        if hostw_states is not None and batch.seq_lens.shape[0] > 1:
+            raise ValueError("HOSTW requires a single unpadded request")
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
@@ -816,6 +1075,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             and draft_input.dsa_topk_indices is None
         ):
             can_run_decode_cuda_graph = False
+
+        if (
+            self._dl_enabled
+            and forward_batch.batch_size == 1
+            and self.speculative_num_steps > 1
+            and not forward_batch.forward_mode.is_idle()
+            and not can_run_decode_cuda_graph
+        ):
+            raise RuntimeError("DL requires a captured draft graph; eager runtime fallback is forbidden")
 
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
@@ -860,7 +1128,34 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 steps=self.speculative_num_steps,
             )
 
-        return build_eagle_verify_input(
+        verify_steps = self.speculative_num_steps
+        target_attn_backend = None
+        if hostw_states is not None and not batch.forward_mode.is_idle():
+            # All width-independent work (including strided batch copies) is
+            # queued before the sole host read. Never recapture in the hot path.
+            prepared = {
+                steps: (
+                    trim_draft_payload(steps, draft_tokens, draft_probs,
+                                       draft_support_probs, draft_support_tokens),
+                    parent_list[:, :steps].contiguous(),
+                    top_scores_index[:, :steps].contiguous(),
+                )
+                for steps, state in hostw_states.items()
+                if 0 < steps <= self.speculative_num_steps
+                and state.target_graph_runner is not None
+            }
+            length = read_max_length(self._dl_lengths, batch.seq_lens.shape[0])
+            verify_steps = select_verify_steps(
+                length, prepared, self.speculative_num_steps
+            )
+            payload, parent_list, top_scores_index = prepared[verify_steps]
+            draft_tokens = payload["draft_tokens"]
+            draft_probs = payload["draft_probs"]
+            draft_support_probs = payload["draft_support_probs"]
+            draft_support_tokens = payload["draft_support_tokens"]
+            target_attn_backend = hostw_states[verify_steps].target_attn_backend
+
+        verify_input = build_eagle_verify_input(
             batch=batch,
             draft_input=draft_input,
             parent_list=parent_list,
@@ -871,30 +1166,52 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_support_tokens=draft_support_tokens,
             target_worker=self.target_worker,
             topk=self.topk,
-            num_steps=self.speculative_num_steps,
-            num_draft_tokens=self.speculative_num_draft_tokens,
+            num_steps=verify_steps,
+            num_draft_tokens=verify_steps + 1 if hostw_states is not None else self.speculative_num_draft_tokens,
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
             chain_topk1=self._draft_tail_chain,
+            target_attn_backend=target_attn_backend,
+            **(
+                {"vt_confidence": self._vt_conf_buf}
+                if self._vt_enabled and batch.seq_lens.shape[0] == 1 else {}
+            ),
         )
+        if hostw_states is not None:
+            verify_input.draft_reserved_token_num = self.speculative_num_draft_tokens
+        return verify_input
 
     def _record_position0_confidence(self, next_token_logits: torch.Tensor):
         # C1: the confidence the adaptive controller decides on. This is the
         # only chain position whose probability exists before the next step's
         # state swap, because the draft loop itself is one captured CUDA graph.
-        if self._conf_channel is None:
+        if self._conf_channel is None and self._vt_position0 is None:
             return
-        p0 = top1_prob(next_token_logits)
-        self._conf_channel.record_position0(p0)
-        if self._chain_conf_buf is not None:
-            n = min(p0.shape[0], self._chain_conf_buf.shape[0])
-            self._chain_conf_buf[:n, 0].copy_(p0[:n])
+        self._store_position0_confidence(top1_prob(next_token_logits))
+
+    def _store_position0_confidence(self, p0: torch.Tensor):
+        if self._vt_position0 is not None:
+            if p0.shape[0] > self._vt_position0.shape[0]:
+                raise ValueError("VT position-0 batch exceeds launch dimensions")
+            # Keep the singleton launch row-ordered; concurrent launches also
+            # key p0 by request so singleton drafts survive batch filter/merge.
+            self._vt_position0[: p0.shape[0]].copy_(p0)
+            if self._hostw_position0 is not None:
+                self._hostw_position0.index_copy_(
+                    0, self._hostw_req_indices.to(torch.int64), p0
+                )
+        if self._conf_channel is not None:
+            self._conf_channel.record_position0(p0)
+            if self._chain_conf_buf is not None:
+                n = min(p0.shape[0], self._chain_conf_buf.shape[0])
+                self._chain_conf_buf[:n, 0].copy_(p0[:n])
 
     def _rs_draft_proposal(
         self,
         next_token_logits: torch.Tensor,
         sampling_info,
         out: Optional[torch.Tensor] = None,
+        hot_token_id: Optional[torch.Tensor] = None,
     ):
         """Rejection-sampling draft proposal on the target vocab.
 
@@ -903,6 +1220,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         hot_token_id). `out`, when given, must be zero-filled (bs, vocab) and
         receives q in place.
         """
+        if hot_token_id is None:
+            hot_token_id = self.hot_token_id
         bs = next_token_logits.shape[0]
         if RS_DRAFT_TOPK > 0:
             probs, ids, topk_p, topk_index = sample_draft_proposal_truncated(
@@ -913,13 +1232,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 RS_DRAFT_TOPK,
                 min_ps=sampling_info.min_ps if SPEC_MIN_P else None,
             )
-            if self.hot_token_id is not None:
-                ids = self.hot_token_id[ids]
+            if hot_token_id is not None:
+                ids = hot_token_id[ids]
         else:
             probs, topk_p, topk_index = sample_draft_proposal(
                 next_token_logits, sampling_info.temperatures
             )
-            ids = self.hot_token_id
+            ids = hot_token_id
             if ids is None:
                 if out is None:
                     return probs, topk_p, topk_index
@@ -931,7 +1250,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 dtype=torch.float32,
                 device=next_token_logits.device,
             )
-        if ids.dim() == 1:
+        if getattr(self, "_draft_ctx_vocab", None) is not None:
+            # Empty tail slots map to hot[0] but have zero probability. A copy
+            # would overwrite that token's real mass with a duplicate zero.
+            out.scatter_add_(1, ids.expand(bs, -1), probs.float())
+        elif ids.dim() == 1:
             out.index_copy_(1, ids, probs.float())
         else:
             out.scatter_(1, ids, probs)
@@ -957,6 +1280,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if forward_batch.forward_mode.is_idle():
             return self._draft_forward_idle(forward_batch, spec_info)
 
+        dl_enabled = self._dl_enabled and forward_batch.batch_size == 1
         out_cache_loc = forward_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
@@ -966,8 +1290,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         maybe_detect_nan(topk_p, "draft_forward: NaN in initial topk_p from spec_info")
 
-        if self.hot_token_id is not None:
+        if self.hot_token_id is not None and getattr(self, "_draft_ctx_vocab", None) is None:
             topk_index = self.hot_token_id[topk_index]
+
+        # The seed still came from the unchanged draft-extend head. Only logits
+        # produced by an own-HC DECODE below use the recurrent vocabulary.
+        decode_token_map = (
+            getattr(self, "recur_hot_token_id", None)
+            if is_recur_head_mode(forward_batch.forward_mode)
+            else None
+        )
+        if decode_token_map is None:
+            decode_token_map = self.hot_token_id
 
         out_cache_loc = per_step_draft_out_cache_loc(
             out_cache_loc,
@@ -1019,7 +1353,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         if (
             topk1_chain_fits
             and _is_cuda
-            and (self.sparse_rs or not get_spec().speculative_use_rejection_sampling)
+            and (dl_enabled or self.sparse_rs or not get_spec().speculative_use_rejection_sampling)
         ):
             draft_tokens_topk1 = torch.empty(
                 (topk_index.shape[0], self.speculative_num_steps),
@@ -1050,6 +1384,47 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else None
         )
 
+        vt_conf_buf = self._vt_conf_buf if forward_batch.batch_size == 1 else None
+        if vt_conf_buf is not None:
+            bs = topk_index.shape[0]
+            if (
+                bs > vt_conf_buf.shape[0]
+                or self.speculative_num_steps > vt_conf_buf.shape[1]
+            ):
+                raise ValueError("VT draft exceeds launch confidence dimensions")
+            # This copy is captured too: every replay consumes the latest p0.
+            p0 = (
+                self._hostw_position0[forward_batch.req_pool_indices.to(torch.int64)]
+                if self._hostw_position0 is not None else self._vt_position0[:bs]
+            )
+            vt_conf_buf[:bs, 0].copy_(p0)
+        topk1_conf_buf = vt_conf_buf if vt_conf_buf is not None else chain_conf_buf
+
+        if dl_enabled:
+            from sglang.srt.speculative.dl_graph import conditional_if
+            from sglang.srt.speculative.dl_kernels import advance
+
+            # Capture each existing width with its own threshold, not the
+            # launch width or C1's pre-stepup choice. Zero means no stopping.
+            dl_threshold = dl_tau(steps=self.speculative_num_steps)
+            if draft_tokens_topk1 is None or bs != 1:
+                raise ValueError("DL requires materialized topk=1 chains")
+            # Reset every replay, including after a longer adaptive-width stage.
+            # Zero is an in-range token ID, not a semantic padding token.
+            draft_tokens_topk1[:, 1:].zero_()
+            vt_conf_buf[:, 1:].zero_()
+            if chain_conf_buf is not None:
+                chain_conf_buf[:, 1:].zero_()
+            if draft_support_probs is not None:
+                draft_support_probs[:, 1:].zero_()
+                draft_support_tokens[:, 1:].zero_()
+            self._dl_product.fill_(1.0)
+            self._dl_lengths.zero_()
+            self._dl_forwards.zero_()
+            advance(vt_conf_buf[:bs], self._dl_product, self._dl_lengths,
+                    self._dl_predicate, self._dl_forwards, 0,
+                    self.speculative_num_steps, dl_threshold)
+
         # Forward multiple steps
         scores = None
         with IndexTopKShareState.mtp_iteration(
@@ -1071,108 +1446,133 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if i == self.speculative_num_steps - 1:
                     break
 
-                forward_batch.input_ids = input_ids
-                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-                # argument must be contiguous.
-                if (
-                    self.draft_runner.model_config.hf_config.architectures[0]
-                    == "Qwen3MoeForCausalLMMTP"
-                ):
-                    out_cache_loc = out_cache_loc.contiguous()
-                forward_batch.out_cache_loc = out_cache_loc[i]
-                spec_info.hidden_states = hidden_states
-
-                canary_index_ctx = (
-                    c.with_active_single_forward_manager(i)
-                    if (c := self.draft_runner.canary_manager) is not None
-                    else contextlib.nullcontext()
-                )
                 with (
-                    forward_context(
-                        ForwardContext(
-                            attn_backend=self.draft_attn_backend.attn_backends[i]
-                        )
-                    ),
-                    canary_index_ctx,
+                    conditional_if(self._dl_predicate)
+                    if dl_enabled else contextlib.nullcontext()
                 ):
-                    logits_output = self.draft_runner.forward(
-                        forward_batch
-                    ).logits_output
-                maybe_detect_nan(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
-                )
-                maybe_detect_inf(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
-                )
-                if self.sparse_rs:
-                    _, _, topk_p, topk_index = rs_draft_proposal_sparse(
-                        next_token_logits=logits_output.next_token_logits,
-                        temperatures=forward_batch.sampling_info.temperatures,
-                        top_ks=forward_batch.sampling_info.top_ks,
-                        top_ps=forward_batch.sampling_info.top_ps,
-                        min_ps=forward_batch.sampling_info.min_ps if SPEC_MIN_P else None,
-                        uniforms=uniforms[:, i], k=RS_DRAFT_TOPK,
-                        temp_scale=RS_DRAFT_TEMP_SCALE, onehot_above=RS_DRAFT_ONEHOT_ABOVE,
-                        **({"greedy_fast": True} if RS_GREEDY_FAST else {}),
-                        hot_token_id=self.hot_token_id, positions=forward_batch.positions,
-                        draft_tokens=draft_tokens_topk1, draft_token_column=i + 1,
-                        draft_support_probs=draft_support_probs[:, i + 1],
-                        draft_support_tokens=draft_support_tokens[:, i + 1],
+                    forward_batch.input_ids = input_ids
+                    # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
+                    # argument must be contiguous.
+                    if (
+                        self.draft_runner.model_config.hf_config.architectures[0]
+                        == "Qwen3MoeForCausalLMMTP"
+                    ):
+                        out_cache_loc = out_cache_loc.contiguous()
+                    forward_batch.out_cache_loc = out_cache_loc[i]
+                    spec_info.hidden_states = hidden_states
+
+                    canary_index_ctx = (
+                        c.with_active_single_forward_manager(i)
+                        if (c := self.draft_runner.canary_manager) is not None
+                        else contextlib.nullcontext()
                     )
-                elif get_spec().speculative_use_rejection_sampling:
-                    _, topk_p, topk_index = self._rs_draft_proposal(
-                        logits_output.next_token_logits,
-                        forward_batch.sampling_info,
-                        out=draft_probs[:, i + 1],
+                    with (
+                        forward_context(
+                            ForwardContext(
+                                attn_backend=self.draft_attn_backend.attn_backends[i]
+                            )
+                        ),
+                        canary_index_ctx,
+                    ):
+                        logits_output = self.draft_runner.forward(
+                            forward_batch
+                        ).logits_output
+                    maybe_detect_nan(
+                        logits_output.next_token_logits, f"draft_forward step {i}"
                     )
-                    forward_batch.positions.add_(1)
-                elif self.topk == 1 and not _is_hip:
-                    if _is_cuda:
-                        topk_p, topk_index = draft_topk1_postprocess(
+                    if getattr(self, "_draft_ctx_vocab", None) is None:
+                        maybe_detect_inf(
+                            logits_output.next_token_logits, f"draft_forward step {i}"
+                        )
+                    if (
+                        vt_conf_buf is not None
+                        and get_spec().speculative_use_rejection_sampling
+                    ):
+                        # Raw, untempered top-1 mass over every emitted logit, before
+                        # RS truncation, temperature scaling, or one-hot conversion.
+                        vt_conf_buf[:bs, i + 1].copy_(
+                            top1_prob(logits_output.next_token_logits)
+                        )
+                    if self.sparse_rs:
+                        _, _, topk_p, topk_index = rs_draft_proposal_sparse(
+                            next_token_logits=logits_output.next_token_logits,
+                            temperatures=forward_batch.sampling_info.temperatures,
+                            top_ks=forward_batch.sampling_info.top_ks,
+                            top_ps=forward_batch.sampling_info.top_ps,
+                            min_ps=forward_batch.sampling_info.min_ps if SPEC_MIN_P else None,
+                            uniforms=uniforms[:, i], k=RS_DRAFT_TOPK,
+                            temp_scale=RS_DRAFT_TEMP_SCALE, onehot_above=RS_DRAFT_ONEHOT_ABOVE,
+                            **({"greedy_fast": True} if RS_GREEDY_FAST else {}),
+                            hot_token_id=decode_token_map, positions=forward_batch.positions,
+                            draft_tokens=draft_tokens_topk1, draft_token_column=i + 1,
+                            draft_support_probs=draft_support_probs[:, i + 1],
+                            draft_support_tokens=draft_support_tokens[:, i + 1],
+                        )
+                    elif get_spec().speculative_use_rejection_sampling:
+                        _, topk_p, topk_index = self._rs_draft_proposal(
                             logits_output.next_token_logits,
-                            forward_batch.positions,
-                            draft_tokens_topk1,
-                            i + 1,
-                            hot_token_id=(
-                                self.hot_token_id
-                                if draft_tokens_topk1 is not None
-                                else None
-                            ),
-                            # C1 trace only: the kernel's argmax pass already
-                            # reads every logit, so the top-1 probability of
-                            # chain position i+1 comes out of the same
-                            # reduction.  ``None`` in production, and the
-                            # kernel specialises WRITE_PROB away.
-                            chain_probs=chain_conf_buf,
+                            forward_batch.sampling_info,
+                            out=draft_probs[:, i + 1],
+                            hot_token_id=decode_token_map,
                         )
-                    else:
-                        topk_index = torch.argmax(
-                            logits_output.next_token_logits, dim=-1, keepdim=True
-                        )
-                        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                         forward_batch.positions.add_(1)
-                else:
-                    probs = renorm_draft_probs(
-                        logits_output.next_token_logits,
-                        forward_batch.sampling_info,
-                        get_spec().speculative_use_rejection_sampling,
+                        if dl_enabled:
+                            if decode_token_map is not None:
+                                topk_index = decode_token_map[topk_index]
+                            draft_tokens_topk1[:, i + 1].copy_(topk_index.flatten())
+                    elif self.topk == 1 and not _is_hip:
+                        if _is_cuda:
+                            topk_p, topk_index = draft_topk1_postprocess(
+                                logits_output.next_token_logits,
+                                forward_batch.positions,
+                                draft_tokens_topk1,
+                                i + 1,
+                                hot_token_id=(
+                                    decode_token_map
+                                    if draft_tokens_topk1 is not None
+                                    else None
+                                ),
+                                # VT/C1: reduce all logits, including contextual
+                                # vocabulary rows, without changing greedy topk_p.
+                                # Both off: WRITE_PROB specialises away.
+                                chain_probs=topk1_conf_buf,
+                            )
+                            if vt_conf_buf is not None and chain_conf_buf is not None:
+                                chain_conf_buf[:bs, i + 1].copy_(
+                                    vt_conf_buf[:bs, i + 1]
+                                )
+                        else:
+                            topk_index = torch.argmax(
+                                logits_output.next_token_logits, dim=-1, keepdim=True
+                            )
+                            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                            forward_batch.positions.add_(1)
+                    else:
+                        probs = renorm_draft_probs(
+                            logits_output.next_token_logits,
+                            forward_batch.sampling_info,
+                            get_spec().speculative_use_rejection_sampling,
+                        )
+                        topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                        forward_batch.positions.add_(1)
+                    topk_index_vocab_size = (
+                        self.target_worker.model_config.vocab_size
+                        if draft_tokens_topk1 is not None and decode_token_map is not None
+                        else logits_output.next_token_logits.shape[-1]
                     )
-                    topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-                    forward_batch.positions.add_(1)
-                topk_index_vocab_size = (
-                    self.target_worker.model_config.vocab_size
-                    if draft_tokens_topk1 is not None and self.hot_token_id is not None
-                    else logits_output.next_token_logits.shape[-1]
-                )
-                maybe_detect_oob(
-                    topk_index,
-                    0,
-                    topk_index_vocab_size,
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={topk_index_vocab_size}",
-                )
-                if self.hot_token_id is not None and draft_tokens_topk1 is None:
-                    topk_index = self.hot_token_id[topk_index]
-                hidden_states = logits_output.hidden_states
+                    maybe_detect_oob(
+                        topk_index,
+                        0,
+                        topk_index_vocab_size,
+                        f"draft_forward step {i}: topk_index OOB vs vocab_size={topk_index_vocab_size}",
+                    )
+                    if decode_token_map is not None and draft_tokens_topk1 is None:
+                        topk_index = decode_token_map[topk_index]
+                    hidden_states = logits_output.hidden_states
+                    if dl_enabled:
+                        advance(vt_conf_buf[:bs], self._dl_product, self._dl_lengths,
+                                self._dl_predicate, self._dl_forwards, i + 1,
+                                self.speculative_num_steps, dl_threshold)
 
         # Organize the results
         if draft_tokens_topk1 is not None:
@@ -1246,10 +1646,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        if self._vt_position0 is not None:
+            self._hostw_req_indices = batch.req_pool_indices
         # Construct input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
+            ctxv = getattr(self, "_draft_ctx_vocab", None)
+            if ctxv is not None:
+                for req in batch.reqs:
+                    if getattr(req, "_rnd_ctxv_prefill_state", None) is not ctxv:
+                        # Include radix-cached prompt tokens, not just this chunk.
+                        ctxv.update_prefill(req.origin_input_ids)
+                        ctxv.update_prefill(req.output_ids)
+                        req._rnd_ctxv_prefill_state = ctxv
+                ctxv.update_committed(tail_tokens, None, 1)
             new_input_ids = torch.empty_like(batch.input_ids)
             pt = 0
             for i, extend_len in enumerate(batch.extend_lens):
@@ -1317,7 +1728,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
-        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
+        if getattr(self, "_draft_ctx_vocab", None) is None:
+            maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
+
+        if self._vt_position0 is not None:
+            self._record_position0_confidence(logits_output.next_token_logits)
 
         prefill_dsa_topk = None
         if seed_from_extend:
@@ -1339,6 +1754,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 logits_output.next_token_logits, batch.sampling_info, False
             )
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        if getattr(self, "_draft_ctx_vocab", None) is not None:
+            # Snapshot the token now: another batch's prefill may evict its
+            # tail row before this cached first proposal is consumed.
+            topk_index = self.hot_token_id[topk_index]
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1373,7 +1792,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ):
         # The topk == 1 branch of _draft_extend_for_decode in two launches; p0 is
         # top1_prob of the gathered rows (bit-exact) unless FUSED_CONF is on.
-        conf_on = self._conf_channel is not None
+        conf_on = self._conf_channel is not None or self._vt_position0 is not None
         topk_p, topk_index, hidden_states, rows, conf = draft_extend_select_topk1(
             next_token_logits=draft_logits_output.next_token_logits,
             hidden_states=draft_logits_output.hidden_states,
@@ -1384,18 +1803,82 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         if conf_on:
             p0 = conf if self._draft_tail_fused_conf else top1_prob(rows)
-            self._conf_channel.record_position0(p0)
-            if self._chain_conf_buf is not None:
-                n = min(p0.shape[0], self._chain_conf_buf.shape[0])
-                self._chain_conf_buf[:n, 0].copy_(p0[:n])
+            self._store_position0_confidence(p0)
         next_draft_input.topk_p = topk_p
-        next_draft_input.topk_index = topk_index
+        next_draft_input.topk_index = (
+            self.hot_token_id[topk_index]
+            if getattr(self, "_draft_ctx_vocab", None) is not None
+            else topk_index
+        )
         next_draft_input.hidden_states = hidden_states
+
+    def _rs_draft_extend_tail(
+        self,
+        next_draft_input: EagleDraftInput,
+        draft_logits_output: LogitsProcessorOutput,
+        accept_lens: torch.Tensor,
+        sampling_info,
+    ):
+        # The sparse_rs branch of _draft_extend_for_decode without the select_index
+        # gathers; p0 is top1_prob of the copied rows (bit-exact) unless FUSED_CONF.
+        conf_on = self._conf_channel is not None or self._vt_position0 is not None
+        logits = draft_logits_output.next_token_logits
+        support_probs, support_tokens, topk_p, topk_index, hidden_states, rows, conf = (
+            rs_draft_extend_proposal_sparse(
+                next_token_logits=logits,
+                accept_lens=accept_lens,
+                num_tokens_per_req=self.speculative_num_draft_tokens,
+                temperatures=sampling_info.temperatures,
+                top_ks=sampling_info.top_ks,
+                top_ps=sampling_info.top_ps,
+                min_ps=sampling_info.min_ps if SPEC_MIN_P else None,
+                uniforms=torch.rand((accept_lens.shape[0],), device=logits.device),
+                hot_token_id=self.hot_token_id,
+                k=RS_DRAFT_TOPK,
+                hidden_states=draft_logits_output.hidden_states,
+                write_rows=conf_on and not self._rs_extend_fused_conf,
+                write_prob=conf_on and self._rs_extend_fused_conf,
+                temp_scale=RS_DRAFT_TEMP_SCALE,
+                onehot_above=RS_DRAFT_ONEHOT_ABOVE,
+                greedy_fast=RS_GREEDY_FAST,
+            )
+        )
+        if conf_on:
+            p0 = conf if self._rs_extend_fused_conf else top1_prob(rows)
+            self._store_position0_confidence(p0)
+        next_draft_input.topk_p = topk_p
+        next_draft_input.topk_index = (
+            self.hot_token_id[topk_index]
+            if getattr(self, "_draft_ctx_vocab", None) is not None
+            else topk_index
+        )
+        next_draft_input.hidden_states = hidden_states
+        next_draft_input.draft_support_probs = support_probs
+        next_draft_input.draft_support_tokens = support_tokens
+        next_draft_input.draft_probs = None
+
+    def _update_context_from_verify(self, batch, batch_result):
+        ctxv = getattr(self, "_draft_ctx_vocab", None)
+        if ctxv is None or batch.forward_mode.is_idle():
+            return
+        # Preserve committed-token update order. Candidates are
+        # a second FIFO transaction, never a replacement for committed tokens.
+        ctxv.update_committed(
+            batch_result.next_token_ids,
+            batch_result.accept_lens,
+            self.speculative_num_draft_tokens,
+        )
+        topk_ids = getattr(batch_result, "draft_context_topk_ids", None)
+        if getattr(ctxv, "target_topk", 0) and topk_ids is not None:
+            ctxv.update_topk(topk_ids, batch_result.accept_lens)
 
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
+        if self._vt_position0 is not None:
+            self._hostw_req_indices = batch.req_pool_indices
+        self._update_context_from_verify(batch, batch_result)
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
@@ -1408,7 +1891,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         # The fused draft tail derives these rows from accept_lens in-kernel.
         select_index = None
-        if not self._draft_tail_select or self.seed_dsa_topk_from_draft_extend:
+        fused_select = self._draft_tail_select or self._rs_extend_tail
+        if not fused_select or self.seed_dsa_topk_from_draft_extend:
             select_index = (
                 torch.arange(
                     0,
@@ -1434,6 +1918,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
+                fused_lens=self._draft_extend_lens_fused,
             )
 
         if self.plan_stream:
@@ -1479,10 +1964,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             draft_logits_output.next_token_logits,
             f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
         )
-        maybe_detect_inf(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
-        )
+        if getattr(self, "_draft_ctx_vocab", None) is None:
+            maybe_detect_inf(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
+            )
 
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
@@ -1503,6 +1989,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 next_draft_input=batch_result.next_draft_input,
                 draft_logits_output=draft_logits_output,
                 accept_lens=batch_result.accept_lens,
+            )
+            if self.seed_dsa_topk_from_draft_extend:
+                batch_result.next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
+            return
+        if self._rs_extend_tail:
+            self._rs_draft_extend_tail(
+                next_draft_input=batch_result.next_draft_input,
+                draft_logits_output=draft_logits_output,
+                accept_lens=batch_result.accept_lens,
+                sampling_info=batch.sampling_info,
             )
             if self.seed_dsa_topk_from_draft_extend:
                 batch_result.next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
@@ -1546,6 +2042,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
+        if getattr(self, "_draft_ctx_vocab", None) is not None:
+            ret_topk_index = self.hot_token_id[ret_topk_index]
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
@@ -1579,6 +2077,9 @@ def _adaptive_split() -> frozenset:
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    # Off by default for subclasses that skip this __init__ (NgramChainWorkerV2, StandaloneWorkerV2).
+    _hostw_enabled: bool = False
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1629,6 +2130,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 config_path=get_spec().speculative_adaptive_config,
             )
 
+        self._hostw_enabled = dl_hostw_enabled()
+        if self._hostw_enabled and self.adaptive_controller is None:
+            raise ValueError("HOSTW requires --speculative-adaptive runtime states")
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -1653,6 +2158,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.draft_extend_attn_backend
             or self._draft_worker.draft_runner.attn_backend,
         )
+
+    def validate_dl_length_storage(self):
+        dw = self._draft_worker
+        if not dw._dl_enabled:
+            return
+        from sglang.srt.speculative.vt_kernels import (
+            assert_shared_length_storage,
+            length_buffer,
+        )
+
+        target_lengths = [
+            module._vt_lengths
+            for module in self._target_worker.model_runner.model.modules()
+            if getattr(module, "_vt_lengths", None) is not None
+        ]
+        if not target_lengths:
+            raise RuntimeError("DL target has no registered length storage")
+        sampler_lengths = length_buffer(dw._vt_conf_buf.device)
+        assert_shared_length_storage(dw._dl_lengths, sampler_lengths, *target_lengths)
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
@@ -1691,10 +2215,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     cuda_graph_bs=(
                         None
                         if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else target_model_runner.decode_cuda_graph_runner.capture_bs
+                        else get_batch_sizes_to_capture(
+                            target_model_runner, self.speculative_num_draft_tokens
+                        )[0]
                     ),
                     max_batch_size=target_model_runner.max_running_requests,
                 )
+        # One startup line for the 2-D draft path, only when one of its parts is on, so a production log shows
+        # which path the entry took (the verification harness reads the same attributes).
+        stepup = os.environ.get("SGLANG_RND_DL_STEPUP", "0") == "1"
+        dl = bool(getattr(self._draft_worker, "_dl_enabled", False))
+        vt = bool(getattr(self._draft_worker, "_vt_enabled", False))
+        hostw = bool(getattr(self, "_hostw_enabled", False))
+        if dl or vt or stepup or hostw:
+            widths = sorted(self.adaptive_controller._states) if self.adaptive_controller is not None else []
+            logger.info(
+                f"2-D tree: dl={int(dl)} vt={int(vt)} stepup={int(stepup)} hostw={int(hostw)} widths={widths}"
+            )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
@@ -1768,30 +2305,52 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                    if self._hostw_enabled:
+                        verify_input = self.draft_worker.draft(
+                            batch, hostw_states=self.adaptive_controller._states
+                        )
+                    else:
+                        verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            if (
-                self.speculative_num_steps == 0
-                and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
-            ):
-                self._stub_skipped_draft_extend(batch, batch_output)
-            else:
-                with (
-                    self.draft_worker.draft_tp_context(
-                        self.draft_worker.draft_runner.tp_group
-                    ),
-                    speculative_moe_backend_context(),
-                    speculative_moe_a2a_backend_context(),
-                    spec_stage_span("draft_extend"),
+            with self._hostw_runtime_state(verify_input.spec_steps):
+                batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+                # Publish before draft_extend so the fence is at verify-end.
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+                if (
+                    self.speculative_num_steps == 0
+                    and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    self.draft_worker._update_context_from_verify(batch, batch_output)
+                    self._stub_skipped_draft_extend(batch, batch_output)
+                else:
+                    with (
+                        self.draft_worker.draft_tp_context(
+                            self.draft_worker.draft_runner.tp_group
+                        ),
+                        speculative_moe_backend_context(),
+                        speculative_moe_a2a_backend_context(),
+                        spec_stage_span("draft_extend"),
+                    ):
+                        self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
             return batch_output
+
+    @contextlib.contextmanager
+    def _hostw_runtime_state(self, verify_steps):
+        if not self._hostw_enabled or verify_steps == self.speculative_num_steps:
+            yield
+            return
+        execution_state = self.adaptive_controller._states[self.speculative_num_steps]
+        verify_state = self.adaptive_controller._states[verify_steps]
+        # Extend must consume the same row stride as verify. Chain buffers are
+        # unused in these phases; keep their pointers for the next S-wide draft.
+        try:
+            self.apply_runtime_state(verify_state, rebuild_chain=False)
+            yield
+        finally:
+            self.apply_runtime_state(execution_state, rebuild_chain=False)
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
         """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
@@ -2057,7 +2616,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         return state
 
-    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+    def apply_runtime_state(self, state: SpecRuntimeState, *, rebuild_chain=True) -> None:
         """Apply a pre-built runtime state to this worker."""
         if self.speculative_num_steps == state.speculative_num_steps:
             return
@@ -2082,13 +2641,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 backend.drain_pending_recovery()
                 drained_backend_ids.add(id(backend))
 
-        log_info_on_rank0(
-            logger,
-            "Switch adaptive runtime state: "
-            f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
-            f"draft_tokens {self.speculative_num_draft_tokens} -> "
-            f"{state.speculative_num_draft_tokens}",
-        )
+        if rebuild_chain:
+            log_info_on_rank0(
+                logger,
+                "Switch adaptive runtime state: "
+                f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
+                f"draft_tokens {self.speculative_num_draft_tokens} -> "
+                f"{state.speculative_num_draft_tokens}",
+            )
 
         # Top-level
         self.speculative_num_steps = state.speculative_num_steps
@@ -2115,7 +2675,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 draft_attn_backend=state.draft_attn_backend,
                 draft_extend_attn_backend=state.draft_extend_attn_backend,
             )
-        dw._rebuild_topk1_chain_buffers()
+        if rebuild_chain:
+            dw._rebuild_topk1_chain_buffers()
 
         # Target side
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
@@ -2212,6 +2773,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch, grammar_barrier=None):
+        batch.spec_info.draft_context_vocab = (
+            getattr(self.draft_worker, "_draft_ctx_vocab", None) is not None
+        )
         return run_eagle_verify(
             batch,
             target_worker=self.target_worker,

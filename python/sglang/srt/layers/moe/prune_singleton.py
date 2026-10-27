@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """P1: drop routed-expert routes that are the sole user of their expert.
 
 The routed-expert grouped GEMM is at the expert-weight bandwidth roof and costs
@@ -36,6 +39,11 @@ capturable.  Only ``[min_rows, max_rows]`` batches are touched (default 2..64),
 which keeps the T=1 draft/decode calls -- where every route is a singleton by
 construction, i.e. a plain top-k cut -- and prefill out of it.
 
+VT supplies an optional device length L. Only rows < min(M, L+1) participate
+in either count implementation; MIN_ROWS/MAX_ROWS use that effective size too.
+Thus live routes match an actual short verify, even when dead-row hidden states
+change in later layers. Dead rows are always written as id -1 / weight 0.
+
 Env:
     SGLANG_MOE_PRUNE_SINGLETON_TAU   weight threshold; 0/unset disables (default 0)
     SGLANG_MOE_PRUNE_MIN_RANK        lowest 0-based within-row rank eligible (default 1)
@@ -59,8 +67,9 @@ step 6/7).  ``TAU``/``MIN_RANK``/``MIN_ROWS``/``MAX_ROWS`` are exported to the
 ``FLASHINFER_MOE_PRUNE_*`` variables the csrc reads (an explicitly set
 ``FLASHINFER_`` value wins), and this module's kernel becomes a no-op.  The csrc
 writes the dropped routes back as id -1 / weight 0, the same convention as here.
-If the fused prologue declines a call (batch > 32 rows, unsupported quant path,
-``FLASHINFER_MOE_FUSED_PROLOGUE=0`` ...), that call is simply not pruned.
+Without VT, a call the fused prologue declines (batch > 32 rows, unsupported
+quant path, ``FLASHINFER_MOE_FUSED_PROLOGUE=0`` ...) is not pruned, as before.
+With VT, the patched FlashInfer (flashinfer-overlays) uses a live-only standalone fallback.
 """
 
 from __future__ import annotations
@@ -134,9 +143,13 @@ def _prune_singleton_kernel(
     ids_ptr,
     w_ptr,
     cnt_ptr,
+    vt_lens_ptr,
     M,
     TAU_,
     MIN_RANK_,
+    MIN_ROWS_: tl.constexpr,
+    MAX_ROWS_: tl.constexpr,
+    HAS_VT: tl.constexpr,
     K: tl.constexpr,
     MP: tl.constexpr,
     KP: tl.constexpr,
@@ -144,6 +157,7 @@ def _prune_singleton_kernel(
     KEEP_IDS_: tl.constexpr,
     PAIRWISE_: tl.constexpr,
     USE_PDL: tl.constexpr,
+    BS: tl.constexpr = 1,
 ):
     """One CTA over the [M, k] top-k tile of a single MoE call.
 
@@ -173,7 +187,23 @@ def _prune_singleton_kernel(
     r = tl.arange(0, MP)
     c = tl.arange(0, KP)
     off = r[:, None] * K + c[None, :]
-    m = (r[:, None] < M) & (c[None, :] < K)
+    live_rows = M
+    live = r < M
+    can_prune = True
+    if HAS_VT:
+        if BS == 1:
+            live_rows = tl.minimum(M, tl.maximum(tl.load(vt_lens_ptr), 0) + 1)
+            live = r < live_rows
+        else:
+            rowsper = M // BS
+            cap = tl.maximum(
+                tl.load(vt_lens_ptr + r // rowsper, mask=r < M, other=-1), 0
+            )
+            live = (r < M) & (r % rowsper <= cap)
+            live_rows = tl.sum(live.to(tl.int32), axis=0)
+        can_prune = (live_rows >= MIN_ROWS_) & (live_rows <= MAX_ROWS_)
+    physical = (r[:, None] < M) & (c[None, :] < K)
+    m = live[:, None] & (c[None, :] < K)
     ids = tl.load(ids_ptr + off, mask=m, other=SENTINEL_)
     w = tl.load(w_ptr + off, mask=m, other=0.0).to(tl.float32)
 
@@ -186,22 +216,31 @@ def _prune_singleton_kernel(
     if PAIRWISE_:
         cnt = tl.zeros([MP, KP], tl.int32)
         for rp in tl.static_range(MP):
-            orow = tl.load(ids_ptr + rp * K + c, mask=(c < K) & (rp < M),
+            if HAS_VT and BS > 1:
+                rp_cap = tl.maximum(
+                    tl.load(vt_lens_ptr + rp // rowsper, mask=rp < M, other=-1), 0
+                )
+                rp_live = (rp < M) & (rp % rowsper <= rp_cap)
+            else:
+                rp_live = rp < live_rows
+            orow = tl.load(ids_ptr + rp * K + c, mask=(c < K) & rp_live,
                            other=SENTINEL_ - 1)
             cnt += tl.sum((ids[:, :, None] == orow[None, None, :]).to(tl.int32),
                           axis=2)
     else:
-        tl.atomic_add(cnt_ptr + ids, 1, mask=m)
+        valid_id = m & (ids >= 0) if HAS_VT else m
+        tl.atomic_add(cnt_ptr + ids, 1, mask=valid_id)
         tl.debug_barrier()
-        cnt = tl.load(cnt_ptr + ids, mask=m, other=0, cache_modifier=".cg")
+        cnt = tl.load(cnt_ptr + ids, mask=valid_id, other=0, cache_modifier=".cg")
         tl.debug_barrier()
-        tl.atomic_xchg(cnt_ptr + ids, 0, mask=m)
+        tl.atomic_xchg(cnt_ptr + ids, 0, mask=valid_id)
 
-    prune = m & (cnt == 1) & (w < TAU_) & (rank >= MIN_RANK_)
+    prune = m & can_prune & (cnt == 1) & (w < TAU_) & (rank >= MIN_RANK_)
     tl.debug_barrier()          # every load above precedes every store below
-    if not KEEP_IDS_:
-        tl.store(ids_ptr + off, tl.where(prune, SENTINEL_, ids), mask=m)
-    tl.store(w_ptr + off, tl.where(prune, 0.0, w).to(w_ptr.dtype.element_ty), mask=m)
+    if not KEEP_IDS_ or HAS_VT:
+        out_ids = ids if KEEP_IDS_ else tl.where(prune, SENTINEL_, ids)
+        tl.store(ids_ptr + off, out_ids, mask=physical)
+    tl.store(w_ptr + off, tl.where(prune, 0.0, w).to(w_ptr.dtype.element_ty), mask=physical)
     pdl_trigger(USE_PDL)
 
 
@@ -211,11 +250,13 @@ def _skip(reason: str) -> None:
         logger.warning("moe singleton prune disabled for this shape: %s", reason)
 
 
-def maybe_prune_singleton_routes(topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> None:
-    """In-place mask of low-weight singleton routes.  No-op unless enabled."""
+def maybe_prune_singleton_routes(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, vt_lens: torch.Tensor | None = None
+) -> None:
+    """In-place singleton mask, counting only VT's live rows when supplied."""
     if not ENABLED:
         return
-    prune_singleton_routes_(topk_ids, topk_weights, TAU, MIN_RANK, MIN_ROWS, MAX_ROWS)
+    prune_singleton_routes_(topk_ids, topk_weights, TAU, MIN_RANK, MIN_ROWS, MAX_ROWS, vt_lens)
 
 
 def prune_singleton_routes_(
@@ -225,13 +266,25 @@ def prune_singleton_routes_(
     min_rank: int = 1,
     min_rows: int = 2,
     max_rows: int = 64,
+    vt_lens: torch.Tensor | None = None,
 ) -> None:
     """The kernel itself, independent of the env gating (used by the P2 equivalence test)."""
     if topk_ids.dim() != 2 or topk_weights.shape != topk_ids.shape:
         return _skip(f"shape {tuple(topk_ids.shape)}/{tuple(topk_weights.shape)}")
     M, K = topk_ids.shape
-    if M < min_rows or M > max_rows:
+    if M == 0 or (vt_lens is None and (M < min_rows or M > max_rows)):
         return
+    bs = 1
+    if vt_lens is not None:
+        if (
+            vt_lens.dim() != 1 or vt_lens.numel() < 1 or vt_lens.dtype != torch.int32
+            or not vt_lens.is_contiguous() or not vt_lens.is_cuda
+            or vt_lens.device != topk_ids.device
+        ):
+            raise ValueError("VT singleton pruning requires CUDA int32 [bs] lengths on the route device")
+        bs = vt_lens.numel()
+        if bs > 1 and (M < bs or M % bs != 0):
+            raise ValueError("VT singleton pruning requires nonempty equal-sized per-request rows")
     if not (topk_ids.is_contiguous() and topk_weights.is_contiguous()):
         return _skip("non-contiguous top-k tensors")
     dev = topk_ids.device
@@ -252,9 +305,14 @@ def prune_singleton_routes_(
         topk_ids,
         topk_weights,
         cnt if cnt is not None else topk_ids,   # unused when PAIRWISE_
+        vt_lens if vt_lens is not None else topk_ids,
         M,
         tau,
         min_rank,
+        MIN_ROWS_=min_rows,
+        MAX_ROWS_=max_rows,
+        HAS_VT=vt_lens is not None,
+        BS=bs,
         K=K,
         MP=MP,
         KP=KP,
@@ -266,9 +324,17 @@ def prune_singleton_routes_(
         launch_pdl=PDL,
     )
     if RENORM:
-        topk_weights.div_(
-            topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        )
+        denominator = topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        if vt_lens is not None:
+            # A physical one-row call skips normalization together with pruning.
+            if bs == 1:
+                live_rows = (vt_lens.clamp_min(0) + 1).clamp_max(M)
+            else:
+                live_rows = (vt_lens.clamp_min(0) + 1).clamp_max(M // bs).sum()
+            denominator = torch.where(
+                (live_rows >= min_rows) & (live_rows <= max_rows), denominator, 1.0
+            )
+        topk_weights.div_(denominator)
 
 
 def describe() -> str:

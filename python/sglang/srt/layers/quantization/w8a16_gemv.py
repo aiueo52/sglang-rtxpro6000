@@ -1,5 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Triton W8A16 skinny GEMM: y[M,N] = x[M,K](bf16) @ W[N,K](fp8 e4m3)^T * scale[N] (fp32).
-Targets decode/verify shapes (M <= 16). Weight-only FP8: no activation quantization.
+Targets decode/verify shapes (M <= 32, opt-in above 16). Weight-only FP8: no activation quantization.
 
 Two properties of the decode shapes decide throughput here:
 
@@ -52,7 +55,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 #: still read by exactly one CTA running the same k loop, so the output is
 #: bit-identical -- only the (pid_n -> columns) map changes.
 #:
-#: Measured (server A/B 2026-09-06, in_proj_ba grid [3,1,1] -> [4,1,1], CUPTI
+#: Measured (server A/B, in_proj_ba grid [3,1,1] -> [4,1,1], CUPTI
 #: medians): W16 code-edit 7.82 -> 7.61 us/call, W16 prose-en 7.43 -> 7.23,
 #: W4 code-edit 5.82 -> 5.84, W4 prose-en 5.61 -> 6.16. So it recovers ~0.2 us
 #: of the 0.9 us the split costs at M=16 and is neutral-to-noise at M=4.
@@ -60,6 +63,22 @@ def _env_flag(name: str, default: str = "0") -> bool:
 #: is the right shape for any future two-destination split that is not
 #: launch-bound at 3-4 CTAs.
 BA_SPLIT_GRID = _env_flag("SGLANG_GEMV_BA_SPLIT_GRID")
+
+W8A16_GEMV_MAX_M = int(os.environ.get("SGLANG_FP8_W8A16_GEMV_MAX_M", "16"))
+if W8A16_GEMV_MAX_M > 32:
+    raise ValueError("SGLANG_FP8_W8A16_GEMV_MAX_M must be <= 32")
+
+
+def _m_limit() -> int:
+    from sglang.srt.model_executor.forward_context import get_gemv_m_limit
+
+    # Below 16 the callers' own gates still decide, as before.
+    return get_gemv_m_limit(max(16, W8A16_GEMV_MAX_M))
+
+
+def _m_pad(M: int, use_dot: bool) -> int:
+    # Preserve the existing M=1 dot plans as well as the broadcast plans.
+    return 32 if M > 16 else (16 if (use_dot or M > 1) else 1)
 
 
 @triton.jit
@@ -324,8 +343,8 @@ def _w8a16_gemv_kernel(
 
 # Split-K scratch, allocated once per device and reused: the fixup CTA leaves the
 # counters at 0, so nothing has to be cleared between calls. Sized for the largest
-# plan _plan can emit (MAX_N_BLOCKS n blocks x MAX_SPLITS splits x 16 rows x 128 wide
-# would be 8 M floats; the planner caps the product at _WS_FLOATS instead).
+# plan _plan can emit (MAX_N_BLOCKS n blocks x MAX_SPLITS splits x M_PAD rows x BLOCK_N wide
+# is bounded by _WS_FLOATS for plans that use split-K).
 _WS_FLOATS = 1 << 21
 _WS_COUNTERS = 4096
 _MAX_SPLITS = 32
@@ -405,7 +424,7 @@ def _num_sms(device) -> int:
 
 
 def _m_bucket(M: int) -> int:
-    return 1 if M == 1 else (4 if M <= 4 else 16)
+    return 1 if M == 1 else (4 if M <= 4 else (16 if M <= 16 else 32))
 
 
 # Measured on RTX PRO 6000 Blackwell Max-Q (sm_120, 188 SMs) with
@@ -432,7 +451,7 @@ _BY_SHAPE = {
     (1, False, 248320, 2560): (128, 256, 1, True, None, 8, 3),  # lm_head, 1.02x
     # bf16, bf16_gemv
     # GDN in_proj_ba: the bench's split-K winner (16,256,10,...,2,4) measured 9.2us in the
-    # server vs 7.9us for this single-launch tile (2026-09-03 gemv3 trace), so keep it.
+    # server vs 7.9us for this single-launch tile (GEMV trace), so keep it.
     (2, False, 96, 2560): (32, 512, 1, True, None, 4, 3),
     (2, False, 512, 2560): (16, 128, 10, True, None, 2, 4),  # MoE router gate, 1.04x
     # The 2560x6144 out_proj/o_proj and the 13312x2560 attention qkv are absent at
@@ -446,6 +465,19 @@ _BY_SHAPE_M16 = {
     # attention qkv at M=16: both the wide (128,256,8w) tile and the (64,128) qkvz tile
     # measured 27.5us in the server vs 25.6us for the narrow single-split tile; pin it.
     (1, False, 13312, 2560): (32, 128, 1, True, None, 4, 3),
+}
+# Bucket 32 is deliberately independent of the measured <=16-row tables.
+# 32-row tuning: a winner replaced the planner
+# default only when it was >= 2% faster. The 3-stage 128x256 tiles exceed the planner's
+# conservative staged-bf16 bound but compile and pass the sweep's error check.
+_BY_SHAPE_M32 = {
+    # attention qkv: the provisional seed, 24.75 us; the best tile was 24.64 us (<2%).
+    (1, False, 13312, 2560): (64, 128, 1, True, None, 4, 3),
+    (1, False, 16384, 2560): (128, 256, 1, True, None, 8, 3),  # GDN in_proj_qkvz, 1.11x
+    (1, False, 32768, 2560): (128, 256, 1, True, None, 4, 2),  # draft lm_head, 1.03x
+    (1, False, 2560, 6144): (64, 128, 4, True, None, 4, 3),  # out_proj/o_proj, 14.3 vs ~18 us
+    (1, False, 2560, 640): (16, 128, 1, True, None, 4, 3),  # shared-expert down, 3.7 vs 5.3 us
+    (1, False, 1280, 2560): (16, 128, 4, True, None, 4, 3),  # shared gate_up, 5.8 vs 8.0 us
 }
 _BY_SHAPE_M1 = {
     # USE_DOT False (the broadcast path, M_PAD 1) is only legal at M == 1.
@@ -470,6 +502,7 @@ def _expand(table, buckets):
 _TUNED = _expand(_BY_SHAPE, (1, 4, 16))
 _TUNED.update(_expand(_BY_SHAPE_M16, (16,)))
 _TUNED.update(_expand(_BY_SHAPE_M1, (1,)))
+_TUNED.update(_expand(_BY_SHAPE_M32, (32,)))
 
 
 def _prev_pow2(v: int) -> int:
@@ -487,6 +520,8 @@ def _plan(M: int, N: int, K: int, contig_n: bool, w_bytes: int, sms: int):
         # full with, since 32 fp8 columns is only one 32 B sector per k. Untuned:
         # no caller produces this layout.
         block_n = 128 if N >= 2048 else (64 if N >= 512 else 32)
+        if _m_bucket(M) == 32:
+            return _fit(M, N, (min(block_n, 64), 128, 1, True, None, 4, 2))
         return _fit(M, N, (block_n, 128, 1, True, None, 8, 3))
     # [N, K] contiguous. When N alone fills the machine, a long BLOCK_K keeps more
     # bytes in flight: 1.15x on the 32768x2560 draft head, 1.01-1.04x on the other
@@ -495,6 +530,13 @@ def _plan(M: int, N: int, K: int, contig_n: bool, w_bytes: int, sms: int):
     if triton.cdiv(N, 128) * 2 >= sms and _m_bucket(M) != 4:
         if M == 1:
             return (32, 256, 1, False, None, 4, 3)
+        if _m_bucket(M) == 32:
+            # sm_120 has 99 KiB of shared memory. Avoid the wide 128x256,
+            # three-stage fallback: conservatively count bf16 dot operands,
+            # 2 stages * (32 + 64) * 128 * 2 B = 48 KiB (80 KiB for
+            # the two-weight SiLU variant). Keep room for compiler scratch.
+            # This is a host-side bound; GPU compilation is checked later.
+            return (64, 128, 1, True, None, 4, 2)
         # A [128, 256] bf16 tile needs 144 KB of smem, over the 99 KB sm_120 limit.
         return (128 if w_bytes == 1 else 64, 256, 1, True, None, 8, 3)
     use_dot = M > 1
@@ -522,7 +564,7 @@ def _fit(M: int, N: int, cfg, n_blocks: Optional[int] = None):
     block_n, block_k, splits, use_dot, w_kn, warps, stages = cfg
     if splits == 1:
         return cfg
-    m_pad = 16 if (use_dot or M > 1) else 1
+    m_pad = _m_pad(M, use_dot)
     if n_blocks is None:
         n_blocks = triton.cdiv(N, block_n)
     if (
@@ -537,7 +579,7 @@ def _fit(M: int, N: int, cfg, n_blocks: Optional[int] = None):
 def _launch(x, w, s, y, M, N, K, per_channel, cfg, y2=None, split_n=0, norm=None):
     block_n, block_k, splits, use_dot, w_kn, num_warps, num_stages = cfg
     use_dot = use_dot or M > 1
-    m_pad = 16 if use_dot else 1
+    m_pad = _m_pad(M, use_dot)
     ws, cnt = _workspace(x.device)
     n_blocks = triton.cdiv(N, block_n)
     seg_nb0 = 0
@@ -655,7 +697,7 @@ def w8a16_gemv(
     """
     M, K = x.shape
     N = w.shape[0]
-    assert w.shape[1] == K and M <= 16
+    assert w.shape[1] == K and M <= _m_limit()
     y, y2, split_n = _split_dests(out, out2, split_n, M, N, x.device)
     s = scale.reshape(-1)
     if s.dtype != torch.float32 or not s.is_contiguous():
@@ -705,7 +747,7 @@ NORM_INTO_GEMV = _env_flag("SGLANG_NORM_INTO_GEMV")
 #
 # In the server the norm launch costs 1.88 us (W4) / 1.98 us (W16) rather than
 # the 1.3-1.5 us it costs here, so the fold is worth more there. Server A/B
-# (2026-09-06, out_proj grid [80,6,1] -> [40,4,1], CUPTI medians per call):
+# (out_proj grid [80,6,1] -> [40,4,1], CUPTI medians per call):
 #
 #   profile / workload   plain + norm            fused    delta
 #   W4  code-edit        13.84 + 1.88 = 15.72    14.13    -1.59
@@ -761,7 +803,7 @@ def w8a16_gemv_norm_gated_supported(
         and x.dim() == 2
         and x.dtype == torch.bfloat16
         and z.dtype == torch.bfloat16
-        and 1 <= x.shape[0] <= 16
+        and 1 <= x.shape[0] <= _m_limit()
         and tuple(z.shape) == tuple(x.shape)
         and x.stride(1) == 1
         and z.stride(1) == 1
@@ -797,7 +839,7 @@ def w8a16_gemv_norm_gated(
     """
     M, K = x.shape
     N = w.shape[0]
-    assert w.shape[1] == K and M <= 16
+    assert w.shape[1] == K and M <= _m_limit()
     y = _out_or_new(out, M, N, x.device)
     s = scale.reshape(-1)
     if s.dtype != torch.float32 or not s.is_contiguous():
@@ -832,10 +874,10 @@ def bf16_gemv(
     split_n: int = 0,
 ):
     """Skinny BF16 GEMM y = x @ w^T for tiny-N linears where cuBLAS picks a poor kernel.
-    x: [M,K] bf16 (M<=16); w: [N,K] bf16. ``out2``/``split_n``: see w8a16_gemv."""
+    x: [M,K] bf16 (M<=max(16, SGLANG_FP8_W8A16_GEMV_MAX_M)); w: [N,K] bf16. ``out2``/``split_n``: see w8a16_gemv."""
     M, K = x.shape
     N = w.shape[0]
-    assert w.shape[1] == K and M <= 16
+    assert w.shape[1] == K and M <= _m_limit()
     y, y2, split_n = _split_dests(out, out2, split_n, M, N, x.device)
     one = _ONES.get(x.device)
     if one is None:
@@ -988,6 +1030,10 @@ def _fused_plan(M: int, N: int, K: int, sms: int):
     # (each CTA covers two columns now) and keeping its split-K choice.
     cfg = _plan(M, N, K, False, 1, sms)
     block_n, block_k, splits, use_dot, _w_kn, warps, stages = cfg
+    if _m_bucket(M) == 32:
+        # Two bf16 weight operands also need headroom for the provisional
+        # 64x128 qkv seed, whose plain plan uses three stages.
+        stages = min(stages, 2)
     return _fit_fused(M, N // 2, (block_n, block_k, splits, use_dot, None, warps, stages))
 
 
@@ -995,7 +1041,7 @@ def _fit_fused(M: int, H: int, cfg):
     block_n, block_k, splits, use_dot, w_kn, warps, stages = cfg
     if splits == 1:
         return cfg
-    m_pad = 16 if (use_dot or M > 1) else 1
+    m_pad = _m_pad(M, use_dot)
     n_blocks = triton.cdiv(H, block_n)
     if (
         splits > _MAX_SPLITS
@@ -1011,14 +1057,14 @@ def w8a16_gemv_silu_mul(
 ):
     """silu(x @ w[:H].T * s[:H]) * (x @ w[H:].T * s[H:]) in one launch.
 
-    x: [M,K] bf16 (M<=16); w: [N,K] fp8_e4m3 with N = 2H and the gate half first
+    x: [M,K] bf16 (M<=max(16, SGLANG_FP8_W8A16_GEMV_MAX_M)); w: [N,K] fp8_e4m3 with N = 2H and the gate half first
     (the MergedColumnParallelLinear [gate|up] layout); scale: [N] or [N,1] fp32.
     Returns [M, H] bf16. The activation is evaluated in fp32 on the unrounded
     accumulators, so the result is at least as accurate as gemv-then-act_and_mul.
     """
     M, K = x.shape
     N = w.shape[0]
-    assert w.shape[1] == K and M <= 16 and N % 2 == 0
+    assert w.shape[1] == K and M <= _m_limit() and N % 2 == 0
     H = N // 2
     y = torch.empty((M, H), dtype=torch.bfloat16, device=x.device)
     s = scale.reshape(-1)
@@ -1029,7 +1075,7 @@ def w8a16_gemv_silu_mul(
         cfg = _fused_plan(M, N, K, _num_sms(x.device))
     block_n, block_k, splits, use_dot, _w_kn, num_warps, num_stages = cfg
     use_dot = use_dot or M > 1
-    m_pad = 16 if use_dot else 1
+    m_pad = _m_pad(M, use_dot)
     ws, cnt = _workspace(x.device)
     _w8a16_gemv_silu_kernel[(triton.cdiv(H, block_n), splits)](
         x,
@@ -1062,14 +1108,14 @@ def w8a16_gemv_silu_mul(
 
 
 def w8a16_gemv_silu_mul_supported(
-    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, max_m: int = 16
+    x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor, max_m: Optional[int] = None
 ) -> bool:
     """Whether this (x, [N, K] fp8 weight, per-channel scale) can take the fused path."""
     return (
         x.is_cuda
         and x.dim() == 2
         and x.dtype == torch.bfloat16
-        and 1 <= x.shape[0] <= max_m
+        and 1 <= x.shape[0] <= (_m_limit() if max_m is None else min(max_m, _m_limit()))
         and w.dtype == torch.float8_e4m3fn
         and w.dim() == 2
         and w.shape[1] == x.shape[1]

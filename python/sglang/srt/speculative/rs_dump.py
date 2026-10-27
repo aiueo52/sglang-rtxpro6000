@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Post-verify sparse RS dumps for offline analysis; supports TP = 1 only.
 
 Each chunk contains up to 50 CPU records. Normal process exit flushes the tail;

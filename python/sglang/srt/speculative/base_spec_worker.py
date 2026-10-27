@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import logging
@@ -68,6 +69,15 @@ class EagleDraftWorkerBase(ABC):
     # already-captured draft graph writes into.
     _chain_conf_buf: Optional[torch.Tensor] = None
     _conf_channel = None
+    # VT stays device-only and independent of the optional C1 host channel.
+    # Keep launch-sized storage across adaptive graph captures/state switches.
+    _vt_conf_buf: Optional[torch.Tensor] = None
+    _vt_position0: Optional[torch.Tensor] = None
+    # 2-D draft switches default to off, so draft workers that skip EagleDraftWorker.__init__
+    # (standalone, frozen-KV MTP, ngram chain) read "off" instead of raising AttributeError.
+    _vt_enabled: bool = False
+    _dl_enabled: bool = False
+    _dl_tau: float = 0.0
 
     def __init__(self) -> None:
         self._specialized_graph_memory_usage: dict[str, float] = {}
@@ -153,6 +163,21 @@ class EagleDraftWorkerBase(ABC):
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
         self._init_confidence_channel(max_bs, num_steps)
+        if getattr(self, "_vt_enabled", False):
+            self._init_vt_confidence_buffers(max_bs, num_steps)
+
+    def _init_vt_confidence_buffers(self, max_bs: int, num_steps: int) -> None:
+        if self._vt_conf_buf is not None:
+            if (
+                max_bs > self._vt_conf_buf.shape[0]
+                or num_steps > self._vt_conf_buf.shape[1]
+            ):
+                raise ValueError("VT confidence buffers cannot exceed launch dimensions")
+            return
+        self._vt_conf_buf = torch.zeros(
+            (max_bs, max(num_steps, 1)), dtype=torch.float32, device=self.device
+        )
+        self._vt_position0 = torch.zeros(max_bs, dtype=torch.float32, device=self.device)
 
     def _init_confidence_channel(self, max_bs: int, num_steps: int) -> None:
         from sglang.srt.speculative.adaptive_confidence import (

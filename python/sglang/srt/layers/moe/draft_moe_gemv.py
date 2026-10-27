@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Route-parallel W4A16 NVFP4 MoE GEMV for the draft model's one-token MoE call.
 
 At one token FlashInfer's CUTLASS NVFP4 MoE runs a routing prologue, an FP4 GEMM1, an
@@ -67,8 +70,8 @@ class DraftMoeGemvConfig(msgspec.Struct, frozen=True):
     stages2: int
 
 
-# Measured with flash-next-bench bench/dg1/dg1_bench.py --sweep (E=512, H=2560, I=640,
-# top-10, RTX PRO 6000, 2026-10-01); re-tune when the kernels change.
+# Measured with a kernel sweep (E=512, H=2560, I=640,
+# top-10, RTX PRO 6000); re-tune when the kernels change.
 DEFAULT_CONFIG = DraftMoeGemvConfig(
     block_n1=8,
     block_k1=512,

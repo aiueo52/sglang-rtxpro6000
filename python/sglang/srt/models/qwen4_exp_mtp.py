@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """Inference-only Qwen4-Exp MTP speculative decoding."""
 
 import copy
@@ -315,7 +316,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         return self.fc(torch.cat((input_embeds, hidden_states), dim=-1))
 
     # ------------------------------------------------------------------
-    # R3: per-token table for the embedding side of the entry fusion
+    # Per-token table for the embedding side of the entry fusion
     # ------------------------------------------------------------------
 
     def _fc_embedding_row(

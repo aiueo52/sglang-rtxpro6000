@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,8 +35,10 @@ Two declaration forms, keyed on ``hf_config.architectures[0]``:
 
 from __future__ import annotations
 
+import argparse
 import copy
 import dataclasses
+import functools
 import inspect
 import json
 import logging
@@ -403,12 +407,129 @@ def resolution_projection(server_args: Any) -> Dict[str, Any]:
     They used ``dataclasses.asdict``, which reads the fields -- the operator's
     input, not what resolution decided. Field values only: the private resolution
     bookkeeping and the ``model_config`` memo that a ``vars()`` dump carried into
-    the readback are not configuration.
+    the readback are not configuration. Set credentials are redacted without
+    changing the live configuration; unset credentials remain None.
     """
-    return {
+    projected = {
         field.name: _plain(resolution_result(server_args, field.name))
         for field in dataclasses.fields(server_args)
     }
+    for name in ("admin_api_key", "api_key", "ssl_keyfile_password"):
+        if projected.get(name) is not None:
+            projected[name] = "<redacted>"
+    return projected
+
+
+def redacted_server_args(server_args: Any) -> Any:
+    """Shallow copy for dumps, preserving type without live credentials."""
+    credentials = ("admin_api_key", "api_key", "ssl_keyfile_password")
+
+    def redact_fields(fields):
+        fields = dict(fields)
+        for name in credentials:
+            if fields.get(name) is not None:
+                fields[name] = "<redacted>"
+        return fields
+
+    redacted = copy.copy(server_args)
+    for name in credentials:
+        if getattr(redacted, name, None) is not None:
+            object.__setattr__(redacted, name, "<redacted>")
+    # Resolution bookkeeping also retains the raw credential fields.
+    raw = getattr(redacted, "_raw_input", None)
+    if raw is not None:
+        object.__setattr__(redacted, "_raw_input", redact_fields(raw))
+    for name in ("_resolved_overrides", "_runtime_mutations"):
+        entries = getattr(redacted, name, None)
+        if entries is not None:
+            object.__setattr__(
+                redacted,
+                name,
+                [(source, redact_fields(fields)) for source, fields in entries],
+            )
+    return redacted
+
+
+_NONSECRET_TOKEN_OPTIONS = frozenset(
+    {"bucket-time-to-first-token", "kt-max-deferred-experts-per-token"}
+)
+
+_SENSITIVE_ARG_SUFFIXES = (
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "auth",
+    "cred",
+    "creds",
+    "credential",
+    "credentials",
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _sensitive_argv_options():
+    # Import lazily: server_args itself imports this module.
+    from sglang.srt.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    options = {
+        option.lstrip("-").lower().replace("_", "-")
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+    sensitive = frozenset(
+        name
+        for name in options
+        if name not in _NONSECRET_TOKEN_OPTIONS
+        and name.endswith(_SENSITIVE_ARG_SUFFIXES)
+    )
+    nonsensitive_prefixes = frozenset(
+        name
+        for name in options - sensitive
+        if any(option.startswith(name) for option in sensitive)
+    )
+    return sensitive, nonsensitive_prefixes
+
+
+def redacted_argv(argv: Sequence[str]) -> List[str]:
+    """Copy argv with credential flag values, including abbreviations, hidden."""
+    argv = list(argv)
+    sensitive_options, nonsensitive_prefixes = _sensitive_argv_options()
+    redact_next = False
+    for index, arg in enumerate(argv):
+        name, separator, _ = arg.partition("=")
+        normalized_name = name.lstrip("-").lower().replace("_", "-")
+        checked_name = bool(normalized_name) and normalized_name not in nonsensitive_prefixes
+        # A real secret option, by exact name or abbreviation.
+        names_secret_option = checked_name and arg.startswith("--") and (
+            any(option.startswith(normalized_name) for option in sensitive_options)
+            # Protect HF tokens even though this parser lacks --hf-token.
+            or "hf-token".startswith(normalized_name)
+        )
+        is_sensitive = arg.startswith("-") and checked_name and (
+            names_secret_option
+            or (
+                normalized_name not in _NONSECRET_TOKEN_OPTIONS
+                and normalized_name.endswith(_SENSITIVE_ARG_SUFFIXES)
+            )
+        )
+        if redact_next and not names_secret_option:
+            # A pending value is masked whatever it starts with. After a bare "--" or
+            # a credential-looking token, the next token is masked too.
+            argv[index] = "<redacted>"
+            redact_next = arg == "--" or (is_sensitive and not separator)
+            continue
+        redact_next = False
+        if is_sensitive:
+            if separator:
+                argv[index] = name + "=<redacted>"
+            else:
+                redact_next = True
+    return argv
 
 
 def _plain(value: Any) -> Any:

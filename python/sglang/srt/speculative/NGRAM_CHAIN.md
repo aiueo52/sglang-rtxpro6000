@@ -1,3 +1,8 @@
+<!--
+SPDX-License-Identifier: Apache-2.0
+Copyright 2026 aiueo52 and contributors
+-->
+
 # NGRAM_CHAIN
 
 `NGRAM_CHAIN` is an EAGLE-compatible speculative provider for Qwen4-Exp MTP.

@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """GPU builders for QSA CUDA-graph replay metadata.
 
 Compressed addressing is pure arithmetic over the page-aligned full-KV
@@ -334,6 +335,149 @@ def launch_graph_metadata(
         FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
         PAGE_BLOCK=_PAGE_BLOCK,
         PAGE_PARALLEL=page_parallel,
+        PAGE_BOUND=_page_bound_enabled(),
+        num_warps=1,
+    )
+
+
+# Element dtypes of the per-step address table columns, in kernel order.
+_DRAFT_STEP_DTYPES = (torch.int32,) * 7 + (torch.int64, torch.int32)
+
+
+@triton.jit
+def _qsa_draft_steps_metadata_kernel(
+    seq_lens_ptr,  # [bs] base lengths; draft step s decodes at seq_lens + s + 1
+    req_pool_ptr,  # [bs] request pool slots
+    step_outputs_ptr,  # [steps, 9] int64 buffer addresses, see draft_steps_output_table
+    req_to_token_ptr,
+    req_to_token_row_stride,
+    bs,
+    num_padding,
+    max_pages,
+    RATIO: tl.constexpr,
+    RING: tl.constexpr,
+    FULL_PAGE: tl.constexpr,
+    PAGE_BLOCK: tl.constexpr,
+    PAGE_BOUND: tl.constexpr = False,
+):
+    # Decode-mode layout + row metadata of every draft step in one launch; same
+    # values as _qsa_graph_layout_kernel (MODE 0) then _qsa_graph_row_metadata_kernel.
+    row = tl.program_id(0)
+    page_pid = tl.program_id(1)
+    step = tl.program_id(2)
+    outs = step_outputs_ptr + step * 9
+    row_seq_lens_ptr = tl.load(outs + 0).to(tl.pointer_type(tl.int32))
+    row_prefix_lens_ptr = tl.load(outs + 1).to(tl.pointer_type(tl.int32))
+    row_req_pool_ptr = tl.load(outs + 2).to(tl.pointer_type(tl.int32))
+    compressed_lens_ptr = tl.load(outs + 3).to(tl.pointer_type(tl.int32))
+    write_locs_ptr = tl.load(outs + 4).to(tl.pointer_type(tl.int32))
+    page_table_ptr = tl.load(outs + 5).to(tl.pointer_type(tl.int32))
+    logical_positions_ptr = tl.load(outs + 6).to(tl.pointer_type(tl.int32))
+    state_slots_ptr = tl.load(outs + 7).to(tl.pointer_type(tl.int64))
+    ring_locs_ptr = tl.load(outs + 8).to(tl.pointer_type(tl.int32))
+    write_scalars = page_pid == 0
+
+    real = row < bs - num_padding
+    seq_len = tl.load(seq_lens_ptr + row).to(tl.int32) + (step + 1)
+    req = tl.load(req_pool_ptr + row).to(tl.int64)
+    # Padding rows alias request slot 0, as in the layout kernel.
+    req = tl.where(real, req, 0).to(tl.int32).to(tl.int64)
+    seq_len = tl.where(real, seq_len, 1)
+    if write_scalars:
+        tl.store(row_seq_lens_ptr + row, seq_len)
+        tl.store(row_req_pool_ptr + row, req.to(tl.int32))
+        tl.store(row_prefix_lens_ptr + row, tl.maximum(seq_len - 1, 0))
+
+    token_row = req * req_to_token_row_stride
+    current = tl.maximum(seq_len - 1, 0)
+    last_loc = tl.load(req_to_token_ptr + token_row + current).to(tl.int32)
+    compressed = seq_len // RATIO
+    boundary = (seq_len > 0) & (seq_len % RATIO == 0)
+    write_loc = tl.where(boundary, last_loc // RATIO, 0)
+    if write_scalars:
+        tl.store(compressed_lens_ptr + row, compressed)
+        tl.store(write_locs_ptr + row, write_loc)
+        tl.store(logical_positions_ptr + row, current)
+        tl.store(state_slots_ptr + row, req * RING + (current % RING).to(tl.int64))
+        ring_base = row.to(tl.int64) * RATIO
+        for k in tl.static_range(RATIO):
+            member = tl.maximum(current - (RATIO - 1 - k), 0)
+            slot = req * RING + (member % RING).to(tl.int64)
+            tl.store(ring_locs_ptr + ring_base + k, slot.to(tl.int32))
+
+    table_row = page_table_ptr + row.to(tl.int64) * max_pages
+    offs = tl.arange(0, PAGE_BLOCK)
+    row_width_pages = req_to_token_row_stride // FULL_PAGE
+    page_limit = tl.minimum(max_pages, row_width_pages)
+    if PAGE_BOUND:
+        page_limit = tl.minimum(page_limit, (seq_len + FULL_PAGE - 1) // FULL_PAGE)
+    idx = page_pid * PAGE_BLOCK + offs
+    valid = idx < page_limit
+    loc = tl.load(req_to_token_ptr + token_row + idx * FULL_PAGE, mask=valid, other=0)
+    tl.store(table_row + idx, tl.maximum(loc // FULL_PAGE, 0), mask=valid)
+
+
+def draft_steps_output_table(*, metadatas) -> torch.Tensor:
+    """[steps, 9] int64 addresses of each draft step's decode graph buffers.
+
+    The buffers are allocated once per backend (init_cuda_graph_state), so the
+    table stays valid for the life of the captured graphs.
+    """
+
+    rows = []
+    for metadata in metadatas:
+        indexer = metadata.indexer_metadata
+        bufs = (
+            metadata.sequence_lengths,
+            indexer.graph_prefix_lengths,
+            metadata.row_req_pool_indices,
+            indexer.graph_compressed_lengths,
+            indexer.graph_write_locs,
+            indexer.graph_compressed_page_table,
+            indexer.decode_logical_positions,
+            indexer.pending_ring_slots,
+            indexer.graph_ring_group_locs,
+        )
+        for buf, dtype in zip(bufs, _DRAFT_STEP_DTYPES):
+            assert buf.dtype == dtype and buf.is_contiguous()
+        rows.append([buf.data_ptr() for buf in bufs])
+    device = metadatas[0].sequence_lengths.device
+    return torch.tensor(rows, dtype=torch.int64, device=device)
+
+
+def launch_draft_steps_metadata(
+    *,
+    bs,
+    seq_lens,
+    req_pool_indices,
+    num_padding,
+    step_outputs,
+    metadata,
+    req_to_token,
+    pool,
+) -> None:
+    """All draft steps' decode metadata in one launch (SGLANG_OPT_QSA_DRAFT_META_BATCH).
+
+    ``metadata`` is any step's decode metadata; the steps share ratio, ring and
+    page-table width because every step backend is built from the same runner.
+    """
+
+    indexer = metadata.indexer_metadata
+    max_pages = indexer.graph_compressed_page_table.shape[1]
+    steps = step_outputs.shape[0]
+    _qsa_draft_steps_metadata_kernel[(bs, triton.cdiv(max_pages, _PAGE_BLOCK), steps)](
+        seq_lens,
+        req_pool_indices,
+        step_outputs,
+        req_to_token,
+        req_to_token.stride(0),
+        bs,
+        num_padding,
+        max_pages,
+        RATIO=indexer.compress_ratio,
+        RING=indexer.ring_size or indexer.compress_ratio,
+        FULL_PAGE=pool.qsa_compressed_page_size * indexer.compress_ratio,
+        PAGE_BLOCK=_PAGE_BLOCK,
         PAGE_BOUND=_page_bound_enabled(),
         num_warps=1,
     )

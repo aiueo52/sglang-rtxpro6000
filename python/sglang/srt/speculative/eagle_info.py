@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
@@ -35,6 +36,11 @@ class EagleVerifyInput(SpecInput):
     draft_probs: torch.Tensor = None
     draft_support_probs: torch.Tensor = None
     draft_support_tokens: torch.Tensor = None
+    draft_context_vocab: bool = False
+    # VT accepted draft cap, excluding the bonus; CUDA int32 [bs].
+    vt_lens: Optional[torch.Tensor] = None
+    # HOSTW may verify fewer rows than the draft's already-reserved KV window.
+    draft_reserved_token_num: Optional[int] = None
 
     # Shape info for padding
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
@@ -157,6 +163,7 @@ class EagleDraftInput(SpecInput):
     draft_probs: torch.Tensor = None
     draft_support_probs: torch.Tensor = None
     draft_support_tokens: torch.Tensor = None
+    draft_context_vocab: bool = False
     # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
     # None when the spec algorithm's draft doesn't read hidden_states
     # (e.g., STANDALONE — vanilla LLM draft).

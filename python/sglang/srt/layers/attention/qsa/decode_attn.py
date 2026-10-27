@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Split-KV Triton decode attention over QSA sparse top-k rows.
 
 Opt-in replacement (SGLANG_OPT_TRITON_DECODE_ATTN) for the valid-count, KV
@@ -35,7 +38,7 @@ _INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 
 # (max rows, (num_splits, block_n, num_warps, kv_stages, v_asm)), first match
 # wins. Measured on RTX PRO 6000 Max-Q (sm120, 188 SMs) at 2051 top-k columns,
-# fp8 KV, 2 kv heads x 12 query heads x 256 (flash-next-bench bench/xa1, job4).
+# fp8 KV, 2 kv heads x 12 query heads x 256.
 _LAUNCH_BY_ROWS = (
     (1, (22, 32, 4, 3, True)),
     (4, (22, 32, 4, 3, True)),

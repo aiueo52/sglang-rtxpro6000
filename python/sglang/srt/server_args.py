@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -2375,6 +2376,10 @@ class ServerArgs:
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
         NS("spec"),
+    ] = None
+    # HOSTW reserves a larger launch width without changing the policy seed.
+    _speculative_adaptive_initial_steps: A[
+        Optional[int], Arg(no_cli=True, resolvable=True), NS("spec")
     ] = None
 
     # Decoupled speculative decoding: draft and verify run as

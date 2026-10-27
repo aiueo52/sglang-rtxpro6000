@@ -1,4 +1,7 @@
-"""Triton W4A16 NVFP4 skinny GEMV: y[M,N] = x[M,K](bf16) @ dequant(W)[N,K]^T, M <= 16.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
+"""Triton W4A16 NVFP4 skinny GEMV: y[M,N] = x[M,K](bf16) @ dequant(W)[N,K]^T, M <= 32 (opt-in above 16).
 
 The weight is the same NVFP4 format the experts already use in this fork:
 
@@ -16,7 +19,7 @@ weight A-load:
 - **Unpack.** A ``[BLOCK_N, BLOCK_K//2]`` uint8 tile is split into low/high nibbles and
   ``tl.join``-ed back into ``[BLOCK_N, BLOCK_K]`` -- a pure register shuffle, no extra
   traffic, and it reproduces the standard even/odd nibble order.
-- **Dequant by bit trick** (same as the in-house engine's ``nvfp4_linear.py``): the 4-bit code's
+- **Dequant by bit trick** (same as FreeToken's ``nvfp4_linear.py``): the 4-bit code's
   mantissa bit and 2 exponent bits are shifted into fp16 bits [11:9] and the sign into
   [15], so a bitcast yields exactly ``e2m1_value * 2^-14``.  fp16's subnormal encoding
   makes the ``e == 0`` codes land on the same 2^-14 factor, so the map is exact for all
@@ -252,6 +255,7 @@ from sglang.srt.layers.quantization.w8a16_gemv import (  # noqa: E402
     _MAX_SPLITS,
     _WS_COUNTERS,
     _WS_FLOATS,
+    _m_pad,
     _num_sms,
     _workspace,
 )
@@ -260,9 +264,19 @@ from sglang.srt.layers.quantization.w8a16_gemv import (  # noqa: E402
 #: to compile on a given Triton build.
 SCALE_GATHER = _env_flag("SGLANG_NVFP4_GEMV_SCALE_GATHER")
 
+NVFP4_GEMV_MAX_M = int(os.environ.get("SGLANG_NVFP4_GEMV_MAX_M", "16"))
+if NVFP4_GEMV_MAX_M > 32:
+    raise ValueError("SGLANG_NVFP4_GEMV_MAX_M must be <= 32")
+
+
+def _m_limit() -> int:
+    from sglang.srt.model_executor.forward_context import get_gemv_m_limit
+
+    return get_gemv_m_limit(NVFP4_GEMV_MAX_M)
+
 
 def _m_bucket(M: int) -> int:
-    return 1 if M == 1 else (4 if M <= 4 else 16)
+    return 1 if M == 1 else (4 if M <= 4 else (16 if M <= 16 else 32))
 
 
 # Measured with bench/n1/bench_nvfp4_gemv.py (CUPTI kernel-duration medians over a
@@ -276,9 +290,14 @@ def _m_bucket(M: int) -> int:
 # to use 16. The scales are only 1/8 of the weight bytes but at the wrong granularity
 # they cost a second sector each.
 _TUNED: dict = {
-    # draft lm_head, hot2_49152. Planner default (32,256,...) measured 56.19 us;
-    # this is 52.64 us = 1344.6 GB/s = 83.3 % of the 1615 GB/s roof (sweep 2026-09-06).
+    # draft lm_head, 49152 rows. Planner default (32,256,...) measured 56.19 us;
+    # this is 52.64 us = 1344.6 GB/s = 83.3 % of the 1615 GB/s roof in a tuning sweep.
     (1, 49152, 2560): (32, 512, 1, False, 4, 2),
+    # 32-row tuning: the planner's
+    # (64,128,1,True,4,2) already beat two 16-row slices (327.6 vs 484.7 us on the
+    # lm_head, 86.9 vs 105.0 us on the draft head); these tiles are 1.13x / 1.27x on it.
+    (32, 248320, 2560): (128, 256, 1, True, 8, 2),
+    (32, 49152, 2560): (64, 256, 1, True, 4, 2),
 }
 
 
@@ -292,6 +311,10 @@ def _plan(M: int, N: int, K: int, sms: int):
     if triton.cdiv(N, 128) * 2 >= sms:
         if M == 1:
             return (32, 256, 1, False, 4, 3)
+        if _m_bucket(M) == 32:
+            # Same conservative 48 KiB staged-bf16 operand bound as W8A16;
+            # unpacked weights are bf16 too. Leave compiler headroom below 99 KiB.
+            return (64, 128, 1, True, 4, 2)
         return (64, 256, 1, True, 8, 3)
     use_dot = M > 1
     block_n = 16 if M == 1 else 32
@@ -313,7 +336,7 @@ def _fit(M: int, N: int, cfg):
     block_n, block_k, splits, use_dot, warps, stages = cfg
     if splits == 1:
         return cfg
-    m_pad = 16 if (use_dot or M > 1) else 1
+    m_pad = _m_pad(M, use_dot)
     n_blocks = triton.cdiv(N, block_n)
     if (
         splits > _MAX_SPLITS
@@ -357,7 +380,7 @@ def w4a16_nvfp4_gemv(
     M, K = x.shape
     N = wq.shape[0]
     assert wq.shape[1] == K // 2 and bs.shape == (N, K // FP4_SCALE_BLOCK)
-    assert M <= 16 and wq.stride(1) == 1 and bs.stride(1) == 1
+    assert M <= _m_limit() and wq.stride(1) == 1 and bs.stride(1) == 1
     if out2 is None:
         y, y2, split_n = _out_or_new(out, M, N, x.device), None, 0
     else:
@@ -374,7 +397,7 @@ def w4a16_nvfp4_gemv(
     block_n, block_k, splits, use_dot, num_warps, num_stages = cfg
     assert K % block_k == 0, f"K={K} must be a multiple of BLOCK_K={block_k}"
     use_dot = use_dot or M > 1
-    m_pad = 16 if use_dot else 1
+    m_pad = _m_pad(M, use_dot)
     ws, cnt = _workspace(x.device)
     sview = bs.view(torch.float8_e4m3fn)
 
@@ -451,8 +474,8 @@ def quantize_nvfp4(
     # beyond taste: `amax/6/gscale` and `amax/6*enc` differ by one fp32 ulp, and e4m3's
     # 4-bit significand is coarse enough that ~1 % of block scales land exactly on a
     # tie point, where that ulp flips the rounding. Using the same expression as
-    # the project's reference NVFP4 emulation is what keeps the two implementations
-    # bit-identical.
+    # `parity/nvfp4_emulate.nvfp4_quantize` is what makes the offline acceptance gate
+    # actually predict the server.
     enc = 1.0 / gscale
     wq = torch.empty((N, K // 2), dtype=torch.uint8, device=w.device)
     bs = torch.empty((N, K // block), dtype=torch.uint8, device=w.device)

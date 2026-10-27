@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Fused Qwen4-Exp MTP entry normalization and projections."""
 
 from __future__ import annotations

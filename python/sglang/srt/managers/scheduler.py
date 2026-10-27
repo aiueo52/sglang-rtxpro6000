@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -996,6 +998,9 @@ class Scheduler(
 
     def init_all_cuda_graphs(self):
         """Capture cuda graphs for all workers."""
+        validate = getattr(self.draft_worker, "validate_dl_length_storage", None)
+        if validate is not None:
+            validate()
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
@@ -2727,9 +2732,41 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        error_msg = self._vt_grammar_refusal(req)
+        if error_msg is not None:
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+
+    def _vt_grammar_refusal(self, req: Req) -> Optional[str]:
+        # Grammar-constrained requests run on the 2-D draft VT path (SGLANG_RND_VT_GRAMMAR=1, the default).
+        # SGLANG_RND_VT_GRAMMAR=0 (read and checked when the draft worker starts) keeps the legacy refusal: such a
+        # request alone gets an error, before it is queued.
+        refuse = getattr(self, "_vt_grammar_refuse", None)
+        if refuse is None:
+            inner = getattr(self.draft_worker, "draft_worker", None) if self.draft_worker is not None else None
+            refuse = self._vt_grammar_refuse = bool(getattr(inner, "_vt_enabled", False)) and not bool(
+                getattr(inner, "_vt_grammar", True)
+            )
+        if not refuse:
+            return None
+        params = req.sampling_params
+        if (
+            params.json_schema is None
+            and params.regex is None
+            and params.ebnf is None
+            and params.structural_tag is None
+            and not getattr(self.grammar_manager, "_enable_strict_thinking", False)
+        ):
+            return None
+        return (
+            "Grammar-constrained generation (response_format, forced or strict tool calls) is not available "
+            "while the 2-D VT path is on; restart this entry with STACK_D=0 to use it."
+        )
 
     def handle_batch_generate_request(
         self,
@@ -5240,6 +5277,12 @@ def run_scheduler_process(
             moe_dp_rank,
             dp_rank,
         )
+
+        # oea-sd: every CUDA graph of this process (target, draft, adaptive states) is captured now, so the OEA control
+        # thread may read its control file (it synchronizes the device, which would break a capture).
+        from sglang.srt.layers.moe.oea_prologue import mark_serving
+
+        mark_serving()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())

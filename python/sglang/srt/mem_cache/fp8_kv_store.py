@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Fused BF16 scale, FP8 cast, and NHD KV-cache scatter."""
 
 from __future__ import annotations

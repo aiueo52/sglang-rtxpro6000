@@ -1,0 +1,75 @@
+{
+  "version": "0.6.17",
+  "trees": {
+    "vt": {
+      "tree_sha256": "a72eab621bfe064c6d1606866a410d03e1217ed9b5ceaebbb4df91b7cc8daa5b",
+      "files": {
+        "data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh": {
+          "wheel_sha256": "fd24f5f8234b0736f205dd2540f47dcaf90783a53c2fbbab66d0490c9494dbac",
+          "sha256": "1920458c714cdbbbd445bb00c4478e6d4efae6e6b68d1d9e2f8c63353407989a"
+        },
+        "data/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu": {
+          "wheel_sha256": "af8afe9d012744f02aa50cda309beeaeda9fc60468e8607f0e3b68b6ad913480",
+          "sha256": "dfd4a9d2265c0a615a91f58ce27e2efa87618b5643c7decb4eaf95a7cb0ff573"
+        },
+        "data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h": {
+          "wheel_sha256": "d5562b100214697950149718929fc6dd0bf6570ac79cd452d6da6c9df2ea6161",
+          "sha256": "f39228a742f10a56f711e40d4bb297215ff5fb8dfda69158defcd68dc14c29d2"
+        },
+        "fused_moe/core.py": {
+          "wheel_sha256": "1fc7f2b942b253837e554b2a4c128e196a19a48679c4a11cdd7677e0cccfd5ca",
+          "sha256": "53c5a2b6b2999e3cdf2637dfd25c068134cb76e4fa259e39183da53d79db503c"
+        },
+        "fused_moe/tactic_rows_policy.py": {
+          "wheel_sha256": "added",
+          "sha256": "93bd1d1396f186f9a44a1c4a055d3099304b7524fd2ecdacdbaa5fdf385753d0"
+        },
+        "gdn_kernels/gdn_decode_bf16_wy_output_only.py": {
+          "wheel_sha256": "1d5aab179935526e975ba880b8714f50c56232213a9c04433364e2d9ca4a5c86",
+          "sha256": "92aed98b9fa8101cc2e3ca9f7a0520f3ae7b62b29b38c5d8d7166f848700920e"
+        },
+        "jit/core.py": {
+          "wheel_sha256": "33e49ddda268b3df5b57e3abd592ab761ece732785514aff3155dd37c6088b75",
+          "sha256": "67111915ffc2ca8b2648ea3651a0c6520cf8fce6aba5368afa38ca40c04dbe01"
+        },
+        "jit/fused_moe.py": {
+          "wheel_sha256": "4314cf98ec2f54aaf1b85b8cbc4ab2137c7ed2d3efb0afea006935595acc2747",
+          "sha256": "7b29e2c05375d1322148dd5b4e6db0a12f57ad891a2a5bb1bc9e0a3c0eb01e8d"
+        }
+      }
+    },
+    "vtoea": {
+      "tree_sha256": "3a0839c322b6197e0d88abf05610e05c6a287d92157ad9d4398a1319adfe45f6",
+      "files": {
+        "data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh": {
+          "wheel_sha256": "fd24f5f8234b0736f205dd2540f47dcaf90783a53c2fbbab66d0490c9494dbac",
+          "sha256": "9077805486b5b7293cd25afff6fe4985f7f6d6a42e5a5a68f309f364aaebb190"
+        },
+        "data/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu": {
+          "wheel_sha256": "af8afe9d012744f02aa50cda309beeaeda9fc60468e8607f0e3b68b6ad913480",
+          "sha256": "f8c1f9371a57b6345d0c1006509bf3004b1650563c351ccae9ae21f670a5baf4"
+        },
+        "data/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h": {
+          "wheel_sha256": "d5562b100214697950149718929fc6dd0bf6570ac79cd452d6da6c9df2ea6161",
+          "sha256": "6ea1fc21d5c903d79ddf9eeb2127a3ffe6bb0c74c6c24fabd378929f28e2c5ca"
+        },
+        "fused_moe/core.py": {
+          "wheel_sha256": "1fc7f2b942b253837e554b2a4c128e196a19a48679c4a11cdd7677e0cccfd5ca",
+          "sha256": "242395437301170da56f022a104eae8f967626ff0301ea0d0813828da5266c50"
+        },
+        "gdn_kernels/gdn_decode_bf16_wy_output_only.py": {
+          "wheel_sha256": "1d5aab179935526e975ba880b8714f50c56232213a9c04433364e2d9ca4a5c86",
+          "sha256": "92aed98b9fa8101cc2e3ca9f7a0520f3ae7b62b29b38c5d8d7166f848700920e"
+        },
+        "jit/core.py": {
+          "wheel_sha256": "33e49ddda268b3df5b57e3abd592ab761ece732785514aff3155dd37c6088b75",
+          "sha256": "67111915ffc2ca8b2648ea3651a0c6520cf8fce6aba5368afa38ca40c04dbe01"
+        },
+        "jit/fused_moe.py": {
+          "wheel_sha256": "4314cf98ec2f54aaf1b85b8cbc4ab2137c7ed2d3efb0afea006935595acc2747",
+          "sha256": "97d022e63d33a7b200cba7b99cc88b8f595de91e11e1b7423958a4be2fedba22"
+        }
+      }
+    }
+  }
+}

@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright (c) 2024, Tri Dao.
@@ -22,7 +23,7 @@ PAD_SLOT_ID = -1
 # (batch, cdiv(dim, BLOCK_N)): at batch=1 with dim=10240 a 256-wide block
 # gives only 40 CTAs for the serial per-timestep loop, so the 16-token
 # target-verify update took 18.8us; 64-wide blocks (160 CTAs) take 6.2us with
-# identical math (measured on RTX PRO 6000, 2026-09-03). Small grids therefore
+# identical math (measured on RTX PRO 6000). Small grids therefore
 # use 64; large batches keep 256. Override with SGLANG_CONV1D_UPDATE_BLOCK_N.
 _UPDATE_BLOCK_N_ENV = os.environ.get("SGLANG_CONV1D_UPDATE_BLOCK_N")
 _UPDATE_BLOCK_N_SMALL_GRID = 64

@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,6 +47,7 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.arg_groups.overrides import redacted_argv, redacted_server_args
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
@@ -796,6 +799,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         self._init_req_state(obj, request)
+        dispatched = False
         try:
             if get_disagg().language_only:
                 self._handle_epd_disaggregation_encode_request(obj)
@@ -816,12 +820,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if obj.return_prompt_token_ids:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
+                    dispatched = True
                     async for response in self._wait_one_response(obj, request):
                         yield response
                 else:
                     async for response in self._handle_batch_request(obj, request):
                         yield response
-        except BaseException:
+        except BaseException as exc:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path
             # (_handle_batch_output), so a failure *before* a request reaches the
@@ -829,8 +834,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # request -- would otherwise leak those entries forever. Drop any that
             # are still pending; entries already removed on the normal completion
             # path are left untouched (pop is a no-op).
+            if dispatched and isinstance(exc, (GeneratorExit, asyncio.CancelledError)):
+                self._abort_unfinished_single(obj)
             self._discard_pending_req_states(obj)
             raise
+
+    def _abort_unfinished_single(self, obj):
+        """Abort a dispatched single request whose consumer went away.
+
+        A client that closes a stream arrives here as GeneratorExit at the
+        response yield (or CancelledError while waiting). Dropping the state
+        alone leaves the scheduler generating up to max_new_tokens: the
+        StreamingResponse background abort task is skipped on ClientDisconnect
+        (Starlette 1.x with ASGI spec >= 2.4), and it would find no state to
+        abort anyway once the state is discarded. Finished and background
+        requests are left alone; other exceptions keep their old handling.
+        """
+        if getattr(obj, "background", False):
+            return
+        state = self.rid_to_state.get(obj.rid)
+        if state is not None and not state.finished:
+            self.abort_request(obj.rid)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -2966,7 +2990,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         logger.info(log_message)
         to_dump_with_server_args = {
-            "server_args": self.server_args,
+            "server_args": redacted_server_args(self.server_args),
             "config_updates": get_context().overrides_log(),
             "resolved_config": self._dump_config_snapshot(),
             "requests": data_list.copy(),
@@ -3051,11 +3075,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
                 # Write the data to the file
                 data_to_dump_with_server_args = {
-                    "server_args": self.server_args,
+                    "server_args": redacted_server_args(self.server_args),
                     "config_updates": get_context().overrides_log(),
                     "resolved_config": self._dump_config_snapshot(),
                     "requests": data_to_dump,
-                    "launch_command": " ".join(sys.argv),
+                    "launch_command": " ".join(redacted_argv(sys.argv)),
                 }
                 with open(filename, "wb") as f:
                     try:

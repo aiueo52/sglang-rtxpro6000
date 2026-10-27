@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """Sparse-attention backend for Qwen4-Exp models with an indexer.
 
 The backend is installed as the full-attention side of Qwen4-Exp's hybrid backend;
@@ -1973,6 +1974,9 @@ class QwenSparseMultiStepDraftBackend:
             for _ in range(speculative_num_steps - 1)
         ]
         self._step_offsets = None
+        self._batch_step_metadata = envs.SGLANG_OPT_QSA_DRAFT_META_BATCH.get()
+        # bs -> [steps, 9] addresses of the step backends' decode graph buffers.
+        self._step_output_tables = {}
 
     @staticmethod
     def _as_cpu_lengths(seq_lens_cpu, seq_lens: torch.Tensor) -> torch.Tensor:
@@ -2127,6 +2131,10 @@ class QwenSparseMultiStepDraftBackend:
 
         num_padding = getattr(forward_batch, "num_padding", None)
         num_padding = num_padding if num_padding is not None else 0
+        if self._batch_step_metadata and self._replay_steps_batched(
+            forward_batch=forward_batch, num_padding=num_padding
+        ):
+            return
         step_lens = self._all_step_seq_lens(forward_batch)
         for step, backend in enumerate(self.attn_backends):
             step_batch = self._make_step_forward_batch(
@@ -2141,6 +2149,43 @@ class QwenSparseMultiStepDraftBackend:
                 seq_lens_cpu=step_batch.seq_lens_cpu,
                 num_padding=num_padding,
             )
+
+    def _replay_steps_batched(self, *, forward_batch, num_padding: int) -> bool:
+        # One launch for what the per-step loop does with two launches per step;
+        # False leaves the batch to that loop (host-fallback pools).
+        from sglang.srt.layers.attention.qsa.graph_metadata import (
+            draft_steps_output_table,
+            launch_draft_steps_metadata,
+        )
+
+        seq_lens = forward_batch.seq_lens
+        bs = int(seq_lens.numel())
+        if not self.attn_backends or bs <= 0:
+            return False
+        metadatas = [
+            backend._cuda_graph_metadata[(ForwardMode.DECODE, bs)]
+            for backend in self.attn_backends
+        ]
+        first = self.attn_backends[0]
+        if not first._can_replay_with_gpu_kernels(metadatas[0], seq_lens):
+            return False
+        table = self._step_output_tables.get(bs)
+        if table is None:
+            table = draft_steps_output_table(metadatas=metadatas)
+            self._step_output_tables[bs] = table
+        launch_draft_steps_metadata(
+            bs=bs,
+            seq_lens=seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            num_padding=max(0, min(int(num_padding), bs)),
+            step_outputs=table,
+            metadata=metadatas[0],
+            req_to_token=first.req_to_token,
+            pool=metadatas[0].indexer_metadata.token_to_kv_pool,
+        )
+        for backend, metadata in zip(self.attn_backends, metadatas):
+            backend.forward_metadata = metadata
+        return True
 
     def init_forward_metadata_in_graph(self, forward_batch) -> None:
         pass

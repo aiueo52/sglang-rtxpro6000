@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import logging
@@ -63,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+    conv_window_dedup_enabled,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -2082,6 +2084,61 @@ class KVCacheConfigurator:
             )
         return config
 
+    def _none_mode_intermediate_sizes(self, num_layers: int) -> tuple[int, int] | None:
+        if not (
+            envs.SGLANG_OPT_MAMBA_NONE_MODE_SIZING.get()
+            and get_exec().mamba.gdn_mtp_cache_mode == "none"
+            and self.hybrid_gdn_config is not None
+        ):
+            return None
+        params = self.mambaish_config.mamba2_cache_params
+        num_draft_tokens = max_speculative_num_draft_tokens()
+        assert num_draft_tokens is not None
+        dedup = (
+            not params.shape.disable_conv_window_dedup
+            and conv_window_dedup_enabled(
+                is_npu=self.device == "npu",
+                is_cpu=self.device == "cpu",
+                speculative_eagle_topk=get_spec().speculative_eagle_topk,
+                is_kda=params.is_kda,
+            )
+        )
+        window_len = params.shape.conv_kernel - 1
+        conv_dims = sum(math.prod(shape) // window_len for shape in params.shape.conv)
+        conv_columns = (
+            num_draft_tokens + window_len - 1 if dedup else num_draft_tokens * window_len
+        )
+        conv_bytes = num_layers * conv_dims * conv_columns * params.dtype.conv.itemsize
+        # FlashInfer recovery keeps post-conv q/k/v and two per-value-head gates.
+        recovery_bytes = (
+            num_layers
+            * num_draft_tokens
+            * (conv_dims + 2 * params.shape.temporal[0])
+            * self.model_dtype.itemsize
+        )
+        return conv_bytes + recovery_bytes, conv_bytes
+
+    def _mamba_intermediate_reservation(
+        self,
+        *,
+        stage_per_req: int,
+        capped_reqs: int,
+        none_mode_sizes: tuple[int, int] | None,
+    ) -> int:
+        old_bytes = (
+            stage_per_req * (capped_reqs + 1) * get_spec().speculative_num_draft_tokens
+        )
+        if none_mode_sizes is None:
+            return old_bytes
+        per_req_bytes, padding_bytes = none_mode_sizes
+        new_bytes = per_req_bytes * capped_reqs + padding_bytes
+        logger.info(
+            "Mamba none-mode intermediate reservation: old=%d bytes, new=%d bytes",
+            old_bytes,
+            new_bytes,
+        )
+        return new_bytes
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -2140,6 +2197,12 @@ class KVCacheConfigurator:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
 
+        none_mode_sizes = (
+            self._none_mode_intermediate_sizes(max_stage_mamba_layers)
+            if has_spec_dec and not replayssm_active
+            else None
+        )
+
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             get_context().override(
@@ -2156,10 +2219,10 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    stage_per_req
-                    * (capped_reqs + 1)
-                    * get_spec().speculative_num_draft_tokens
+                intermediate_size = self._mamba_intermediate_reservation(
+                    stage_per_req=stage_per_req,
+                    capped_reqs=capped_reqs,
+                    none_mode_sizes=none_mode_sizes,
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -2175,10 +2238,10 @@ class KVCacheConfigurator:
             # Reserve intermediate memory based on capped max_num_reqs (+1: the
             # pool's padding slot). Skipped under replayssm.
             if has_spec_dec and not replayssm_active:
-                intermediate_size = (
-                    stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
-                    * get_spec().speculative_num_draft_tokens
+                intermediate_size = self._mamba_intermediate_reservation(
+                    stage_per_req=stage_per_req,
+                    capped_reqs=get_schedule().max_mamba_cache_size,
+                    none_mode_sizes=none_mode_sizes,
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -2200,12 +2263,20 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                get_context().override(
-                    "mamba_pool.memory_budget_spec",
-                    max_mamba_cache_size=int(
+                if none_mode_sizes is None:
+                    max_mamba_cache_size = int(
                         (mamba_budget_bytes - per_req * (1 + D))
                         // (per_req * (1 + D / ratio))
-                    ),
+                    )
+                else:
+                    intermediate_per_req, padding_bytes = none_mode_sizes
+                    max_mamba_cache_size = int(
+                        (mamba_budget_bytes - per_req - padding_bytes)
+                        // (per_req + intermediate_per_req / ratio)
+                    )
+                get_context().override(
+                    "mamba_pool.memory_budget_spec",
+                    max_mamba_cache_size=max_mamba_cache_size,
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -2213,7 +2284,11 @@ class KVCacheConfigurator:
                     get_schedule().max_running_requests // self.ps.attn_dp_size,
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = self._mamba_intermediate_reservation(
+                    stage_per_req=per_req,
+                    capped_reqs=capped_reqs,
+                    none_mode_sizes=none_mode_sizes,
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + replayssm_ring_per_req

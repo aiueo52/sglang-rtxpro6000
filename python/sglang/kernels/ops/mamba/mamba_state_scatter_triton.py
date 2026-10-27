@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """
 Fused Triton kernel for Mamba state scatter operations.
 
@@ -886,4 +888,239 @@ def track_mamba_states_all_layers(
         ssm_state_numel_per_row,
         BLOCK_SIZE,
         check_freed_slots,
+    )
+
+
+_COMMIT_GLUE_MAX_TYPES = 8
+_COMMIT_GLUE_META_COLS = 17
+_commit_glue_meta_cache: dict = {}
+
+
+@triton.jit
+def _fused_commit_glue_scatter_kernel(
+    meta_ptr,  # int64 [num_types, 17], columns in _commit_glue_build_meta
+    idx1_ptr,
+    step1_ptr,
+    idx2_ptr,
+    step2_ptr,
+    n1,
+    NUM_TYPES: tl.constexpr,
+    META_COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # One launch for the RecoverSSM commit glue: every type is copied as 16-bit
+    # words, so conv windows (strided) and flat PLE rows (any even dtype) share it.
+    pid_req = tl.program_id(0)
+    pid_block = tl.program_id(1).to(tl.int64)
+
+    is1 = pid_req < n1
+    is2 = pid_req >= n1
+    off1 = pid_req
+    off2 = pid_req - n1
+    s1 = tl.load(step1_ptr + off1, mask=is1, other=-1).to(tl.int64)
+    s2 = tl.load(step2_ptr + off2, mask=is2, other=-1).to(tl.int64)
+    step_idx = tl.where(is2, s2, s1)
+    if step_idx < 0:
+        return
+    d1 = tl.load(idx1_ptr + off1, mask=is1, other=-1).to(tl.int64)
+    d2 = tl.load(idx2_ptr + off2, mask=is2, other=-1).to(tl.int64)
+    dst_idx = tl.where(is2, d2, d1)
+    src_idx = tl.where(is2, off2, off1).to(tl.int64)
+    if dst_idx < 0:
+        return
+
+    for t in tl.static_range(NUM_TYPES):
+        row = meta_ptr + t * META_COLS
+        block_start = tl.load(row + 10)
+        block_end = tl.load(row + 11)
+        if (pid_block >= block_start) & (pid_block < block_end):
+            src_req_size = tl.load(row + 14)
+            src_step_size = tl.load(row + 15)
+            dst_req_size = tl.load(row + 16)
+            if (
+                (dst_idx < dst_req_size)
+                & (src_idx < src_req_size)
+                & (step_idx < src_step_size)
+            ):
+                src_ptr = tl.load(row + 0).to(tl.pointer_type(tl.int16))
+                dst_ptr = tl.load(row + 1).to(tl.pointer_type(tl.int16))
+                elem_per_entry = tl.load(row + 2)
+                src_layer_stride = tl.load(row + 3)
+                src_req_stride = tl.load(row + 4)
+                src_step_stride = tl.load(row + 5)
+                src_dim_stride = tl.load(row + 6)
+                src_win_stride = tl.load(row + 7)
+                dst_layer_stride = tl.load(row + 8)
+                dst_req_stride = tl.load(row + 9)
+                last_axis = tl.load(row + 12)
+                blocks_per_layer = tl.load(row + 13)
+
+                local = pid_block - block_start
+                layer = local // blocks_per_layer
+                start = (local % blocks_per_layer) * BLOCK_SIZE
+                e = start + tl.arange(0, BLOCK_SIZE)
+                mask = e < elem_per_entry
+                d = e // last_axis
+                w = e % last_axis
+                src_off = (
+                    layer * src_layer_stride
+                    + src_idx * src_req_stride
+                    + step_idx * src_step_stride
+                    + d * src_dim_stride
+                    + w * src_win_stride
+                )
+                dst_off = layer * dst_layer_stride + dst_idx * dst_req_stride + e
+                data = tl.load(src_ptr + src_off, mask=mask, other=0)
+                tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+def _entry_contiguous(t: torch.Tensor, entry_start_dim: int) -> bool:
+    expected = 1
+    for i in range(t.ndim - 1, entry_start_dim - 1, -1):
+        if t.shape[i] != 1 and t.stride(i) != expected:
+            return False
+        expected *= t.shape[i]
+    return True
+
+
+def commit_glue_eligible(conv_pairs, flat_pairs) -> bool:
+    """Conv windows: 2-byte [L, cache, dim, K-1] <- [L, spec, steps, dim, K-1];
+    flat states: any even-size dtype, contiguous src, entry-contiguous dst."""
+    pairs = list(conv_pairs) + list(flat_pairs)
+    if not (0 < len(pairs) <= _COMMIT_GLUE_MAX_TYPES):
+        return False
+    device = pairs[0][0].device
+    for dst, src in pairs:
+        if dst.device != device or src.device != device or dst.dtype != src.dtype:
+            return False
+        if dst.element_size() % 2 != 0:
+            return False
+        if dst.shape[0] != src.shape[0] or dst.shape[2:] != src.shape[3:]:
+            return False
+        if not _entry_contiguous(dst, 2):
+            return False
+    for dst, src in conv_pairs:
+        if dst.element_size() != 2 or dst.ndim != 4 or src.ndim != 5:
+            return False
+    for dst, src in flat_pairs:
+        if dst.ndim < 2 or src.ndim < 3 or not src.is_contiguous():
+            return False
+    return True
+
+
+def _commit_glue_build_meta(conv_pairs, flat_pairs, block_size: int):
+    # Columns: src_ptr, dst_ptr, elem, s_l, s_r, s_s, s_d, s_w, d_l, d_r,
+    # block_start, block_end, last_axis, blocks_per_layer, src_req, src_step, dst_req.
+    rows = []
+    block_start = 0
+    for dst, src in list(conv_pairs) + list(flat_pairs):
+        is_conv = len(rows) < len(conv_pairs)
+        words = dst.element_size() // 2
+        elem = dst.numel() // (dst.shape[0] * dst.shape[1]) * words
+        if is_conv:
+            src_dim_stride, src_win_stride = src.stride(3), src.stride(4)
+            last_axis = dst.shape[3]
+        else:
+            src_dim_stride, src_win_stride = 0, 1
+            last_axis = elem
+        blocks_per_layer = triton.cdiv(elem, block_size)
+        block_end = block_start + dst.shape[0] * blocks_per_layer
+        rows.append(
+            [
+                src.data_ptr(),
+                dst.data_ptr(),
+                elem,
+                src.stride(0) * words,
+                src.stride(1) * words,
+                src.stride(2) * words,
+                src_dim_stride,
+                src_win_stride,
+                dst.stride(0) * words,
+                dst.stride(1) * words,
+                block_start,
+                block_end,
+                max(last_axis, 1),
+                blocks_per_layer,
+                src.shape[1],
+                src.shape[2],
+                dst.shape[1],
+            ]
+        )
+        block_start = block_end
+    device = (list(conv_pairs) + list(flat_pairs))[0][0].device
+    meta = torch.tensor(rows, dtype=torch.int64, device=device)
+    return meta, block_start
+
+
+def fused_commit_glue_scatter(
+    conv_pairs,
+    flat_pairs,
+    dst_indices_raw: torch.Tensor,
+    step_indices_raw: torch.Tensor,
+    dst_indices2_raw: torch.Tensor | None = None,
+    step_indices2_raw: torch.Tensor | None = None,
+) -> None:
+    """Bit-exact single launch of the per-pair conv-window and flat scatters for
+    both index sets. Needs ``commit_glue_eligible`` and disjoint accept/track
+    slots: the per-pair path writes the track set last."""
+    n1 = step_indices_raw.shape[0]
+    n2 = 0 if step_indices2_raw is None else step_indices2_raw.shape[0]
+    if n1 + n2 == 0:
+        return
+    if dst_indices_raw.shape != step_indices_raw.shape or (
+        n2 > 0 and dst_indices2_raw.shape != step_indices2_raw.shape
+    ):
+        raise ValueError("fused_commit_glue_scatter: indices length mismatch")
+
+    BLOCK_SIZE = 1024
+    key = tuple(
+        (dst.data_ptr(), src.data_ptr(), dst.dtype)
+        + tuple(src.stride())
+        + tuple(src.shape)
+        + tuple(dst.stride())
+        + tuple(dst.shape)
+        for dst, src in list(conv_pairs) + list(flat_pairs)
+    ) + (len(conv_pairs),)
+    cached = _commit_glue_meta_cache.get(key)
+    if cached is None:
+        cached = _commit_glue_build_meta(conv_pairs, flat_pairs, BLOCK_SIZE)
+        _commit_glue_meta_cache.clear()
+        _commit_glue_meta_cache[key] = cached
+    meta, total_blocks = cached
+
+    idx1 = (
+        dst_indices_raw
+        if dst_indices_raw.is_contiguous()
+        else dst_indices_raw.contiguous()
+    )
+    st1 = (
+        step_indices_raw
+        if step_indices_raw.is_contiguous()
+        else step_indices_raw.contiguous()
+    )
+    if n2 > 0:
+        idx2 = (
+            dst_indices2_raw
+            if dst_indices2_raw.is_contiguous()
+            else dst_indices2_raw.contiguous()
+        )
+        st2 = (
+            step_indices2_raw
+            if step_indices2_raw.is_contiguous()
+            else step_indices2_raw.contiguous()
+        )
+    else:
+        idx2, st2 = idx1, st1
+
+    grid = (n1 + n2, total_blocks)
+    _fused_commit_glue_scatter_kernel[grid](
+        meta,
+        idx1,
+        st1,
+        idx2,
+        st2,
+        n1,
+        NUM_TYPES=len(conv_pairs) + len(flat_pairs),
+        META_COLS=_COMMIT_GLUE_META_COLS,
+        BLOCK_SIZE=BLOCK_SIZE,
     )

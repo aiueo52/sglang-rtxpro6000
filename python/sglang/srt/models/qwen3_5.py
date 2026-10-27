@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2025 Qwen Team
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");

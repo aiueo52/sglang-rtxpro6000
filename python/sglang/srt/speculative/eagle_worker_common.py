@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
@@ -8,7 +9,10 @@ import torch
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_draft_cache_locs_contiguous,
 )
-from sglang.kernels.ops.speculative.eagle import fill_bonus_tokens_func
+from sglang.kernels.ops.speculative.eagle import (
+    draft_extend_lens,
+    fill_bonus_tokens_func,
+)
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
@@ -19,6 +23,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
+    _cap_vt_chain_edges,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
     eagle_sample,
@@ -114,6 +119,7 @@ def prepare_for_draft_extend(
     return_hidden_states_before_norm: bool,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
+    fused_lens: bool = False,
 ):
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
@@ -155,7 +161,15 @@ def prepare_for_draft_extend(
     )
     # init_new requires both list or both Tensor;
     # gpu_only emits device tensors to skip H2D.
-    if gpu_only:
+    seq_lens_after = None
+    if gpu_only and fused_lens and batch.seq_lens.is_contiguous():
+        batch.prefix_lens, batch.extend_lens, seq_lens_after = draft_extend_lens(
+            batch.seq_lens,
+            front_offset=front_offset,
+            num_window_tokens=num_window_tokens,
+            num_draft_tokens=num_draft_tokens,
+        )
+    elif gpu_only:
         batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
         batch.extend_lens = torch.full(
             (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
@@ -184,7 +198,10 @@ def prepare_for_draft_extend(
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-    forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+    if seq_lens_after is not None and forward_batch.seq_lens is batch.seq_lens:
+        forward_batch.seq_lens = seq_lens_after
+    else:
+        forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
     if not gpu_only:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
@@ -331,6 +348,8 @@ def build_eagle_verify_input(
     chain_topk1: bool = False,
     draft_support_probs: Optional[torch.Tensor] = None,
     draft_support_tokens: Optional[torch.Tensor] = None,
+    vt_confidence: Optional[torch.Tensor] = None,
+    target_attn_backend=None,
 ) -> EagleVerifyInput:
     """Shared draft() tail: idle input, tree-mask build, EagleVerifyInput assembly.
 
@@ -349,7 +368,25 @@ def build_eagle_verify_input(
     # Write straight into the backend's buffer when it owns one and this batch
     # fits; an eager batch past the captured max_bs falls back to allocating.
     bs = batch.seq_lens.shape[0]
-    target_attn_backend = target_worker.model_runner.attn_backend
+    vt_lens = None
+    if vt_confidence is not None:
+        from sglang.srt.speculative.vt_kernels import compute_lengths
+
+        from sglang.srt.speculative.dl_policy import dl_hostw_enabled, dl_tau
+
+        if bs != 1 or topk != 1 or num_draft_tokens != num_steps + 1:
+            raise ValueError("VT/HOSTW requires one unpadded topk=1 draft chain")
+
+        if dl_tau() > 0:
+            from sglang.srt.speculative.vt_kernels import length_buffer
+
+            vt_lens = length_buffer(vt_confidence.device)
+            if dl_hostw_enabled():
+                vt_lens = vt_lens[:bs]
+        else:
+            vt_lens = compute_lengths(vt_confidence, num_steps)
+    if target_attn_backend is None:
+        target_attn_backend = target_worker.model_runner.attn_backend
     verify_mask = target_attn_backend.verify_mask
     if verify_mask is None:
         tree_mask_buf, mask_mode, fill_mask = None, tree_mask_mode, True
@@ -407,6 +444,7 @@ def build_eagle_verify_input(
         draft_probs=draft_probs,
         draft_support_probs=draft_support_probs,
         draft_support_tokens=draft_support_tokens,
+        vt_lens=vt_lens,
     )
 
 
@@ -508,6 +546,9 @@ def run_eagle_verify(
             target_worker,
         )
 
+    if verify_input.draft_reserved_token_num is not None and not batch.forward_mode.is_idle() and not can_run_cuda_graph:
+        raise RuntimeError("HOSTW requires a registered target verify graph for this batch")
+
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
     record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
@@ -539,10 +580,14 @@ def run_eagle_verify(
             ),
         )
 
-    # Must stay ahead of the target verify launch below.
+    # Must stay ahead of the target verify launch below. With VT the bitmask covers
+    # only rows 0..L, the rows acceptance can reach (same cap as eagle_sample);
+    # without VT (vt_lens None) the tree is passed through unchanged.
     grammar_tree = (
         GrammarTree.from_device(
-            verify_input.retrieve_next_token,
+            _cap_vt_chain_edges(
+                verify_input.retrieve_next_token, getattr(verify_input, "vt_lens", None)
+            ),
             verify_input.retrieve_next_sibling,
             verify_input.draft_token.view(verify_input.retrieve_next_token.shape),
         )
@@ -592,6 +637,19 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
+    context_topk_ids = None
+    if (
+        getattr(verify_input, "draft_context_vocab", False)
+        and not batch.forward_mode.is_idle()
+        and getattr(logits_output, "draft_context_topk_ids", None) is not None
+    ):
+        from sglang.srt.speculative.draft_context_vocab import select_context_topk_rows
+
+        # accept_lens includes the bonus. Gather the actual tree path before
+        # compaction, and own the IDs before a later target graph reuses them.
+        context_topk_ids = select_context_topk_rows(
+            logits_output.draft_context_topk_ids, accept_index, accept_lens
+        )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
@@ -603,7 +661,7 @@ def run_eagle_verify(
             batch.req_pool_indices,
             batch.seq_lens,
             accept_lens,
-            num_draft_tokens,
+            verify_input.draft_reserved_token_num or num_draft_tokens,
         )
 
     # Update mamba state for hybrid GDN models after verification
@@ -664,4 +722,5 @@ def run_eagle_verify(
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
+        draft_context_topk_ids=context_topk_ids,
     )

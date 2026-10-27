@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.speculative.adaptive_spec_params import adaptive_capture_bs_for_step
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_utils import RS_DRAFT_TOPK, SPEC_SPARSE_RS, resolve_num_tokens_per_req
@@ -154,9 +156,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        all_capture_bs = self.capture_bs
+        if get_spec().speculative_adaptive:
+            self.capture_bs = adaptive_capture_bs_for_step(
+                capture_bs=all_capture_bs,
+                step=self.speculative_num_steps,
+                cfg_path=get_spec().speculative_adaptive_config,
+            )
         # Static capture width.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_decode")
-        self.max_bs = max(self.capture_bs)
+        self.max_bs = max(self.capture_bs, default=max(all_capture_bs))
         self.max_num_token = self.max_bs * self.captured_req_width
 
         # Attention backend init
@@ -331,6 +340,16 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def assert_adaptive_graph_coverage(self, required_bs: list[int]) -> None:
+        assert set(required_bs).issubset(self.capture_bs), (
+            f"Missing adaptive graph buckets: steps={self.speculative_num_steps}, "
+            f"required={required_bs}, captured={self.capture_bs}"
+        )
+        for bs in required_bs:
+            assert self.backend.can_run(
+                None, self._make_graph_key(bs)
+            ), f"Missing adaptive graph: steps={self.speculative_num_steps}, bs={bs}"
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         # EAGLE doesn't use stream_idx / lora variants.
         return ShapeKey(size=bs)
@@ -339,6 +358,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     # can_run_graph
     # -----------------------------------------------------------------
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not self.capture_bs:
+            return False
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
@@ -507,6 +528,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
             set_is_extend_in_batch(False)
 
+            positions_backup = (
+                forward_batch.positions.clone()
+                if getattr(self.eagle_worker, "_dl_enabled", False) else None
+            )
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
             dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
@@ -516,7 +541,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
-            forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
+            if positions_backup is not None:
+                # IF bodies increment positions only when executed.
+                forward_batch.positions.copy_(positions_backup)
+            else:
+                forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
         with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):

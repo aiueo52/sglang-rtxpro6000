@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import bisect
@@ -12,6 +13,8 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    commit_glue_eligible,
+    fused_commit_glue_scatter,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
     scatter_mamba_states_after_mtp_verify,
@@ -19,6 +22,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_if_needed,
 )
 from sglang.srt.configs.hybrid_arch import mamba2_config
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
@@ -991,6 +995,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # sidecar, so the verify-commit dispatch below stays GDN-only by
         # construction rather than by inspecting pool buffers.
         self._recover_ssm = linear_attn_backend._recover_ssm
+        self._commit_glue_fused = (
+            self._recover_ssm and envs.SGLANG_OPT_COMMIT_GLUE_FUSED.get()
+        )
+        if self._commit_glue_fused:
+            logger.info("SGLANG_OPT_COMMIT_GLUE_FUSED on: RecoverSSM commit glue fused")
         # gdn_mtp_cache_mode=none recovery overlap: run the (eager) SSM-state
         # recovery on a dedicated side stream so its GPU work overlaps the next
         # step's draft-phase compute, then join before the next target forward
@@ -1385,6 +1394,14 @@ class HybridLinearAttnBackend(AttentionBackend):
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
             )
+            if self._commit_glue_fused and self._commit_glue_scatter(
+                mamba_caches=mamba_caches,
+                state_indices_tensor=state_indices_tensor,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+            ):
+                return
             # Conv-state rollback uses the cached (deduplicated sliding-window)
             # conv windows via the strided-read scatter variant.
             fused_conv_window_scatter_with_mask(
@@ -1528,6 +1545,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         Padded rows (bucket - B) point at reserved SSM slot 0 (never allocated to
         a real request; free_slots starts at 1), so their output is harmless.
         """
+        if not capture_bs:
+            return
         from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
             fi_recovery_kernel,
         )
@@ -1539,6 +1558,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
         stash_per_layer = getattr(self.linear_attn_backend, "_no_cache_stash", {})
         if not stash_per_layer:
+            assert (
+                not get_spec().speculative_adaptive
+            ), "Adaptive GDN recovery stash is missing at graph capture"
             logger.warning(
                 "[gdn_recovery] stash not allocated at capture time; "
                 "recovery will run eagerly on the side stream (no cuda graph)."
@@ -1643,6 +1665,14 @@ class HybridLinearAttnBackend(AttentionBackend):
                         )
                     self._rec_boundary_graphs[B] = gb
             self._rec_capture_bs = buckets
+            if get_spec().speculative_adaptive:
+                assert set(capture_bs).issubset(
+                    self._rec_graphs
+                ), f"Missing adaptive GDN recovery graphs: {capture_bs}"
+                if capture_boundary:
+                    assert set(capture_bs).issubset(
+                        self._rec_boundary_graphs
+                    ), f"Missing adaptive GDN boundary graphs: {capture_bs}"
             logger.info(
                 "[gdn_recovery] captured %d recovery cuda graphs (buckets=%s, "
                 "boundary=%s)",
@@ -1651,6 +1681,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                 capture_boundary,
             )
         except Exception as e:
+            if get_spec().speculative_adaptive:
+                raise AssertionError(
+                    "Adaptive GDN recovery graph capture failed"
+                ) from e
             logger.warning(
                 "[gdn_recovery] recovery cuda graph capture failed (%s); "
                 "falling back to eager side-stream recovery.",
@@ -1987,10 +2021,27 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
     ):
         """Roll the accepted per-step PLE side states into their main slots."""
-        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
 
+        for state, intermediate_state in self._ple_state_pairs():
+            self._scatter_speculative_state_with_mask(
+                state,
+                intermediate_state,
+                state_indices_tensor,
+                last_correct_step_indices,
+            )
+            if mamba_track_indices is not None:
+                self._scatter_speculative_state_with_mask(
+                    state,
+                    intermediate_state,
+                    mamba_track_indices,
+                    mamba_steps_to_track,
+                )
+
+    def _ple_state_pairs(self):
+        """(state, intermediate) pairs of the allocated PLE side-state pools."""
+        req_to_token_pool = self.linear_attn_backend.req_to_token_pool
         state_pairs = []
         short_conv_pool = req_to_token_pool.short_conv_pool
         if (
@@ -2016,20 +2067,37 @@ class HybridLinearAttnBackend(AttentionBackend):
                 )
             )
 
-        for state, intermediate_state in state_pairs:
-            self._scatter_speculative_state_with_mask(
-                state,
-                intermediate_state,
-                state_indices_tensor,
-                last_correct_step_indices,
-            )
-            if mamba_track_indices is not None:
-                self._scatter_speculative_state_with_mask(
-                    state,
-                    intermediate_state,
-                    mamba_track_indices,
-                    mamba_steps_to_track,
-                )
+        return state_pairs
+
+    def _commit_glue_scatter(
+        self,
+        mamba_caches,
+        state_indices_tensor: torch.Tensor,
+        last_correct_step_indices: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor],
+        mamba_steps_to_track: Optional[torch.Tensor],
+    ) -> bool:
+        """SGLANG_OPT_COMMIT_GLUE_FUSED: the RecoverSSM conv-window rollback plus
+        _update_ple_state_after_mtp_verify in one launch; False -> per-pair path."""
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+        conv_pairs = [
+            (mamba_caches.conv[0], mamba_caches.intermediate_conv_window[0])
+        ]
+        flat_pairs = self._ple_state_pairs()
+        if not commit_glue_eligible(conv_pairs=conv_pairs, flat_pairs=flat_pairs):
+            return False
+        # Accept and track slots are disjoint pool slots, as the existing
+        # fused_conv_window_scatter_multi (one launch for both sets) relies on.
+        fused_commit_glue_scatter(
+            conv_pairs=conv_pairs,
+            flat_pairs=flat_pairs,
+            dst_indices_raw=state_indices_tensor,
+            step_indices_raw=last_correct_step_indices,
+            dst_indices2_raw=mamba_track_indices,
+            step_indices2_raw=mamba_steps_to_track,
+        )
+        return True
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):

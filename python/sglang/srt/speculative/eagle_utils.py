@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import logging
@@ -716,6 +717,29 @@ def _sparse_rs_verify_kp(*, batch: ScheduleBatch, sampling_info: SamplingBatchIn
     return sparse_verify_width(max(r.sampling_params.top_k for r in batch.reqs))
 
 
+def _cap_vt_chain_edges(
+    retrieve_next_token: torch.Tensor, vt_lens: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Cut outgoing chain links at device L without changing the verify tree.
+
+    Row L remains a target/bonus row, but its draft successor is not verified.
+    The draft policy supplies lengths in [0, num_verify_tokens - 1].
+    """
+    if vt_lens is None:
+        return retrieve_next_token
+    if (
+        retrieve_next_token.ndim != 2
+        or vt_lens.shape != retrieve_next_token.shape[:1]
+        or vt_lens.dtype != torch.int32
+        or vt_lens.device != retrieve_next_token.device
+    ):
+        raise ValueError("VT acceptance requires device int32 lengths of shape [bs].")
+    rows = torch.arange(
+        retrieve_next_token.shape[1], device=vt_lens.device, dtype=vt_lens.dtype
+    )
+    return torch.where(rows.unsqueeze(0) < vt_lens.unsqueeze(1), retrieve_next_token, -1)
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -783,6 +807,17 @@ def eagle_sample(
     if grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
+    vt_lens = getattr(verify_input, "vt_lens", None)
+    retrieve_next_token = verify_input.retrieve_next_token
+    if vt_lens is not None:
+        if verify_input.tree_topk != 1:
+            raise ValueError("VT acceptance requires speculative_eagle_topk=1.")
+        if SIMULATE_ACC_LEN > 0:
+            raise ValueError("VT acceptance is incompatible with simulated acceptance.")
+        # Keep this cap local: attention still consumes the full tree; run_eagle_verify
+        # applies the same cap to the grammar bitmask tree.
+        retrieve_next_token = _cap_vt_chain_edges(retrieve_next_token, vt_lens)
+
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
@@ -802,7 +837,7 @@ def eagle_sample(
             accept_token_num=num_correct_drafts,  # mutable
             candidates=candidates,
             retrieve_index=verify_input.retrieve_index,
-            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_token=retrieve_next_token,
             retrieve_next_sibling=verify_input.retrieve_next_sibling,
             target_predict=target_predict,
             topk=verify_input.tree_topk,
@@ -866,6 +901,7 @@ def eagle_sample(
                 draft_support_tokens=verify_input.draft_support_tokens,
                 vocab_size=next_token_logits.shape[-1],
                 **({"block_verify": RS_BLOCK_VERIFY} if RS_BLOCK_VERIFY else {}),
+                **({"vt_lens": vt_lens} if vt_lens is not None else {}),
             )
             if RS_DUMP_DIR:
                 from sglang.srt.speculative.rs_dump import record_verify
@@ -890,7 +926,7 @@ def eagle_sample(
                 accept_token_num=num_correct_drafts,  # mutable
                 candidates=candidates,
                 retrive_index=verify_input.retrieve_index,
-                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_token=retrieve_next_token,
                 retrive_next_sibling=verify_input.retrieve_next_sibling,
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
@@ -979,7 +1015,7 @@ def eagle_sample(
                     (*verify_input.draft_support_probs.shape[:2], target_probs.shape[-1]),
                     dtype=torch.float32, device=device,
                 )
-                draft_probs.scatter_(dim=2, index=verify_input.draft_support_tokens,
+                draft_probs.scatter_add_(dim=2, index=verify_input.draft_support_tokens,
                                      src=verify_input.draft_support_probs)
             # Defense-in-depth behind the spec_hook startup allowlist: validate
             # the actual kernel inputs before the Triton kernel.
@@ -1006,7 +1042,7 @@ def eagle_sample(
                 candidates=candidates,
                 # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
                 retrive_index=verify_input.retrieve_index,
-                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_token=retrieve_next_token,
                 retrive_next_sibling=verify_input.retrieve_next_sibling,
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
@@ -1015,6 +1051,11 @@ def eagle_sample(
                 threshold_single=get_spec().speculative_accept_threshold_single,
                 threshold_acc=get_spec().speculative_accept_threshold_acc,
                 deterministic=True,
+                **(
+                    {"vt_lens": vt_lens}
+                    if vt_lens is not None and use_rejection_sampling
+                    else {}
+                ),
             )
             del (
                 expanded_temperature,

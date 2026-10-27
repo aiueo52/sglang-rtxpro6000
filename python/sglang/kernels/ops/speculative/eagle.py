@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 import torch
 import triton
 import triton.language as tl
@@ -89,3 +91,55 @@ def fill_accept_out_cache_loc_func(
         accept_out_cache_loc,
         next_power_of_2(size),
     )
+
+
+@triton.jit
+def _draft_extend_lens_kernel(
+    seq_lens_ptr,
+    prefix_lens_ptr,
+    extend_lens_ptr,
+    seq_lens_after_ptr,
+    bs,
+    front_offset,
+    num_window_tokens,
+    num_draft_tokens,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < bs
+    seq_lens = tl.load(seq_lens_ptr + offs, mask=mask, other=0)
+    prefix_lens = tl.maximum(seq_lens - front_offset, 0)
+    tl.store(prefix_lens_ptr + offs, prefix_lens.to(tl.int32), mask=mask)
+    extend_lens = tl.full([BLOCK], num_window_tokens, tl.int32)
+    tl.store(extend_lens_ptr + offs, extend_lens, mask=mask)
+    tl.store(seq_lens_after_ptr + offs, seq_lens + num_draft_tokens, mask=mask)
+
+
+def draft_extend_lens(
+    seq_lens: torch.Tensor,
+    *,
+    front_offset: int,
+    num_window_tokens: int,
+    num_draft_tokens: int,
+):
+    """One launch for the gpu_only draft-extend lengths: int32 prefix_lens
+    (seq_lens - front_offset clamped at 0), int32 extend_lens and seq_lens +
+    num_draft_tokens; bit-exact vs the torch ops in prepare_for_draft_extend."""
+    bs = seq_lens.shape[0]
+    prefix_lens = torch.empty((bs,), dtype=torch.int32, device=seq_lens.device)
+    extend_lens = torch.empty_like(prefix_lens)
+    seq_lens_after = torch.empty_like(seq_lens)
+    if bs > 0:
+        block = min(next_power_of_2(bs), 1024)
+        _draft_extend_lens_kernel[(triton.cdiv(bs, block),)](
+            seq_lens,
+            prefix_lens,
+            extend_lens,
+            seq_lens_after,
+            bs,
+            front_offset,
+            num_window_tokens,
+            num_draft_tokens,
+            BLOCK=block,
+        )
+    return prefix_lens, extend_lens, seq_lens_after

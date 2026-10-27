@@ -1,6 +1,8 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -8,6 +10,7 @@ import triton
 import triton.language as tl
 
 _DRAFT_TOPK1_BLOCK = 8192
+_DRAFT_CTX_VOCAB = int(os.environ.get("SGLANG_RND_DRAFT_CTX_VOCAB", "0")) > 0
 
 
 @triton.jit
@@ -20,6 +23,7 @@ def _draft_topk1_partial_argmax_kernel(
     vocab_size: tl.constexpr,
     num_splits: tl.constexpr,
     WRITE_PROB: tl.constexpr,
+    MASK_EMPTY_SPLITS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     # int64 row base: row * stride overflows int32 once bs * vocab reaches 2^31.
@@ -42,8 +46,11 @@ def _draft_topk1_partial_argmax_kernel(
     tl.store(partial_indices + out_offset, split * BLOCK + local_index)
     if WRITE_PROB:
         # Online-softmax partial: sum over this split of exp(v - m_split).
-        # Masked lanes hold -inf (-> exp 0) so they contribute nothing.
-        tl.store(partial_sums + out_offset, tl.sum(tl.exp(vals - max_val), axis=0))
+        # Use zero for an all-masked split so exp(-inf) contributes nothing.
+        sum_max = max_val
+        if MASK_EMPTY_SPLITS:
+            sum_max = tl.where(max_val == -float("inf"), 0.0, max_val)
+        tl.store(partial_sums + out_offset, tl.sum(tl.exp(vals - sum_max), axis=0))
 
 
 @triton.jit
@@ -190,6 +197,7 @@ def draft_topk1_postprocess(
         vocab_size,
         num_splits,
         WRITE_PROB=write_prob,
+        MASK_EMPTY_SPLITS=_DRAFT_CTX_VOCAB,
         BLOCK=block,
         num_warps=8,
     )
@@ -231,6 +239,7 @@ def _select_split_argmax(
     vocab_size: tl.constexpr,
     WRITE_ROWS: tl.constexpr,
     WRITE_PROB: tl.constexpr,
+    MASK_EMPTY_SPLITS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     offsets = split * BLOCK + tl.arange(0, BLOCK)
@@ -244,7 +253,10 @@ def _select_split_argmax(
     tl.store(partial_vals + out_offset, max_val)
     tl.store(partial_indices + out_offset, split * BLOCK + tl.argmax(vals, axis=0))
     if WRITE_PROB:
-        tl.store(partial_sums + out_offset, tl.sum(tl.exp(vals - max_val), axis=0))
+        sum_max = max_val
+        if MASK_EMPTY_SPLITS:
+            sum_max = tl.where(max_val == -float("inf"), 0.0, max_val)
+        tl.store(partial_sums + out_offset, tl.sum(tl.exp(vals - sum_max), axis=0))
 
 
 @triton.jit
@@ -269,6 +281,7 @@ def _draft_extend_select_partial_kernel(
     WRITE_ROWS: tl.constexpr,
     WRITE_PROB: tl.constexpr,
     COPY_HIDDEN: tl.constexpr,
+    MASK_EMPTY_SPLITS: tl.constexpr,
     BLOCK: tl.constexpr,
     HIDDEN_BLOCK: tl.constexpr,
 ):
@@ -300,6 +313,7 @@ def _draft_extend_select_partial_kernel(
                 vocab_size,
                 WRITE_ROWS,
                 WRITE_PROB,
+                MASK_EMPTY_SPLITS,
                 BLOCK,
             )
     else:
@@ -314,6 +328,7 @@ def _draft_extend_select_partial_kernel(
             vocab_size,
             WRITE_ROWS,
             WRITE_PROB,
+            MASK_EMPTY_SPLITS,
             BLOCK,
         )
 
@@ -435,6 +450,7 @@ def draft_extend_select_topk1(
         WRITE_ROWS=write_rows,
         WRITE_PROB=write_prob,
         COPY_HIDDEN=copy_hidden,
+        MASK_EMPTY_SPLITS=_DRAFT_CTX_VOCAB,
         BLOCK=block,
         HIDDEN_BLOCK=triton.next_power_of_2(max(hidden_size, 1)),
         num_warps=8,

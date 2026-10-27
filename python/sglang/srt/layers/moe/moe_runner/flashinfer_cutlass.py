@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """FlashInfer CUTLASS MoE fused funcs.
 
 This module owns the FlashInfer ``cutlass_fused_moe`` calls used by the
@@ -9,6 +10,7 @@ Quantization methods prepare a small quant_info payload and route through
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -27,8 +29,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.moe.prune_singleton import maybe_prune_singleton_routes
+from sglang.srt.layers.moe import oea_prologue
+from sglang.srt.speculative.vt_policy import vt_tau
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import next_power_of_2
+
+_VT_ENABLED = vt_tau() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -195,8 +201,17 @@ def _run_flashinfer_cutlass(
     # SGLANG_MOE_PRUNE_SINGLETON_TAU is set.  In place and CUDA-graph safe; see
     # sglang/srt/layers/moe/prune_singleton.py.  With SGLANG_MOE_PRUNE_IN_PROLOGUE=1
     # (P2) this is a no-op and FlashInfer's patched routing prologue applies the
-    # same mask in-kernel.
-    maybe_prune_singleton_routes(topk_ids, topk_weights)
+    # same mask in-kernel. Both implementations count only VT's live prefix.
+    vt_lens = None
+    if _VT_ENABLED:
+        from sglang.srt.speculative.vt_kernels import active_lengths, mask_verify_tail_
+
+        vt_lens = active_lengths()
+    maybe_prune_singleton_routes(
+        topk_ids, topk_weights, **({"vt_lens": vt_lens} if vt_lens is not None else {})
+    )
+    if _VT_ENABLED:
+        mask_verify_tail_(topk_ids, topk_weights)
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
@@ -228,6 +243,32 @@ def _run_flashinfer_cutlass(
             quant_scales[5],
         ]
 
+    policy_kwargs = {}
+    policy_active = False
+    if quant_info.quant_type == "fp4" and os.environ.get("SGLANG_TACTIC_ROWS", "0") != "0":
+        from flashinfer.fused_moe import tactic_rows_policy
+
+        if tactic_rows_policy.policy_enabled():
+            policy_active = True
+            from sglang.srt.model_executor.forward_context import (
+                get_forward_context,
+                has_forward_context,
+            )
+
+            capturing = torch.cuda.is_current_stream_capturing()
+            tactic_rows_policy.load_policy(capturing=capturing)
+            mode = getattr(get_forward_context(), "forward_mode", None) if has_forward_context() else None
+            mode_name = getattr(mode, "name", None)
+            if tactic_rows_policy.prefill_scope(mode_name):
+                profile_ids = tactic_rows_policy.requested_profile_ids(
+                    x.shape[0], capturing=capturing
+                )
+                if profile_ids is not None:
+                    policy_kwargs = {
+                        "tactic_rows_prefill": True,
+                        "profile_ids": profile_ids,
+                    }
+
     output = flashinfer_cutlass_fused_moe(
         output=output,
         input=x,
@@ -246,7 +287,13 @@ def _run_flashinfer_cutlass(
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
+        **({"vt_lens": vt_lens} if vt_lens is not None else {}),
+        **oea_prologue.call_kwargs(num_rows=x.shape[0]),
+        **policy_kwargs,
     )[0]
+
+    if policy_active:
+        tactic_rows_policy.record_forward(mode_name, x.shape[0], capturing=capturing)
 
     if quant_info.quant_type in ("bf16", "fp8"):
         _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)

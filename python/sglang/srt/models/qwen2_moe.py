@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
@@ -46,6 +47,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.quantization.w8a16_gemv import scratch_slot as _gemv_scratch_slot
+from sglang.srt.model_executor.forward_context import forward_batch_context
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -140,6 +142,8 @@ logger = logging.getLogger(__name__)
 # W4, 62 at W16). Requires the W8A16 Triton GEMV path (SGLANG_FP8_W8A16_GEMV=1).
 _SHARED_GATEUP_FUSED = os.environ.get("SGLANG_SHARED_GATEUP_FUSED", "0") == "1"
 _SHARED_GATEUP_FUSED_MAX_M = int(os.environ.get("SGLANG_FP8_W8A16_GEMV_MAX_M", "16"))
+if _SHARED_GATEUP_FUSED_MAX_M > 32:
+    raise ValueError("SGLANG_FP8_W8A16_GEMV_MAX_M must be <= 32")
 
 
 def _gateup_fused_layer_ok(layer: MergedColumnParallelLinear) -> bool:
@@ -1337,22 +1341,23 @@ class Qwen2MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
-        aux_hidden_states = None
-        if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-        if self.pp_group.is_last_rank:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+        with forward_batch_context(forward_batch):
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors=pp_proxy_tensors,
             )
-        else:
-            return hidden_states
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+            if self.pp_group.is_last_rank:
+                return self.logits_processor(
+                    input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+                )
+            else:
+                return hidden_states
 
     @torch.no_grad()
     def forward_split_prefill(
@@ -1363,39 +1368,40 @@ class Qwen2MoeForCausalLM(nn.Module):
         split_interval: Tuple[int, int],  # [start, end) 0-based
         input_embeds: torch.Tensor = None,
     ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
+        with forward_batch_context(forward_batch):
+            start, end = split_interval
+            # embed
+            if start == 0:
+                if input_embeds is None:
+                    forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+                else:
+                    forward_batch.hidden_states = input_embeds
 
-        # decoder layer
-        for i in range(start, end):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.model.layers[i]
-                forward_batch.hidden_states, forward_batch.residual = layer(
-                    positions,
-                    forward_batch.hidden_states,
-                    forward_batch,
-                    forward_batch.residual,
+            # decoder layer
+            for i in range(start, end):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.model.layers[i]
+                    forward_batch.hidden_states, forward_batch.residual = layer(
+                        positions,
+                        forward_batch.hidden_states,
+                        forward_batch,
+                        forward_batch.residual,
+                    )
+
+            if end == self.model.config.num_hidden_layers:
+                # norm
+                hidden_states, _ = self.model.norm(
+                    forward_batch.hidden_states, forward_batch.residual
                 )
+                forward_batch.hidden_states = hidden_states
+                # logits process
+                result = self.logits_processor(
+                    input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+                )
+            else:
+                result = None
 
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            hidden_states, _ = self.model.norm(
-                forward_batch.hidden_states, forward_batch.residual
-            )
-            forward_batch.hidden_states = hidden_states
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
+            return result
 
     @property
     def start_layer(self):

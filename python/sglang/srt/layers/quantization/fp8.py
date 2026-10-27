@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
@@ -15,6 +16,8 @@ import os as _os
 
 _W8A16_GEMV_ENABLED = _os.environ.get("SGLANG_FP8_W8A16_GEMV", "0") == "1"
 _W8A16_GEMV_MAX_M = int(_os.environ.get("SGLANG_FP8_W8A16_GEMV_MAX_M", "16"))
+if _W8A16_GEMV_MAX_M > 32:
+    raise ValueError("SGLANG_FP8_W8A16_GEMV_MAX_M must be <= 32")
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
@@ -985,13 +988,15 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def _w8a16_gemv_ok(self, layer: torch.nn.Module, x: torch.Tensor) -> bool:
         """Whether `apply` would route this call through the W8A16 Triton GEMV."""
+        from sglang.srt.model_executor.forward_context import get_gemv_m_limit
+
         return (
             _W8A16_GEMV_ENABLED
             and not self.use_marlin
             and not self.block_quant
             and not self.use_mxfp8
             and x.dim() == 2
-            and x.shape[0] <= _W8A16_GEMV_MAX_M
+            and x.shape[0] <= get_gemv_m_limit(_W8A16_GEMV_MAX_M)
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.float8_e4m3fn
             and layer.weight_scale.numel() == layer.weight.shape[1]

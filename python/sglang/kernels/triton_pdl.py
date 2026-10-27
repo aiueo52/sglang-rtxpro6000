@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Programmatic Dependent Launch (PDL) for the fork's own Triton kernels.
 
 The decode step runs ~1850 kernels inside CUDA graphs and the GPU is idle for

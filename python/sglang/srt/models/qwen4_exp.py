@@ -1,7 +1,11 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import hashlib
+import json
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -53,6 +57,7 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
+    forward_batch_context,
     get_attn_backend,
     get_req_to_token_pool,
 )
@@ -66,11 +71,252 @@ from sglang.srt.models.qwen3_5 import (
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.vt_policy import validate_environment
 from sglang.srt.utils import logger
+
+_VT_TAU = validate_environment()
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
 _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD = 1024
+
+# PLE side-stream and full-row verify switches.  Inert unless the process starts with
+# SGLANG_RND_PLE_SIDE=1; with it unset every path below is the unmodified one
+# (same kernels in the same order).  SGLANG_RND_PLE_SIDE_PARTS picks the halves
+# for an arm split (default "ab"):
+#   "a": the token-only PLE work runs on the PLE prefetch stream beside layer 0;
+#   "b": full-row target verify drops the PLE identities (see rows_full).
+_RND_PLE_SWITCH = os.environ.get("SGLANG_RND_PLE_SIDE") == "1"
+_RND_PLE_PARTS = (
+    os.environ.get("SGLANG_RND_PLE_SIDE_PARTS", "ab") if _RND_PLE_SWITCH else ""
+)
+_RND_PLE_A = "a" in _RND_PLE_PARTS
+_RND_PLE_B = "b" in _RND_PLE_PARTS
+
+
+def rnd_set_ple_parts(parts: str) -> None:
+    """Switch the PLE halves inside one process (in-process A/B tests).
+
+    Applies to forwards run, and graphs captured, after the call; graphs that
+    were captured before keep the path they recorded."""
+    global _RND_PLE_PARTS, _RND_PLE_A, _RND_PLE_B
+    _RND_PLE_PARTS = parts
+    _RND_PLE_A = "a" in parts
+    _RND_PLE_B = "b" in parts
+
+
+def _rnd_record_stream(tensors, stream) -> None:
+    """Made on one stream and used on another: tell the caching allocator.
+
+    Same rule as start_prefetch and the QSA indexer overlap."""
+    for tensor in tensors:
+        if tensor is not None and tensor.is_cuda:
+            tensor.record_stream(stream)
+
+
+def _rnd_tensors(value) -> list:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [t for item in value for t in _rnd_tensors(item)]
+    return []
+
+
+def _rnd_digest(tensors) -> str:
+    """64-bit digest of dtype, shape and bytes (test switch only; syncs)."""
+    digest = hashlib.blake2b(digest_size=8)
+    for tensor in tensors:
+        if tensor is None:
+            digest.update(b"none;")
+            continue
+        tensor = tensor.detach()
+        digest.update(f"{tensor.dtype}{tuple(tensor.shape)};".encode())
+        if tensor.numel():
+            flat = tensor.contiguous().reshape(-1).view(torch.uint8)
+            digest.update(flat.cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+class _RndPleTest:
+    """PLE test switch: SGLANG_RND_PLE_TEST=<jsonl path> (eager only).
+
+    Every target-verify forward runs once per arm on the same inputs: "" (the
+    reference), "a", "b", "ab", then "" again (the control).  A verify forward
+    rewrites only per-step buffers (KV at out_cache_loc, the intermediate
+    states), so a rerun sees the same inputs.
+
+    The production forward is not bit-reproducible against itself (HC mix
+    split-K partials and the MoE finalize add with float atomics), so the PLE
+    layer's input is pinned: the reference stores it and every later run
+    starts the PLE layer from that copy.  The token part (key_normed, value),
+    the n-gram commit and the PLE output then have the same inputs in every
+    run and must match bit for bit; the hidden after the PLE layer, the final
+    HC hidden, the logits and the greedy accept lengths still carry the
+    other layers' noise, which the control measures (max |x - ref|).
+
+    An arm that differs on a pinned part or on the accept lengths is run
+    again, then the reference again (last, so the returned output and the
+    cache writes are the reference's): the repeat tells a systematic
+    difference from noise.  One JSON line per verify forward, numbers and
+    booleans only.  Other modes run once."""
+
+    ARMS = ("", "a", "b", "ab", "")
+    NAMES = ("ref", "a", "b", "ab", "ctrl")
+    CONFIRM = frozenset(("kv", "commit", "ple", "accept"))
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.count = 0
+        self.kept = None
+        self.pinned = None
+        self.notes = {}
+
+    @staticmethod
+    def _flat(values) -> list:
+        tensors = []
+        for value in values:
+            if isinstance(value, _PendingHCCombine):
+                for item in (
+                    value.block_output,
+                    value.residuals,
+                    value.shared_output,
+                    value.shared_gate,
+                ):
+                    tensors += _rnd_tensors(item)
+            else:
+                tensors += _rnd_tensors(value)
+        return tensors
+
+    def keep(self, name: str, *values) -> None:
+        if self.kept is None:
+            return
+        self.kept[name] = [tensor.detach().clone() for tensor in self._flat(values)]
+
+    def note(self, **values) -> None:
+        """Which path the PLE layer took in this run (side stream, full rows)."""
+        if self.kept is not None:
+            self.notes.update({k: bool(v) for k, v in values.items()})
+
+    def pin(self, *values) -> None:
+        """The PLE layer's input: stored by the reference, copied into later runs."""
+        if self.kept is None:
+            return
+        tensors = self._flat(values)
+        if self.pinned is None:
+            self.pinned = [tensor.detach().clone() for tensor in tensors]
+            return
+        if [(t.shape, t.dtype) for t in tensors] != [
+            (p.shape, p.dtype) for p in self.pinned
+        ]:
+            raise RuntimeError("PLE test switch: the PLE layer input changed between arms")
+        for tensor, saved in zip(tensors, self.pinned):
+            tensor.copy_(saved)
+
+    @staticmethod
+    def _accept(logits, forward_batch, width):
+        if logits is None or width is None:
+            return None
+        rows = logits.shape[0] // width
+        if rows * width != logits.shape[0]:
+            return None
+        predicted = logits.argmax(dim=-1).reshape(rows, width)
+        drafts = forward_batch.input_ids.reshape(-1)[: rows * width].reshape(rows, width)
+        matched = (predicted[:, :-1] == drafts[:, 1:]).to(torch.int64)
+        return matched.cumprod(dim=1).sum(dim=1).tolist()
+
+    def _once(self, call, parts, forward_batch, width):
+        rnd_set_ple_parts(parts)
+        self.kept = {}
+        self.notes = {}
+        output = call()
+        kept, self.kept = self.kept, None
+        logits = getattr(output, "next_token_logits", None)
+        kept["hc"] = [
+            t.detach().clone() for t in _rnd_tensors(getattr(output, "hidden_states", None))
+        ]
+        kept["logits"] = [] if logits is None else [logits.detach().clone()]
+        digests = {name: _rnd_digest(values) for name, values in kept.items()}
+        record = (digests, self._accept(logits, forward_batch, width))
+        return output, kept, record, dict(self.notes)
+
+    @staticmethod
+    def _differ(first, second) -> list:
+        differ = sorted(k for k in first[0] if second[0].get(k) != first[0][k])
+        return differ + (["accept"] if first[1] != second[1] else [])
+
+    @staticmethod
+    def _maxabs(reference, kept, differ) -> dict:
+        out = {}
+        for name in differ:
+            if name == "accept":
+                continue
+            pairs = list(zip(reference.get(name, []), kept.get(name, [])))
+            if len(reference.get(name, [])) != len(kept.get(name, [])) or any(
+                r.shape != k.shape for r, k in pairs
+            ):
+                out[name] = None
+                continue
+            out[name] = max(
+                (float((k.float() - r.float()).abs().max()) for r, k in pairs if r.numel()),
+                default=0.0,
+            )
+        return out
+
+    def run(self, call, forward_batch):
+        if forward_batch is None or not _get_ple_forward_mode(forward_batch).is_target_verify():
+            return call()
+        width = int(forward_batch.spec_info.draft_token_num)
+        saved = _RND_PLE_PARTS
+        self.pinned = None
+        try:
+            output, ref_kept, reference, notes = self._once(call, "", forward_batch, width)
+            line = {
+                "i": self.count,
+                "mode": "TARGET_VERIFY",
+                "width": width,
+                "tokens": int(forward_batch.input_ids.numel()),
+                "kept": sorted(reference[0]),
+                "accept": reference[1],
+                "rows_full": notes.get("rows_full"),
+                "side": notes.get("side"),
+            }
+            records = {}
+            for name, parts in zip(self.NAMES[1:], self.ARMS[1:]):
+                output, kept, record, notes = self._once(call, parts, forward_batch, width)
+                differ = self._differ(reference, record)
+                line[name] = {
+                    "same": not differ,
+                    "differ": differ,
+                    "maxabs": self._maxabs(ref_kept, kept, differ),
+                    "side": notes.get("side"),
+                }
+                records[name] = (parts, record)
+                del kept
+            again = [
+                name for name in ("a", "b", "ab") if self.CONFIRM & set(line[name]["differ"])
+            ]
+            for name in again:
+                parts, record = records[name]
+                _, _, repeat, _ = self._once(call, parts, forward_batch, width)
+                line[name]["repeat_same"] = not self._differ(record, repeat)
+            if again:
+                output, _, repeat, _ = self._once(call, "", forward_batch, width)
+                line["ref_repeat_same"] = not self._differ(reference, repeat)
+        finally:
+            self.kept = None
+            self.pinned = None
+            rnd_set_ple_parts(saved)
+        self.count += 1
+        with open(self.path, "a") as stream:
+            stream.write(json.dumps(line, sort_keys=True) + "\n")
+        return output
+
+
+_RND_PLE_TEST = (
+    _RndPleTest(os.environ["SGLANG_RND_PLE_TEST"])
+    if os.environ.get("SGLANG_RND_PLE_TEST")
+    else None
+)
 
 
 def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -108,6 +354,11 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     state_indices: torch.Tensor
     ngram_context: Optional[torch.Tensor]
     ngram_eos_token_id: Optional[int]
+    # PLE full-row verify: True only for target verify whose `lengths` is the constant
+    # row_width (the torch.full branch of _prepare_ple_batch).  Then every token
+    # is valid and (req_indices, token_offsets) is the row-major walk of the
+    # (rows, row_width) grid; _ple_rows_full_holds checks this on the tensors.
+    rows_full: bool = False
 
 
 def _prepare_ple_batch(
@@ -145,6 +396,7 @@ def _prepare_ple_batch(
     tokens = input_ids[:processed_tokens]
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
+    rows_full = False
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
         row_width = int(forward_batch.spec_info.draft_token_num)
@@ -157,16 +409,19 @@ def _prepare_ple_batch(
         # Eager verify can carry a valid length smaller than its fixed row
         # stride.  Ignore the synthetic one-token lengths created when DP
         # attention temporarily rewrites verify as EXTEND.
-        lengths = (
-            forward_batch.extend_seq_lens[:sequence_count].long()
-            if forward_batch.forward_mode.is_target_verify()
+        rows_full = not (
+            forward_batch.forward_mode.is_target_verify()
             and forward_batch.extend_seq_lens is not None
-            else torch.full(
+        )
+        lengths = (
+            torch.full(
                 (sequence_count,),
                 row_width,
                 dtype=torch.long,
                 device=tokens.device,
             )
+            if rows_full
+            else forward_batch.extend_seq_lens[:sequence_count].long()
         )
         if lengths.shape[0] != sequence_count:
             raise RuntimeError(
@@ -246,6 +501,10 @@ def _prepare_ple_batch(
             # true.  The view is exactly the tensor the fill/where/index-put chain
             # would materialize.
             padded = tokens.unsqueeze(1)
+        elif _RND_PLE_B and rows_full:
+            # PLE full-row verify: all tokens valid, row-major walk -> the fill/where/
+            # index-put chain below materializes exactly this view.
+            padded = tokens.reshape(sequence_count, row_width)
         else:
             padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
             if processed_tokens:
@@ -275,6 +534,27 @@ def _prepare_ple_batch(
         state_indices=state_indices,
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
+        rows_full=rows_full,
+    )
+
+
+def _ple_rows_full_holds(batch: _PLEBatch) -> bool:
+    """Check on the tensors what the PLE (B) shortcuts assume (syncs; tests
+    and debugging only, never on the hot path)."""
+    if not batch.rows_full or not batch.mode.is_target_verify():
+        return False
+    rows = batch.lengths.shape[0]
+    width = batch.row_width
+    if batch.processed_tokens != rows * width:
+        return False
+    walk = torch.arange(
+        batch.processed_tokens, device=batch.req_indices.device, dtype=torch.long
+    )
+    return bool(
+        torch.equal(batch.lengths, torch.full_like(batch.lengths, width))
+        and bool(batch.valid_tokens.all())
+        and torch.equal(batch.req_indices, walk // width)
+        and torch.equal(batch.token_offsets, walk % width)
     )
 
 
@@ -289,16 +569,24 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
     context_len = context.shape[1] - batch.row_width
     if batch.mode.is_target_verify():
         step_contexts = context.unfold(1, context_len, 1)[:, 1:]
+        if _RND_PLE_B and batch.rows_full:
+            # PLE full-row verify: every step is valid, so the where keeps step_contexts
+            # (set_intermediate_context copies it either way).
+            if _RND_PLE_TEST is not None:
+                _RND_PLE_TEST.keep("commit", step_contexts)
+            pool.set_ngram_intermediate_context(step_contexts)
+            return
         valid_steps = batch.valid_tokens.reshape(
             batch.lengths.shape[0], batch.row_width
         )
-        pool.set_ngram_intermediate_context(
-            torch.where(
-                valid_steps.unsqueeze(-1),
-                step_contexts,
-                torch.full_like(step_contexts, batch.ngram_eos_token_id),
-            )
+        intermediate_context = torch.where(
+            valid_steps.unsqueeze(-1),
+            step_contexts,
+            torch.full_like(step_contexts, batch.ngram_eos_token_id),
         )
+        if _RND_PLE_TEST is not None:
+            _RND_PLE_TEST.keep("commit", intermediate_context)
+        pool.set_ngram_intermediate_context(intermediate_context)
         return
 
     if batch.use_decode_fast_path:
@@ -952,6 +1240,8 @@ class Qwen4ExpPLELayer(nn.Module):
         self._graph_prefetch_buffers = {}
         self._eager_prefetch_buffer = None
         self._prefetch_state = None
+        # PLE side-stream: (key_normed, value) made on _prefetch_stream, not joined yet.
+        self._rnd_side_state = None
 
     def _apply_ple_norm(self, norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
         y = norm(x.flatten(-2, -1))
@@ -1008,10 +1298,17 @@ class Qwen4ExpPLELayer(nn.Module):
             return F.silu(conv_output)
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
-        padded_seq = x.new_zeros(
-            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
-        )
-        padded_seq[batch.req_indices, batch.token_offsets] = x
+        # PLE full-row verify: full rows -> x is already the padded row grid.
+        rnd_full = _RND_PLE_B and batch.rows_full
+        if rnd_full:
+            padded_seq = x.reshape(
+                batch.lengths.shape[0], batch.row_width, self.conv_channels
+            )
+        else:
+            padded_seq = x.new_zeros(
+                (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+            )
+            padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
         conv_output = F.conv1d(
             conv_input,
@@ -1025,13 +1322,12 @@ class Qwen4ExpPLELayer(nn.Module):
             intermediate_cache = pool.short_conv_layer_intermediate_cache(self.layer_id)
             if intermediate_cache is not None:
                 if self.short_conv_state_len:
-                    intermediate_state = (
-                        conv_input.unfold(2, self.short_conv_state_len, 1)[
-                            :, :, 1 : batch.row_width + 1
-                        ]
-                        .permute(0, 2, 1, 3)
-                        .contiguous()
-                    )
+                    intermediate_state = conv_input.unfold(
+                        2, self.short_conv_state_len, 1
+                    )[:, :, 1 : batch.row_width + 1].permute(0, 2, 1, 3)
+                    if not rnd_full:
+                        # (B) lets the copy_ below do this repack directly.
+                        intermediate_state = intermediate_state.contiguous()
                 else:
                     intermediate_state = x.new_empty(
                         (
@@ -1041,14 +1337,16 @@ class Qwen4ExpPLELayer(nn.Module):
                             0,
                         )
                     )
-                valid_steps = batch.valid_tokens.reshape(
-                    batch.lengths.shape[0], batch.row_width, 1, 1
-                )
-                intermediate_state = torch.where(
-                    valid_steps,
-                    intermediate_state,
-                    torch.zeros_like(intermediate_state),
-                )
+                if not rnd_full:
+                    # (B): every step is valid, so this where keeps the state.
+                    valid_steps = batch.valid_tokens.reshape(
+                        batch.lengths.shape[0], batch.row_width, 1, 1
+                    )
+                    intermediate_state = torch.where(
+                        valid_steps,
+                        intermediate_state,
+                        torch.zeros_like(intermediate_state),
+                    )
                 intermediate_cache[: batch.lengths.shape[0], : batch.row_width].copy_(
                     intermediate_state.to(dtype=intermediate_cache.dtype)
                 )
@@ -1076,6 +1374,11 @@ class Qwen4ExpPLELayer(nn.Module):
                     dtype=conv_state.dtype
                 )
 
+        if rnd_full:
+            # PLE full-row verify: the row-major walk of (rows, row_width) is a reshape.
+            return F.silu(
+                conv_output.reshape(batch.processed_tokens, self.conv_channels)
+            )
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
 
     def forward_idle(self, forward_batch: ForwardBatch) -> None:
@@ -1164,6 +1467,96 @@ class Qwen4ExpPLELayer(nn.Module):
         self._prefetch_state = None
         return embeddings
 
+    def rnd_start_side(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        ngram_size: Optional[int],
+        ngram_eos_token_id: Optional[int],
+    ) -> _PLEBatch:
+        """PLE (A): fork the token-only PLE work onto _prefetch_stream.
+
+        The calls are the serial path's own (_prepare_ple_batch, the n-gram
+        hash, the UVA gather, then reduce, scale, key/value projections and
+        norm_key from forward), in the same order, on the side stream.  The
+        fork is a wait on the current stream like start_prefetch, so the side
+        reads the n-gram history only after everything queued before it;
+        forward() joins right before the first consumer."""
+        if self._prefetch_state is not None or self._rnd_side_state is not None:
+            raise RuntimeError("PLE prefetch state was not consumed before reuse")
+        main = torch.cuda.current_stream()
+        side = self._prefetch_stream
+        side.wait_stream(main)
+        _rnd_record_stream(
+            (
+                input_ids,
+                forward_batch.req_pool_indices,
+                forward_batch.out_cache_loc,
+                forward_batch.extend_seq_lens,
+            ),
+            side,
+        )
+        with torch.cuda.stream(side):
+            batch = _prepare_ple_batch(
+                input_ids,
+                forward_batch,
+                ngram_size=ngram_size,
+                ngram_eos_token_id=ngram_eos_token_id,
+            )
+            if batch is None or not batch.processed_tokens:
+                raise RuntimeError("PLE side path needs a non-empty PLE batch")
+            ngram_ids = self.ple_embedding.compute_ngram_ids(batch)
+            lookup_ids, semantic_tokens = self.ple_embedding._prepare_embedding_lookup(
+                ngram_ids, forward_batch, batch.physical_tokens
+            )
+            lookup_tokens = lookup_ids.shape[0]
+            prefetched = self._get_prefetch_buffer(lookup_tokens, lookup_ids)
+            output_view = prefetched.view(
+                lookup_tokens, self.ple_embedding.ngram_heads, -1
+            )
+            offloaded_embedding = self.ple_embedding.ngram_embedding
+            offloaded_embedding.gather(lookup_ids, out=output_view)
+            embeddings = offloaded_embedding.reduce(prefetched)
+            embeddings = embeddings * offloaded_embedding.weight_scale
+            embeddings = self.ple_embedding._finish_embedding_lookup(
+                embeddings,
+                semantic_tokens,
+                forward_batch,
+                batch.physical_tokens,
+            )
+            key, _ = self.key_proj(embeddings)
+            value, _ = self.value_proj(embeddings)
+            key = key.reshape(batch.processed_tokens, self.hc_count, self.hidden_size)
+            key_normed = self._apply_ple_norm(self.norm_key, key)
+        self._rnd_side_state = (key_normed, value)
+        return batch
+
+    def _rnd_join_side(self, batch: _PLEBatch, token_count: int):
+        key_normed, value = self._rnd_side_state
+        self._rnd_side_state = None
+        if key_normed.shape[0] != token_count:
+            raise RuntimeError(
+                "PLE side rows do not match the PLE query: "
+                f"{key_normed.shape[0]=} {token_count=}"
+            )
+        main = torch.cuda.current_stream()
+        main.wait_stream(self._prefetch_stream)
+        _rnd_record_stream(
+            (
+                key_normed,
+                value,
+                batch.lengths,
+                batch.req_indices,
+                batch.token_offsets,
+                batch.valid_tokens,
+                batch.state_indices,
+                batch.ngram_context,
+            ),
+            main,
+        )
+        return key_normed, value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1171,12 +1564,15 @@ class Qwen4ExpPLELayer(nn.Module):
         batch: _PLEBatch,
     ) -> torch.Tensor:
         hidden_states = hidden_states[: batch.processed_tokens]
-        if self._prefetch_state is not None:
-            embeddings = self._consume_prefetched_embeddings(forward_batch)
-        else:
-            embeddings = self.ple_embedding(batch, forward_batch)
-        key, _ = self.key_proj(embeddings)
-        value, _ = self.value_proj(embeddings)
+        # PLE side-stream: key_normed/value are being made on _prefetch_stream.
+        rnd_side = self._rnd_side_state is not None
+        if not rnd_side:
+            if self._prefetch_state is not None:
+                embeddings = self._consume_prefetched_embeddings(forward_batch)
+            else:
+                embeddings = self.ple_embedding(batch, forward_batch)
+            key, _ = self.key_proj(embeddings)
+            value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
         hidden_size = self.hidden_size
         hc_count = self.hc_count
@@ -1185,10 +1581,18 @@ class Qwen4ExpPLELayer(nn.Module):
                 "PLE hidden size does not match its hyper-connection layout: "
                 f"expected {hc_count * hidden_size}, got {hidden_states.shape[-1]}"
             )
-        key = key.reshape(token_count, hc_count, hidden_size)
+        if not rnd_side:
+            key = key.reshape(token_count, hc_count, hidden_size)
         query = hidden_states.reshape(token_count, hc_count, hidden_size)
-        key_normed = self._apply_ple_norm(self.norm_key, key)
+        if not rnd_side:
+            key_normed = self._apply_ple_norm(self.norm_key, key)
         query_normed = self._apply_ple_norm(self.norm_query, query)
+        if rnd_side:
+            # Join right before the first use of the side results.
+            key_normed, value = self._rnd_join_side(batch, token_count)
+        if _RND_PLE_TEST is not None:
+            _RND_PLE_TEST.keep("kv", key_normed, value)
+            _RND_PLE_TEST.note(side=rnd_side, rows_full=batch.rows_full)
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
         gate = gate / math.sqrt(hidden_size)
         fused_gate_value = False
@@ -1214,13 +1618,16 @@ class Qwen4ExpPLELayer(nn.Module):
             batch,
         )
         output = gated_value + conv_output
-        if not batch.use_decode_fast_path:
+        if not batch.use_decode_fast_path and not (_RND_PLE_B and batch.rows_full):
             output = torch.where(
                 batch.valid_tokens.unsqueeze(-1),
                 output,
                 torch.zeros_like(output),
             )
-        return _pad_token_rows(output, batch.physical_tokens)
+        output = _pad_token_rows(output, batch.physical_tokens)
+        if _RND_PLE_TEST is not None:
+            _RND_PLE_TEST.keep("ple", output)
+        return output
 
 
 class _PendingHCCombine:
@@ -1453,7 +1860,17 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+        if (
+            _VT_TAU > 0
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.batch_size == 1
+        ):
+            from sglang.srt.speculative.vt_kernels import verify_moe_context
+
+            with verify_moe_context(forward_batch, hidden_states.shape[0], hidden_states.device):
+                hidden_states = self.mlp(hidden_states, forward_batch)
+        else:
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
@@ -1740,7 +2157,26 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         prefix: str = "",
         is_nextn: bool = False,
     ) -> None:
+        if _VT_TAU > 0:
+            from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+            if (
+                get_parallel().tp_size != 1
+                or get_parallel().pp_size != 1
+                or get_parallel().attn_dp_size != 1
+                or not get_moe_a2a_backend().is_none()
+                or not get_moe_runner_backend().is_flashinfer_cutlass()
+                or quant_config is None
+                or quant_config.get_name() not in ("modelopt_fp4", "modelopt_mixed")
+            ):
+                raise ValueError("VT requires single-GPU Qwen4-Exp NVFP4 FlashInfer CUTLASS")
         super().__init__(config, quant_config, prefix, is_nextn)
+        if _VT_TAU > 0:
+            from sglang.srt.speculative.vt_kernels import length_buffer
+
+            # Allocate before capture: an initialization fill inside the target
+            # graph would otherwise reset the runtime cap on every replay.
+            self._vt_lengths = length_buffer(self.embed_tokens.weight.device)
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.has_ple = bool(config.ple_layer_ids)
@@ -1773,6 +2209,86 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             ),
             prefix=mixer_prefix,
         )
+        # PLE side-stream: the PLE layer that may run its token-only work on its own
+        # prefetch stream (a 1-tuple so nn.Module does not register it twice).
+        self._rnd_ple_side = (self._rnd_find_ple_side_layer(),)
+        if not is_nextn:
+            self._rnd_ple_side_log()
+
+    def _rnd_ple_side_status(self):
+        """(layer, index, reason): the single PLE layer right after start_layer
+        on a plain layout, or (None, None, why not).
+
+        Its prefetch is started before start_layer, i.e. at the top of the
+        forward, so moving the fork there keeps every other layer unchanged."""
+        if not self.has_ple:
+            return None, None, "the model has no PLE layer"
+        found = [
+            (index, self.layers[index].ple)
+            for index in range(self.start_layer, self.end_layer)
+            if getattr(self.layers[index], "ple", None) is not None
+        ]
+        if len(found) != 1:
+            return None, None, f"{len(found)} PLE layers on this rank, needs 1"
+        index, ple = found[0]
+        embedding = ple.ple_embedding
+        if index != self.start_layer + 1:
+            return None, index, f"PLE layer {index} is not start_layer + 1"
+        if ple._prefetch_stream is None:
+            return None, index, "no PLE prefetch stream (ple_offload_embedding off)"
+        if embedding.gather_dp_tokens:
+            return None, index, "the PLE table gathers DP tokens"
+        tp_size = getattr(embedding.ngram_embedding, "tp_size", 1)
+        if tp_size != 1:
+            return None, index, f"the PLE table is split over tp_size={tp_size}"
+        return ple, index, ""
+
+    def _rnd_find_ple_side_layer(self) -> Optional["Qwen4ExpPLELayer"]:
+        return self._rnd_ple_side_status()[0]
+
+    def _rnd_ple_side_log(self) -> None:
+        """One startup line when SGLANG_RND_PLE_SIDE=1 (and for the test switch);
+        nothing otherwise."""
+        if _RND_PLE_SWITCH:
+            ple, index, reason = self._rnd_ple_side_status()
+            if not (_RND_PLE_A or _RND_PLE_B):
+                logger.info(
+                    "PLE side stream: off (SGLANG_RND_PLE_SIDE_PARTS=%r names no part)",
+                    _RND_PLE_PARTS,
+                )
+            elif ple is not None:
+                logger.info(
+                    "PLE side stream: on (parts=%s, layer=%d)", _RND_PLE_PARTS, index
+                )
+            else:
+                if _RND_PLE_B:
+                    reason += "; only the full-row verify shortcuts (b) apply"
+                logger.info("PLE side stream: off (%s)", reason)
+        if _RND_PLE_TEST is not None:
+            ple, index, reason = self._rnd_ple_side_status()
+            logger.info(
+                "PLE test switch: on (A/B of every verify forward, side layer=%s)",
+                index if ple is not None else f"none: {reason}",
+            )
+
+    def _rnd_ple_side_for(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> Optional["Qwen4ExpPLELayer"]:
+        """PLE (A) for this forward: decode/verify-sized, non-empty batches."""
+        if not _RND_PLE_A:
+            return None
+        ple = self._rnd_ple_side[0]
+        if ple is None:
+            return None
+        mode = _get_ple_forward_mode(forward_batch)
+        if not (mode.is_decode() or mode.is_target_verify()):
+            return None
+        physical_tokens = input_ids.numel()
+        if not 0 < physical_tokens < _QSA_INDEXER_OVERLAP_TOKEN_THRESHOLD:
+            return None
+        if _get_processed_token_count(forward_batch, physical_tokens) == 0:
+            return None
+        return ple
 
     def forward(
         self,
@@ -1781,58 +2297,76 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
-        else:
-            hidden_states = self.embed_tokens(input_ids)
+        from sglang.srt.model_executor.forward_context import forward_batch_context
 
-        ple_batch = (
-            _prepare_ple_batch(
-                input_ids,
-                forward_batch,
-                ngram_size=self.ple_ngram_size,
-                ngram_eos_token_id=self.ple_ngram_eos_token_id,
-            )
-            if self.has_ple
-            else None
-        )
-        residual = None
-        aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            if i + 1 < self.end_layer:
-                next_ple = getattr(self.layers[i + 1], "ple", None)
-                if next_ple is not None:
-                    next_ple.start_prefetch(ple_batch, forward_batch)
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    ple_batch=ple_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+        with forward_batch_context(forward_batch):
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+
+            ple_side = self._rnd_ple_side_for(input_ids, forward_batch)
+            if ple_side is not None:
+                ple_batch = ple_side.rnd_start_side(
+                    input_ids,
+                    forward_batch,
+                    ngram_size=self.ple_ngram_size,
+                    ngram_eos_token_id=self.ple_ngram_eos_token_id,
                 )
+            else:
+                ple_batch = (
+                    _prepare_ple_batch(
+                        input_ids,
+                        forward_batch,
+                        ngram_size=self.ple_ngram_size,
+                        ngram_eos_token_id=self.ple_ngram_eos_token_id,
+                    )
+                    if self.has_ple
+                    else None
+                )
+            residual = None
+            aux_hidden_states = []
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                if i + 1 < self.end_layer:
+                    next_ple = getattr(self.layers[i + 1], "ple", None)
+                    if next_ple is not None and next_ple is not ple_side:
+                        next_ple.start_prefetch(ple_batch, forward_batch)
+                if _RND_PLE_TEST is not None and getattr(layer, "ple", None) is not None:
+                    _RND_PLE_TEST.pin(hidden_states, residual)
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        ple_batch=ple_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
+                if _RND_PLE_TEST is not None and getattr(layer, "ple", None) is not None:
+                    _RND_PLE_TEST.keep("h1", hidden_states, residual)
 
-        if isinstance(hidden_states, _PendingHCCombine):
-            # Safety net: the last executed layer has nothing to fuse into
-            # (and `hc_hidden_states` below is read bitwise by the MTP head).
-            hidden_states = hidden_states.materialize()
+            if isinstance(hidden_states, _PendingHCCombine):
+                # Safety net: the last executed layer has nothing to fuse into
+                # (and `hc_hidden_states` below is read bitwise by the MTP head).
+                hidden_states = hidden_states.materialize()
 
-        _commit_ple_batch(ple_batch, forward_batch)
+            if ple_side is not None and ple_side._rnd_side_state is not None:
+                raise RuntimeError("PLE side stream was forked but never joined")
+            _commit_ple_batch(ple_batch, forward_batch)
 
-        hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        if not forward_batch.forward_mode.is_idle():
-            return hidden_states, hc_hidden_states
+            hc_hidden_states = hidden_states
+            hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+            if not forward_batch.forward_mode.is_idle():
+                return hidden_states, hc_hidden_states
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+            if len(aux_hidden_states) == 0:
+                return hidden_states
+            return hidden_states, aux_hidden_states
 
 
 class Qwen4ExpVLModel(Qwen4ExpModel):
@@ -1898,6 +2432,25 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     @torch.no_grad()
     def forward(self, *args, **kwargs):
+        from sglang.srt.layers.moe import oea_prologue
+
+        forward_batch = kwargs.get("forward_batch", args[2] if len(args) > 2 else None)
+        # OEA: target-verify MoE calls of this forward may pass the k0/min_rows cell (oea_prologue).
+        with forward_batch_context(forward_batch), oea_prologue.target_forward_context(
+            forward_batch
+        ):
+            if _RND_PLE_TEST is not None:
+                return _RND_PLE_TEST.run(
+                    lambda: self._rnd_forward_once(*args, **kwargs), forward_batch
+                )
+            output = super().forward(*args, **kwargs)
+        hc_hidden_states = self.model.last_hc_hidden_states
+        if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
+            output.hidden_states = hc_hidden_states
+        return output
+
+    def _rnd_forward_once(self, *args, **kwargs):
+        # PLE verification test switch: the body of forward above, once.
         output = super().forward(*args, **kwargs)
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):

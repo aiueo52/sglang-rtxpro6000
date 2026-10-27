@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 import base64
 import functools
 import json
@@ -152,6 +153,11 @@ class EnvInt(EnvField):
             return int(value)
         except ValueError:
             raise ValueError(f'"{value}" is not a valid integer value')
+
+
+class _OeaK0Env(EnvInt):
+    def parse(self, value: str) -> int:
+        return super().parse(value) if value.strip() else 0
 
 
 class _DeprecatedEnvFallback:
@@ -946,6 +952,14 @@ class Envs:
     SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
 
     # ===================================================================
+    SGLANG_OEA_K0 = _OeaK0Env(0)
+    SGLANG_OEA_MODE = EnvStr("oea")
+    SGLANG_OEA_WIDTH = EnvInt(16)
+    SGLANG_OEA_MAX_BS = EnvInt(1)
+    SGLANG_OEA_MIN_ROWS = EnvInt(16)
+    SGLANG_OEA_STATS = EnvBool(False)
+    SGLANG_OEA_CTL_FILE = EnvStr("")
+
     # FlashInfer, FlashMLA, and TRT-LLM
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -1274,9 +1288,24 @@ class Envs:
     # Draft-extend position-0 confidence from the fused argmax pass instead of
     # torch top1_prob. Needs SGLANG_OPT_DRAFT_TAIL; not bit-exact (fp32 order).
     SGLANG_OPT_DRAFT_TAIL_FUSED_CONF = EnvBool(False)
+    # Sparse-RS draft-extend tail, bit-exact: the proposal kernel reads each request's
+    # last accepted logits row and copies its hidden row; no select_index gathers.
+    SGLANG_OPT_RS_EXTEND_TAIL = EnvBool(False)
+    # Position-0 confidence from that proposal pass instead of torch top1_prob. Needs
+    # SGLANG_OPT_RS_EXTEND_TAIL; rounding-level on p0 only (fp32 order), drafts unchanged.
+    SGLANG_OPT_RS_EXTEND_FUSED_CONF = EnvBool(False)
     # Index-shared MTP draft rows put the drafted tail right after the valid frozen
     # entries; the packed sparse attention path attends only a valid prefix.
     SGLANG_ENABLE_QSA_SHARED_TAIL_PREFIX = EnvBool(False)
+    # QSA MTP draft: decode metadata for every draft step in one kernel launch instead
+    # of a layout + row-metadata pair per step; bit-exact on every graph buffer.
+    SGLANG_OPT_QSA_DRAFT_META_BATCH = EnvBool(False)
+    # RecoverSSM verify commit: conv-window rollback plus the PLE short-conv and
+    # n-gram commits (accept and track sets) in one launch; bit-exact word copy.
+    SGLANG_OPT_COMMIT_GLUE_FUSED = EnvBool(False)
+    # gpu_only draft extend: prefix_lens, extend_lens and the post-write seq_lens in
+    # one launch instead of five torch ops; bit-exact. ForwardBatch.init_new unchanged.
+    SGLANG_OPT_DRAFT_EXTEND_LENS = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -1319,6 +1348,7 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    SGLANG_OPT_MAMBA_NONE_MODE_SIZING = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

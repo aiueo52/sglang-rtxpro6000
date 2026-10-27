@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import dataclasses
@@ -110,6 +112,9 @@ class GenerationBatchResult:
     fpm_end_event: Optional[torch.cuda.Event] = None
 
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
+    # Accepted target-node top-k snapshot, including bonus; device-only for FIFO.
+    draft_context_topk_ids: Optional[torch.Tensor] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:

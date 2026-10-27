@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Persistent fused HyperConnection combine, per-branch norm, and mix.
 
 Decode and target-verify batches are small enough that launching the individual

@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -157,6 +158,9 @@ class LogitsProcessorOutput:
     # Scheduler-local output copied alongside the ordinary generation result.
     auxiliary_device_output: Optional[DeviceAuxiliaryOutput] = None
 
+    # Sorted target-verify top-k token ids, before sampling. shape: [rows, k]
+    draft_context_topk_ids: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -303,6 +307,13 @@ class LogitsProcessor(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
+        self._draft_ctx_topk = 0
+        if os.environ.get("SGLANG_RND_DRAFT_CTX_TOPK", "0") != "0":
+            from sglang.srt.speculative.draft_context_vocab import (
+                get_draft_context_topk,
+            )
+
+            self._draft_ctx_topk = get_draft_context_topk(self.vocab_size)
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().config.enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = (
@@ -413,31 +424,29 @@ class LogitsProcessor(nn.Module):
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
-
-            # Decode mode or extend mode without return_logprob.
-            return LogitsProcessorOutput(
-                next_token_logits=sampled_logits,
-                hidden_states=hidden_states_to_store,
-                mm_input_embeds=logits_metadata.mm_input_embeds,
+        else:
+            logprobs_result, sampled_logits = self.input_logprob_processor.forward(
+                pruned_states=pruned_states,
+                sample_indices=sample_indices,
+                input_logprob_indices=input_logprob_indices,
+                token_to_seq_idx=token_to_seq_idx,
+                lm_head=lm_head,
+                get_logits_fn=self._get_logits,
+                logits_metadata=logits_metadata,
+                skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
             )
-
-        logprobs_result, sampled_logits = self.input_logprob_processor.forward(
-            pruned_states=pruned_states,
-            sample_indices=sample_indices,
-            input_logprob_indices=input_logprob_indices,
-            token_to_seq_idx=token_to_seq_idx,
-            lm_head=lm_head,
-            get_logits_fn=self._get_logits,
-            logits_metadata=logits_metadata,
-            skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
-        )
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
-        logprobs_result.write_input_to(logits_output)
+        if logits_metadata.extend_return_logprob:
+            logprobs_result.write_input_to(logits_output)
+        if self._draft_ctx_topk and logits_metadata.forward_mode.is_target_verify():
+            logits_output.draft_context_topk_ids = torch.topk(
+                sampled_logits, k=self._draft_ctx_topk, dim=-1, sorted=True
+            ).indices
         return logits_output
 
     def _get_pruned_states(
@@ -718,6 +727,16 @@ class LogitsProcessor(nn.Module):
                     logits / self.final_logit_softcapping
                 )
 
+        ctxv = getattr(lm_head, "_rnd_ctx_vocab", None)
+        if ctxv is not None:
+            from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+
+            # Probe all real logits before introducing legal -inf filler masks.
+            maybe_detect_inf(logits, "draft head before context vocabulary mask")
+            maybe_detect_nan(logits, "draft head before context vocabulary mask")
+            # Captured by both draft graphs; state and head addresses stay fixed.
+            # Filler copies must not gain probability mass in RS/softmax paths.
+            ctxv.mask_logits(logits)
         return logits
 
     def _direct_logits_buffer(

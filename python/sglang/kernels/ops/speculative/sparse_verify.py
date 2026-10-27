@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Sparse target-only sampling verify (SGLANG_OPT_SPEC_SPARSE_VERIFY).
 
 The dense verify in eagle_utils.eagle_sample builds full-vocabulary target

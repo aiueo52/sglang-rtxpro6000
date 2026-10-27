@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Softmax top-k router on 32-bit packed keys (SGLANG_ROUTER_FAST_TOPK=1).
 
 Same weights and ids as the Triton router (``moe_fused_gate(..., scoring_func="softmax")``), bit for
@@ -23,7 +26,7 @@ Why the results are identical:
     floors to -1e30 for the ranking, gets the odd v between bf16 0xF14A and 0xF149, the two
     neighbours of -1e30;
   * a NaN logit makes the row sum, so every weight of the row, NaN in both kernels.
-Checked bit for bit by flash-next-bench ``bench/rt1/route_bench.py --check``.
+Checked bit for bit against the Triton router.
 """
 
 from __future__ import annotations

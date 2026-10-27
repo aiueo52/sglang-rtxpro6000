@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import json
@@ -981,9 +982,13 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
         resolve_candidate_steps_from_config,
     )
 
+    from sglang.srt.speculative.dl_policy import dl_hostw_enabled, dl_hostw_steps
+
     candidate_steps = resolve_candidate_steps_from_config(
         cfg_path=cfg.speculative_adaptive_config,
+        include_hostw=False,
     )
+    runtime_steps = sorted(set(candidate_steps).union(dl_hostw_steps()))
 
     if cfg.speculative_eagle_topk is None:
         declare_resolution(
@@ -999,11 +1004,24 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
             speculative_num_steps=candidate_steps[len(candidate_steps) // 2],
         )
 
-    if cfg.speculative_num_steps not in candidate_steps:
+    if cfg.speculative_num_steps not in runtime_steps:
         raise ValueError(
             f"--speculative-num-steps={cfg.speculative_num_steps} "
-            f"is not in the adaptive config candidate_steps {candidate_steps}. "
+            f"is not in the adaptive config candidate_steps {runtime_steps}. "
             "Pass one of those values."
+        )
+
+    if dl_hostw_enabled():
+        # Reserve maximum launch dimensions before capture, but seed C1/EMA
+        # from the original explicit choice (or the original config median).
+        policy_initial_steps = cfg._speculative_adaptive_initial_steps
+        if policy_initial_steps is None:
+            policy_initial_steps = cfg.speculative_num_steps
+        declare_resolution(
+            server_args,
+            "_init_adaptive_speculative_params",
+            _speculative_adaptive_initial_steps=policy_initial_steps,
+            speculative_num_steps=max(runtime_steps),
         )
 
     declare_resolution(

@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2026 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -106,6 +107,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.adaptive_spec_params import adaptive_capture_bs_for_step
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import (
     empty_context,
@@ -268,6 +270,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # avoid silently changing the CUDA decode path for DSA models (e.g.
         # DeepSeek-V3.2). CUDA can opt in later once validated there.
         self.dsa_dual_graph = False
+        self.record_nolora_graph = False
         self.dsa_index_topk: Optional[int] = None
         from sglang.srt.configs.model_config import (
             get_dsa_index_topk,
@@ -335,11 +338,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        all_capture_bs = self.capture_bs
+        if get_spec().speculative_adaptive:
+            self.capture_bs = adaptive_capture_bs_for_step(
+                capture_bs=self.capture_bs,
+                step=self.speculative_num_steps,
+                cfg_path=get_spec().speculative_adaptive_config,
+            )
+            self.compile_bs = [bs for bs in self.compile_bs if bs in self.capture_bs]
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         self.ragged_verify_mode = (
-            ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
+            bool(self.capture_bs)
+            and ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
@@ -365,7 +377,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # Attention backend
-        self.max_bs = max(self.capture_bs)
+        self.max_bs = max(self.capture_bs, default=max(all_capture_bs))
         self.max_num_token = self.max_bs * self.captured_req_width
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
@@ -542,6 +554,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def assert_adaptive_graph_coverage(self, required_bs: list[int]) -> None:
+        assert set(required_bs).issubset(self.capture_bs), (
+            f"Missing adaptive graph buckets: steps={self.speculative_num_steps}, "
+            f"required={required_bs}, captured={self.capture_bs}"
+        )
+        sizes = self.capture_num_tokens if self.ragged_verify_mode else required_bs
+        variants = ["lora", "nolora"] if self.record_nolora_graph else [None]
+        dsa_variants = ["dense", "sparse"] if self.dsa_dual_graph else [None]
+        for size in sizes:
+            for variant in variants:
+                for dsa_variant in dsa_variants:
+                    key = self._make_graph_key(
+                        size, variant_label=variant, dsa_variant=dsa_variant
+                    )
+                    assert self.backend.can_run(None, key), (
+                        f"Missing adaptive graph: steps={self.speculative_num_steps}, "
+                        f"key={key}"
+                    )
+
     def _make_graph_key(
         self, size, stream_idx=None, variant_label=None, dsa_variant=None
     ):
@@ -652,6 +683,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not self.capture_bs:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -1451,6 +1484,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                draft_context_topk_ids=(
+                    output.draft_context_topk_ids[: self.raw_num_token]
+                    if output.draft_context_topk_ids is not None
                     else None
                 ),
                 customized_info=output.customized_info,

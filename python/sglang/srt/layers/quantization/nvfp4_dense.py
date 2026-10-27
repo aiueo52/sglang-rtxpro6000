@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Load-time NVFP4 packing for dense weights, with an on-disk cache.
 
 Used by the N1 stages to move a dense FP8 weight-only path to the NVFP4 format the
@@ -35,16 +38,11 @@ from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import (
 
 logger = logging.getLogger(__name__)
 
-
-def _default_cache_dir() -> str:
-    from sglang.srt.environ import envs
-
-    return os.path.join(os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), "nvfp4")
-
-
-#: Where packed weights are cached: SGLANG_NVFP4_CACHE_DIR, else <SGLANG_CACHE_DIR>/nvfp4
-#: (by default ~/.cache/sglang/nvfp4).
-CACHE_DIR = os.environ.get("SGLANG_NVFP4_CACHE_DIR") or _default_cache_dir()
+#: Where packed weights are cached. Defaults to the user's application cache.
+CACHE_DIR = os.environ.get(
+    "SGLANG_NVFP4_CACHE_DIR",
+    os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "flash-next-fast", "nvfp4"),
+)
 
 
 def _index_path(model_dir: str) -> Optional[str]:
@@ -132,7 +130,7 @@ def build_or_load(
     """-> (wq [N, K/2] uint8, bs [N, K/16] uint8 e4m3, gscale [1] fp32), all on `device`.
 
     Deterministic: same shard + same row set -> byte-identical output, which is what
-    makes the cache safe.
+    makes the cache safe and the offline acceptance measurement transferable.
     """
     import time
 
@@ -210,10 +208,12 @@ class NVFP4DenseLinearMethod:
 
     @staticmethod
     def _ok(layer, x) -> bool:
+        from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import _m_limit
+
         return (
             getattr(layer, "nvfp4_wq", None) is not None
             and x.dim() == 2
-            and x.shape[0] <= 16
+            and x.shape[0] <= _m_limit()
             and x.dtype == torch.bfloat16
             and x.is_cuda
             and x.stride(1) == 1
@@ -251,21 +251,22 @@ class NVFP4DenseLinearMethod:
         )
 
     def _wide_m(self, layer, x: torch.Tensor) -> torch.Tensor:
-        """The M > 16 path the decode GEMV cannot serve.
+        """The M > NVFP4_GEMV_MAX_M path the decode GEMV cannot serve.
 
         Two regimes, because they have different constraints:
 
-        - **Modest M (<= _CHUNK_M_MAX): loop the GEMV over 16-row slices.** This is the
+        - **Modest M (<= _CHUNK_M_MAX): loop the GEMV over knob-sized slices.** This is the
           draft-extend path, and draft-extend *is* CUDA-graph captured, so it has to be
           capture-safe -- no host->device copies, no syncs, no data-dependent shapes.
           Re-streaming the weight per slice costs bandwidth, but at these M it is a
           handful of slices.
         - **Large M: dequantise in row chunks and GEMM.** Real prefill, never captured.
-          Looping the GEMV here would re-read the whole weight ~M/16 times; a GEMM
+          Looping the GEMV here would re-read the whole weight ~M/knob times; a GEMM
           amortises the weight read across all M rows instead. Chunking the dequant by
           output rows keeps the transient near 80 MB rather than the full BF16 weight.
         """
         from sglang.srt.layers.quantization.w4a16_nvfp4_gemv import (
+            _m_limit,
             dequantize_nvfp4,
             w4a16_nvfp4_gemv,
         )
@@ -273,9 +274,15 @@ class NVFP4DenseLinearMethod:
         wq, bs, gs = layer.nvfp4_wq, layer.nvfp4_bs, layer.nvfp4_gscale
         M, N = x.shape[0], wq.shape[0]
         y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-        if M <= _CHUNK_M_MAX and x.dtype == torch.bfloat16 and x.is_cuda:
-            for m0 in range(0, M, 16):
-                m1 = min(M, m0 + 16)
+        chunk_m = _m_limit()
+        if (
+            M <= _CHUNK_M_MAX
+            and x.dtype == torch.bfloat16
+            and x.is_cuda
+            and chunk_m > 0
+        ):
+            for m0 in range(0, M, chunk_m):
+                m1 = min(M, m0 + chunk_m)
                 w4a16_nvfp4_gemv(x[m0:m1], wq, bs, gs, out=y[m0:m1])
             return y
         for r0 in range(0, N, _FALLBACK_ROW_CHUNK):

@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -214,6 +216,15 @@ def get_global_state() -> _GlobalState:
     return _global_state
 
 
+def _validate_tokenizer_worker_auth(server_args: ServerArgs) -> None:
+    if server_args.tokenizer_worker_num > 1 and (
+        server_args.api_key is not None or server_args.admin_api_key is not None
+    ):
+        raise ValueError(
+            "authentication with multiple tokenizer workers is not supported in this release"
+        )
+
+
 async def init_multi_tokenizer() -> ServerArgs:
     """
     Initialization function for multi-process tokenizer mode.
@@ -228,10 +239,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     server_args: ServerArgs
     port_args: PortArgs
 
-    # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    _validate_tokenizer_worker_auth(server_args)
 
     publish(server_args, role="tokenizer")
 
@@ -1551,6 +1559,7 @@ async def load_lora_adapter(
 
 
 @app.api_route("/load_lora_adapter_from_tensors", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def load_lora_adapter_from_tensors(
     obj: Annotated[LoadLoRAAdapterFromTensorsReqInput, Body()], request: Request
 ):
@@ -2796,6 +2805,8 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    _validate_tokenizer_worker_auth(server_args)
+
     # Launch subprocesses
     (
         tokenizer_manager,

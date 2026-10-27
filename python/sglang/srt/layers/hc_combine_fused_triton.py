@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Single-launch HyperConnection combine (gate + apply in one Triton kernel).
 
 ``GatedResidual.combine`` currently runs the sgl-kernel split pair

@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import contextlib
@@ -41,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
+from sglang.srt.speculative.adaptive_spec_params import adaptive_capture_bs_for_step
 from sglang.srt.speculative.adaptive_runtime_state import (
     init_cuda_graph_state_no_shrink,
 )
@@ -134,15 +136,25 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_hidden_mode = CaptureHiddenMode.LAST
 
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+        all_capture_bs = self.capture_bs
+        if get_spec().speculative_adaptive:
+            self.capture_bs = adaptive_capture_bs_for_step(
+                capture_bs=all_capture_bs,
+                step=self.speculative_num_steps,
+                cfg_path=get_spec().speculative_adaptive_config,
+            )
 
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
         self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
-        self.max_bs = max(self.capture_bs)
+        self.max_bs = max(self.capture_bs, default=max(all_capture_bs))
         self.max_num_token = self.max_bs * self.captured_req_width
 
+        # Shared draft-extend metadata must retain the launch extent across states.
         init_cuda_graph_state_no_shrink(
-            self.draft_extend_attn_backend, self.max_bs, self.max_num_token
+            self.draft_extend_attn_backend,
+            max(all_capture_bs),
+            max(all_capture_bs) * self.captured_req_width,
         )
         self.seq_len_fill_value = (
             self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -213,7 +225,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_for_logprob_gpu = None
 
             hot_token_id = getattr(self.eagle_worker, "hot_token_id", None)
-            if hasattr(
+            if getattr(self.eagle_worker, "_draft_ctx_vocab", None) is not None:
+                # A checkpoint's static hot size must not truncate the fixed tail.
+                vocab_size = len(hot_token_id)
+            elif hasattr(
                 self.model_runner.model_config.hf_config, "draft_vocab_size"
             ):  # llama_eagle
                 vocab_size = self.model_runner.model_config.hf_config.draft_vocab_size
@@ -284,10 +299,22 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
+    def assert_adaptive_graph_coverage(self, required_bs: list[int]) -> None:
+        assert set(required_bs).issubset(self.capture_bs), (
+            f"Missing adaptive graph buckets: steps={self.speculative_num_steps}, "
+            f"required={required_bs}, captured={self.capture_bs}"
+        )
+        for bs in required_bs:
+            assert self.backend.can_run(
+                None, self._make_graph_key(bs)
+            ), f"Missing adaptive graph: steps={self.speculative_num_steps}, bs={bs}"
+
     def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
         return ShapeKey(size=bs)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if not self.capture_bs:
+            return False
         # Uniform-width replay invariant: the batch's actual per-request width
         # must match this runner's capture width; anything else falls back to
         # eager. (Unset widths pass: not every path fills the field yet.)
@@ -438,6 +465,18 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            if getattr(self.eagle_worker, "_vt_position0", None) is not None:
+                from sglang.kernels.ops.speculative.topk1 import draft_extend_select_topk1
+
+                # Position zero belongs to the NEXT chain. Capture its full
+                # untempered max/LSE reduction here, before worker-side sampling.
+                _, _, _, _, confidence = draft_extend_select_topk1(
+                    ret.next_token_logits,
+                    accept_lens=num_accept_tokens,
+                    num_tokens_per_req=self.captured_req_width,
+                    write_prob=True,
+                )
+                self.eagle_worker._vt_position0[:bs].copy_(confidence)
             return ret
 
         with forward_context(

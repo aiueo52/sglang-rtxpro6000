@@ -1,10 +1,12 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.speculative.dl_policy import dl_stepup_steps
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -166,11 +168,14 @@ class AdaptiveController:
             cfg_path=config_path,
         )
         self._states: dict[int, SpecRuntimeState] = {}
-        self._pending_steps: int | None = None
+        self._pending_steps: tuple[int, int] | None = None
 
     @property
     def candidate_steps(self) -> list[int]:
-        return self.params.candidate_steps
+        from sglang.srt.speculative.dl_policy import dl_hostw_steps
+
+        # Execution widths do not become candidates in the C1/EMA estimator.
+        return sorted(set(self.params.candidate_steps).union(dl_hostw_steps()))
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
@@ -186,16 +191,25 @@ class AdaptiveController:
         max_batch_size: int | None = None,
     ) -> None:
         """Build and register runtime states for all candidate steps."""
+        from sglang.srt.speculative.dl_policy import dl_hostw_steps
+
         self.validate_candidates()
         self.params.set_cuda_graph_bs(cuda_graph_bs)
+        hostw_steps = dl_hostw_steps()
 
         for steps in self.candidate_steps:
             if steps in self._states:
                 continue
 
-            pruned_bs = self.params.cuda_graph_bs_for_step(steps)
+            # HOSTW may choose any registered width independently of the slot.
+            pruned_bs = (
+                (sorted(cuda_graph_bs) if cuda_graph_bs else None)
+                if steps in hostw_steps
+                else self.params.cuda_graph_bs_for_step(steps)
+            )
             if (
-                pruned_bs == []
+                steps not in hostw_steps
+                and pruned_bs == []
                 and max_batch_size is not None
                 and not self.params.can_reach_step(
                     step=steps, max_batch_size=max_batch_size
@@ -208,6 +222,45 @@ class AdaptiveController:
                 cuda_graph_bs=pruned_bs,
             )
             self._states[steps] = state
+
+        self._validate_graph_coverage()
+
+    def _validate_graph_coverage(self) -> None:
+        graph_stages = [
+            (
+                state.cuda_graph_runner,
+                state.cuda_graph_runner_for_draft_extend,
+                state.target_graph_runner,
+            )
+            for state in self._states.values()
+        ]
+        enabled = [
+            any(runners[i] is not None for runners in graph_stages) for i in range(3)
+        ]
+        for steps in self.candidate_steps:
+            required_bs = self.params.cuda_graph_bs_for_step(steps)
+            if not required_bs:
+                continue
+            assert (
+                steps in self._states
+            ), f"Missing adaptive runtime state: steps={steps}"
+            state = self._states[steps]
+            for stage, runner in enumerate(
+                (
+                    state.cuda_graph_runner,
+                    state.cuda_graph_runner_for_draft_extend,
+                    state.target_graph_runner,
+                )
+            ):
+                required = enabled[stage] and (stage != 0 or steps > 1)
+                assert (
+                    runner is not None or not required
+                ), f"Missing adaptive graph runner: steps={steps}, stage={stage}"
+                if runner is not None:
+                    assert (
+                        runner.speculative_num_steps == steps
+                    ), f"Mismatched adaptive graph width: steps={steps}, stage={stage}"
+                    runner.assert_adaptive_graph_coverage(required_bs)
 
     def validate_candidates(self) -> None:
         """No candidate may exceed the step count the server started with.
@@ -235,24 +288,37 @@ class AdaptiveController:
         self.params.observe_confidence(confidences, batch_size)
 
     def activate_step_by_batch(self, batch_size: int) -> None:
-        target = (
-            self._pending_steps
-            if self._pending_steps is not None
-            else self.params.get_steps_for_batch(batch_size)
-        )
+        target = self.params.get_steps_for_batch(batch_size)
+        if self._pending_steps is not None:
+            bucket, steps = self._pending_steps
+            if bucket == self.params.get_bucket_for_batch(
+                batch_size
+            ) and steps in self.params.get_candidate_steps_for_batch(batch_size):
+                target = steps
         self._pending_steps = None
+        # Keep C1's chosen width/estimator untouched; remap execution only.
+        # The registered states are the entire budget: never capture a new width.
+        selected_steps = target
+        if batch_size == 1:
+            target = dl_stepup_steps(target, self._states)
         if target != self.worker.speculative_num_steps:
             self._activate(target)
+        observer = getattr(self.params, "observe_execution_steps", None)
+        if batch_size > 0 and observer is not None:
+            observer(selected_steps, self.worker.speculative_num_steps, batch_size)
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
-        """Feed verify results and record any EMA step decision."""
+        """Feed verify results to the bucket that produced the batch."""
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )
         if new_step is not None:
-            self._pending_steps = new_step
+            self._pending_steps = (
+                self.params.get_bucket_for_batch(batch_size),
+                new_step,
+            )
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

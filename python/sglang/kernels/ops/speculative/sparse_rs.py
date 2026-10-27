@@ -1,10 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 from __future__ import annotations
+
+import os
 
 import torch
 import triton
 import triton.language as tl
 
 _DRAFT_BLOCK = 2048
+_DRAFT_CTX_VOCAB = int(os.environ.get("SGLANG_RND_DRAFT_CTX_VOCAB", "0")) > 0
 
 
 @triton.jit
@@ -20,12 +26,39 @@ def _logit_keys(vals, indices):
 def _draft_partial_topk_kernel(
     Logits, Keys, TopKs, stride_l, VOCAB: tl.constexpr, SPLITS: tl.constexpr,
     KB: tl.constexpr, GREEDY_FAST: tl.constexpr, BLOCK: tl.constexpr,
+    AcceptLens, Hidden, HiddenOut, RowsOut, PartialMax, PartialSum, stride_h, tokens_per_req,
+    HIDDEN_SIZE: tl.constexpr, HIDDEN_BLOCK: tl.constexpr, ROW_FROM_ACCEPT: tl.constexpr,
+    COPY_HIDDEN: tl.constexpr, WRITE_ROWS: tl.constexpr, WRITE_PROB: tl.constexpr,
+    MASK_EMPTY_SPLITS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     split = tl.program_id(1)
+    # Draft extend: read each request's last accepted row; split SPLITS copies its hidden row.
+    src = row
+    if ROW_FROM_ACCEPT:
+        src = row * tokens_per_req + tl.load(pointer=AcceptLens + row).to(tl.int64) - 1
+    if COPY_HIDDEN:
+        if split == SPLITS:
+            for h0 in tl.range(0, HIDDEN_SIZE, HIDDEN_BLOCK):
+                offs = h0 + tl.arange(start=0, end=HIDDEN_BLOCK)
+                h = tl.load(pointer=Hidden + src * stride_h + offs, mask=offs < HIDDEN_SIZE)
+                tl.store(pointer=HiddenOut + row * HIDDEN_SIZE + offs, value=h, mask=offs < HIDDEN_SIZE)
+            return
     indices = split * BLOCK + tl.arange(start=0, end=BLOCK)
-    vals = tl.load(pointer=Logits + row * stride_l + indices, mask=indices < VOCAB,
-                   other=-float("inf")).to(tl.float32)
+    raw = tl.load(pointer=Logits + src * stride_l + indices, mask=indices < VOCAB,
+                  other=-float("inf"))
+    if WRITE_ROWS:
+        tl.store(pointer=RowsOut + row * VOCAB + indices, value=raw, mask=indices < VOCAB)
+    vals = raw.to(tl.float32)
+    if WRITE_PROB:
+        # Per-split max and sum(exp(x - max)) for the position-0 top-1 probability.
+        cvals = tl.where(condition=vals == vals, x=vals, y=-1e30)
+        cmax = tl.max(cvals, axis=0)
+        tl.store(pointer=PartialMax + row * SPLITS + split, value=cmax)
+        sum_max = cmax
+        if MASK_EMPTY_SPLITS:
+            sum_max = tl.where(condition=cmax == -float("inf"), x=0.0, y=cmax)
+        tl.store(pointer=PartialSum + row * SPLITS + split, value=tl.sum(tl.exp(cvals - sum_max), axis=0))
     keys = _logit_keys(vals=vals, indices=indices.to(tl.int64))
     keys = tl.where(condition=indices < VOCAB, x=keys, y=-9223372036854775807 - 1)
     if GREEDY_FAST:
@@ -57,8 +90,16 @@ def _draft_finalize_kernel(
     HAS_MIN_P: tl.constexpr, HAS_MAP: tl.constexpr,
     HAS_TEMP_SCALE: tl.constexpr, HAS_ONEHOT: tl.constexpr, GREEDY_FAST: tl.constexpr,
     WRITE_POSITION: tl.constexpr, WRITE_CHAIN: tl.constexpr, BLOCK: tl.constexpr,
+    Conf, PartialMax, PartialSum,
+    WRITE_PROB: tl.constexpr, SPLITS: tl.constexpr, SPLIT_BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
+    if WRITE_PROB:
+        # softmax max of the raw logits: 1 / sum_s(sum_s * exp(max_s - max)), fp32.
+        soffs = tl.arange(start=0, end=SPLIT_BLOCK)
+        pmax = tl.load(pointer=PartialMax + row * SPLITS + soffs, mask=soffs < SPLITS, other=-float("inf"))
+        psum = tl.load(pointer=PartialSum + row * SPLITS + soffs, mask=soffs < SPLITS, other=0.0)
+        tl.store(pointer=Conf + row, value=1.0 / tl.sum(psum * tl.exp(pmax - tl.max(pmax, axis=0)), axis=0))
     offs = tl.arange(start=0, end=BLOCK)
     keys = tl.load(pointer=Keys + row * CANDIDATES + offs, mask=offs < CANDIDATES,
                    other=-9223372036854775807 - 1)
@@ -117,9 +158,24 @@ def _draft_finalize_kernel(
         tl.store(pointer=Positions + row, value=tl.load(Positions + row) + 1)
 
 
-def _proposal_topk_keys(*, logits, top_ks, k_block, topk_impl, greedy_fast):
-    n, vocab = logits.shape
+def _plain_row_args(*, dummy):
+    # Disabled draft-extend operands get a valid dummy pointer; constexpr flags gate them off.
+    return dict(
+        AcceptLens=dummy, Hidden=dummy, HiddenOut=dummy, RowsOut=dummy, PartialMax=dummy,
+        PartialSum=dummy, stride_h=0, tokens_per_req=0, HIDDEN_SIZE=0, HIDDEN_BLOCK=1,
+        ROW_FROM_ACCEPT=False, COPY_HIDDEN=False, WRITE_ROWS=False, WRITE_PROB=False,
+    )
+
+
+def _proposal_split(*, vocab, k_block):
+    block = max(k_block, min(_DRAFT_BLOCK, triton.next_power_of_2(vocab)))
+    return block, triton.cdiv(x=vocab, y=block)
+
+
+def _proposal_topk_keys(*, logits, top_ks, k_block, topk_impl, greedy_fast, n=None, row_args=None):
+    vocab = logits.shape[1]
     if topk_impl == "torch":
+        assert row_args is None, "draft-extend row selection needs topk_impl='triton'"
         vals = torch.nan_to_num(input=logits.float(), nan=-float("inf"),
                                 posinf=float("inf"), neginf=-float("inf"))
         vals = torch.where(condition=vals == 0, input=torch.zeros_like(vals), other=vals)
@@ -131,28 +187,30 @@ def _proposal_topk_keys(*, logits, top_ks, k_block, topk_impl, greedy_fast):
         return torch.topk(input=keys, k=min(k_block, vocab), dim=-1).values
     if topk_impl != "triton":
         raise ValueError(f"Unknown topk_impl: {topk_impl}")
-    block = max(k_block, min(_DRAFT_BLOCK, triton.next_power_of_2(vocab)))
-    splits = triton.cdiv(x=vocab, y=block)
+    if n is None:
+        n = logits.shape[0]
+    if row_args is None:
+        row_args = _plain_row_args(dummy=logits)
+    block, splits = _proposal_split(vocab=vocab, k_block=k_block)
     keys = torch.empty(size=(n, splits * k_block), dtype=torch.int64, device=logits.device)
-    _draft_partial_topk_kernel[(n, splits)](
+    _draft_partial_topk_kernel[(n, splits + int(row_args["COPY_HIDDEN"]))](
         Logits=logits, Keys=keys, TopKs=top_ks, stride_l=logits.stride(0), VOCAB=vocab,
         SPLITS=splits, KB=k_block, GREEDY_FAST=greedy_fast, BLOCK=block, num_warps=4,
+        MASK_EMPTY_SPLITS=_DRAFT_CTX_VOCAB, **row_args,
     )
     return keys
 
 
-def rs_draft_proposal_sparse(
-    *, next_token_logits: torch.Tensor, temperatures: torch.Tensor,
-    top_ks: torch.Tensor, top_ps: torch.Tensor, uniforms: torch.Tensor, k: int,
-    min_ps: torch.Tensor | None = None, hot_token_id: torch.Tensor | None = None,
-    positions: torch.Tensor | None = None, draft_tokens: torch.Tensor | None = None,
-    draft_token_column: int = 0, draft_support_probs: torch.Tensor | None = None,
-    draft_support_tokens: torch.Tensor | None = None, topk_impl: str = "triton",
-    temp_scale: float = 1.0, onehot_above: float = 0.0, greedy_fast: bool = False,
+def _rs_proposal_sparse(
+    *, next_token_logits, temperatures, top_ks, top_ps, uniforms, k, min_ps, hot_token_id,
+    positions, draft_tokens, draft_token_column, draft_support_probs, draft_support_tokens,
+    topk_impl, temp_scale, onehot_above, greedy_fast, accept_lens, num_tokens_per_req,
+    hidden_states, write_rows, write_prob,
 ):
     assert temp_scale > 0 and 0 <= onehot_above <= 1
     assert next_token_logits.ndim == 2 and next_token_logits.stride(1) == 1
-    n, vocab = next_token_logits.shape
+    vocab = next_token_logits.shape[1]
+    n = next_token_logits.shape[0] if accept_lens is None else accept_lens.shape[0]
     assert k > 0 and vocab > 0
     k = min(k, vocab)
     k_block = triton.next_power_of_2(k)
@@ -182,11 +240,47 @@ def rs_draft_proposal_sparse(
         assert 0 <= draft_token_column < draft_tokens.shape[1]
     topk_p = torch.empty(size=(n, 1), dtype=torch.float32, device=device)
     topk_index = torch.empty(size=(n, 1), dtype=torch.int64, device=device)
+    row_args = None
+    hidden_out = rows_out = conf = None
+    partial_max = partial_sum = topk_p
+    splits = 1
+    if accept_lens is not None:
+        assert accept_lens.ndim == 1 and accept_lens.is_contiguous()
+        assert accept_lens.dtype in (torch.int32, torch.int64)
+        assert num_tokens_per_req > 0 and next_token_logits.shape[0] >= n * num_tokens_per_req
+        # Rows may carry trailing dims (e.g. HC streams); the kernel copies flat rows.
+        hidden_rows = hidden_states.flatten(1) if hidden_states is not None else None
+        if hidden_rows is not None:
+            assert hidden_rows.stride(1) == 1 and hidden_rows.shape[0] == next_token_logits.shape[0]
+            hidden_out = torch.empty(size=(n, *hidden_states.shape[1:]), dtype=hidden_states.dtype,
+                                     device=device)
+        if write_rows:
+            rows_out = torch.empty(size=(n, vocab), dtype=next_token_logits.dtype, device=device)
+        _, splits = _proposal_split(vocab=vocab, k_block=k_block)
+        if write_prob:
+            conf = torch.empty(size=(n,), dtype=torch.float32, device=device)
+            partial_max = torch.empty(size=(n, splits), dtype=torch.float32, device=device)
+            partial_sum = torch.empty(size=(n, splits), dtype=torch.float32, device=device)
+        hidden_size = hidden_rows.shape[1] if hidden_rows is not None else 0
+        row_args = dict(
+            AcceptLens=accept_lens,
+            Hidden=hidden_rows if hidden_rows is not None else next_token_logits,
+            HiddenOut=hidden_out if hidden_out is not None else next_token_logits,
+            RowsOut=rows_out if rows_out is not None else next_token_logits,
+            PartialMax=partial_max, PartialSum=partial_sum,
+            stride_h=hidden_rows.stride(0) if hidden_rows is not None else 0,
+            tokens_per_req=num_tokens_per_req, HIDDEN_SIZE=hidden_size,
+            HIDDEN_BLOCK=min(_DRAFT_BLOCK, triton.next_power_of_2(max(hidden_size, 1))),
+            ROW_FROM_ACCEPT=True, COPY_HIDDEN=hidden_rows is not None,
+            WRITE_ROWS=write_rows, WRITE_PROB=write_prob,
+        )
+    else:
+        assert hidden_states is None and not write_rows and not write_prob
     if n == 0:
-        return probs, tokens, topk_p, topk_index
+        return probs, tokens, topk_p, topk_index, hidden_out, rows_out, conf
     keys = _proposal_topk_keys(
         logits=next_token_logits, top_ks=top_ks, k_block=k_block,
-        topk_impl=topk_impl, greedy_fast=greedy_fast,
+        topk_impl=topk_impl, greedy_fast=greedy_fast, n=n, row_args=row_args,
     )
     _draft_finalize_kernel[(n,)](
         Keys=keys, Temps=temperatures, TopKs=top_ks, TopPs=top_ps,
@@ -202,9 +296,59 @@ def rs_draft_proposal_sparse(
         HAS_MIN_P=min_ps is not None, HAS_MAP=hot_token_id is not None,
         HAS_TEMP_SCALE=temp_scale != 1.0, HAS_ONEHOT=onehot_above > 0, GREEDY_FAST=greedy_fast,
         WRITE_POSITION=positions is not None, WRITE_CHAIN=draft_tokens is not None,
-        BLOCK=triton.next_power_of_2(keys.shape[1]), num_warps=4,
+        BLOCK=triton.next_power_of_2(keys.shape[1]),
+        Conf=conf if conf is not None else topk_p, PartialMax=partial_max, PartialSum=partial_sum,
+        WRITE_PROB=conf is not None, SPLITS=splits, SPLIT_BLOCK=triton.next_power_of_2(splits),
+        num_warps=4,
+    )
+    return probs, tokens, topk_p, topk_index, hidden_out, rows_out, conf
+
+
+def rs_draft_proposal_sparse(
+    *, next_token_logits: torch.Tensor, temperatures: torch.Tensor,
+    top_ks: torch.Tensor, top_ps: torch.Tensor, uniforms: torch.Tensor, k: int,
+    min_ps: torch.Tensor | None = None, hot_token_id: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None, draft_tokens: torch.Tensor | None = None,
+    draft_token_column: int = 0, draft_support_probs: torch.Tensor | None = None,
+    draft_support_tokens: torch.Tensor | None = None, topk_impl: str = "triton",
+    temp_scale: float = 1.0, onehot_above: float = 0.0, greedy_fast: bool = False,
+):
+    probs, tokens, topk_p, topk_index, _, _, _ = _rs_proposal_sparse(
+        next_token_logits=next_token_logits, temperatures=temperatures, top_ks=top_ks,
+        top_ps=top_ps, uniforms=uniforms, k=k, min_ps=min_ps, hot_token_id=hot_token_id,
+        positions=positions, draft_tokens=draft_tokens, draft_token_column=draft_token_column,
+        draft_support_probs=draft_support_probs, draft_support_tokens=draft_support_tokens,
+        topk_impl=topk_impl, temp_scale=temp_scale, onehot_above=onehot_above,
+        greedy_fast=greedy_fast, accept_lens=None, num_tokens_per_req=0, hidden_states=None,
+        write_rows=False, write_prob=False,
     )
     return probs, tokens, topk_p, topk_index
+
+
+def rs_draft_extend_proposal_sparse(
+    *, next_token_logits: torch.Tensor, accept_lens: torch.Tensor, num_tokens_per_req: int,
+    temperatures: torch.Tensor, top_ks: torch.Tensor, top_ps: torch.Tensor,
+    uniforms: torch.Tensor, k: int, min_ps: torch.Tensor | None = None,
+    hot_token_id: torch.Tensor | None = None, hidden_states: torch.Tensor | None = None,
+    write_rows: bool = False, write_prob: bool = False,
+    temp_scale: float = 1.0, onehot_above: float = 0.0, greedy_fast: bool = False,
+):
+    """rs_draft_proposal_sparse on rows ``i * num_tokens_per_req + accept_lens[i] - 1``.
+
+    Also copies those hidden rows; ``write_rows`` returns the selected logits rows
+    (bit-exact input for top1_prob), ``write_prob`` returns their softmax max (fp32
+    order differs from torch top1_prob: rounding-level). Returns
+    (probs, tokens, topk_p, topk_index, hidden, rows, conf); unasked outputs are None.
+    """
+    return _rs_proposal_sparse(
+        next_token_logits=next_token_logits, temperatures=temperatures, top_ks=top_ks,
+        top_ps=top_ps, uniforms=uniforms, k=k, min_ps=min_ps, hot_token_id=hot_token_id,
+        positions=None, draft_tokens=None, draft_token_column=0,
+        draft_support_probs=None, draft_support_tokens=None, topk_impl="triton",
+        temp_scale=temp_scale, onehot_above=onehot_above, greedy_fast=greedy_fast,
+        accept_lens=accept_lens, num_tokens_per_req=num_tokens_per_req,
+        hidden_states=hidden_states, write_rows=write_rows, write_prob=write_prob,
+    )
 
 
 @triton.jit
@@ -215,11 +359,15 @@ def _bv_combine(a1, c1, b1, a2, c2, b2):
 @triton.jit
 def _chain_sampling_sparse_kernel(
     Predicts, AcceptIndex, AcceptTokenNum, Candidates, RetriveIndex,
-    Coins, CoinsFinal, P, PI, Q, QI,
+    Coins, CoinsFinal, P, PI, Q, QI, VTLens,
     NUM_SLOTS: tl.constexpr, K: tl.constexpr, KQ: tl.constexpr,
     KP: tl.constexpr, VOCAB: tl.constexpr, BLOCK_VERIFY: tl.constexpr, SP: tl.constexpr,
+    HAS_VT: tl.constexpr,
 ):
     bx = tl.program_id(0).to(tl.int64)
+    num_drafts = NUM_SLOTS - 1
+    if HAS_VT:
+        num_drafts = tl.minimum(tl.maximum(tl.load(VTLens + bx), 0), NUM_SLOTS - 1)
     poffs = tl.arange(start=0, end=KP)
     qoffs = tl.arange(start=0, end=KQ)
     base = bx * NUM_SLOTS
@@ -229,6 +377,8 @@ def _chain_sampling_sparse_kernel(
     if BLOCK_VERIFY:
         u = tl.arange(start=0, end=SP)
         valid = (u >= 1) & (u < NUM_SLOTS)
+        if HAS_VT:
+            valid = valid & (u <= num_drafts)
         token = tl.load(pointer=Candidates + base + u, mask=valid, other=-1)
         coin = tl.load(pointer=Coins + base + u - 1, mask=valid, other=1.0)
         position_p = tl.load(pointer=P + (base + u[:, None] - 1) * KP + poffs[None, :],
@@ -253,7 +403,8 @@ def _chain_sampling_sparse_kernel(
         path_pi = tl.minimum(x=a + c, y=b)
         first_zero = tl.min(input=tl.where(condition=valid & (path_pi == 0), x=u, y=SP), axis=0)
         path_pi = tl.where(condition=u >= first_zero, x=0.0, y=path_pi)
-        next_valid = valid & (u < NUM_SLOTS - 1)
+        # Row L is a bonus row: neither its acceptance threshold nor final draw uses q_L.
+        next_valid = valid & (u < num_drafts)
         position_p = tl.load(pointer=P + (base + u[:, None]) * KP + poffs[None, :],
                              mask=next_valid[:, None], other=0.0).to(dtype=tl.float32)
         position_ids = tl.load(pointer=PI + (base + u[:, None]) * KP + poffs[None, :],
@@ -274,7 +425,7 @@ def _chain_sampling_sparse_kernel(
         n = tl.sum(input=tl.maximum(x=path_pi[:, None] * position_p - position_matched, y=0.0), axis=1)
         denominator = n + 1.0 - path_pi
         h = tl.where(condition=denominator > 0, x=n / denominator, y=1.0)
-        h = tl.where(condition=u == NUM_SLOTS - 1, x=path_pi, y=h)
+        h = tl.where(condition=u == num_drafts, x=path_pi, y=h)
         h = tl.where(condition=valid & (u < first_zero), x=h, y=0.0)
         num_correct = tl.max(input=tl.where(condition=coin < h, x=u, y=0), axis=0)
         final_pi = tl.sum(input=tl.where(condition=u == num_correct, x=path_pi, y=0.0), axis=0)
@@ -287,7 +438,7 @@ def _chain_sampling_sparse_kernel(
     else:
         walking = 1
         step = 1
-        while (step < NUM_SLOTS) & (walking == 1):
+        while (step < num_drafts + 1) & (walking == 1):
             token = tl.load(Candidates + base + step)
             p = tl.load(P + (base + step - 1) * KP + poffs)
             pi = tl.load(PI + (base + step - 1) * KP + poffs)
@@ -312,7 +463,7 @@ def _chain_sampling_sparse_kernel(
     if BLOCK_VERIFY:
         p = p.to(tl.float32)
     weights = p
-    if num_correct < NUM_SLOTS - 1:
+    if num_correct < num_drafts:
         qbase = (bx * (NUM_SLOTS - 1) + num_correct) * K
         q = tl.load(pointer=Q + qbase + qoffs, mask=qoffs < K, other=0.0)
         qi = tl.load(pointer=QI + qbase + qoffs, mask=qoffs < K, other=-1)
@@ -345,8 +496,20 @@ def chain_speculative_sampling_sparse(
     uniform_samples_for_final_sampling: torch.Tensor, target_probs: torch.Tensor,
     target_index: torch.Tensor, draft_support_probs: torch.Tensor,
     draft_support_tokens: torch.Tensor, vocab_size: int, block_verify: bool = False,
+    vt_lens: torch.Tensor | None = None,
 ):
     bs, num_slots = candidates.shape
+    if vt_lens is not None:
+        if (
+            vt_lens.shape != (bs,)
+            or vt_lens.dtype != torch.int32
+            or not vt_lens.is_contiguous()
+            or not vt_lens.is_cuda
+            or vt_lens.device != candidates.device
+        ):
+            raise ValueError(
+                "vt_lens must be contiguous CUDA int32 [batch_size] on the candidates device"
+            )
     kp = target_probs.shape[-1]
     k = draft_support_probs.shape[-1]
     assert target_probs.shape == target_index.shape == (bs, num_slots, kp)
@@ -361,6 +524,8 @@ def chain_speculative_sampling_sparse(
         Coins=uniform_samples.contiguous(), CoinsFinal=uniform_samples_for_final_sampling.contiguous(),
         P=target_probs.contiguous(), PI=target_index.contiguous(),
         Q=draft_support_probs.contiguous(), QI=draft_support_tokens.contiguous(),
+        VTLens=vt_lens if vt_lens is not None else candidates,
+        HAS_VT=vt_lens is not None,
         NUM_SLOTS=num_slots, K=k, KQ=triton.next_power_of_2(k), KP=kp, VOCAB=vocab_size, BLOCK_VERIFY=block_verify,
         SP=triton.next_power_of_2(n=num_slots),
         num_warps=8 if block_verify and num_slots > 8 else 4,

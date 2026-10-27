@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Draft-confidence side channel and the confidence/throughput step policy (C1).
 
 Why a side channel
@@ -21,8 +24,8 @@ This module supplies the two missing ingredients.
    CUDA graph (see specs/C1_LOG.md section 1).
 
 2. ``ConfidenceStepSlot`` turns observations into a throughput comparison
-   instead of a threshold test.  Modelling per-position acceptance as flat after
-   position 2 (a modelling assumption), a chain of length S behaves
+   instead of a threshold test.  Per-position acceptance is flat after
+   position 2 (mtp-train phase0/REPORT.md), so a chain of length S behaves
    like S iid Bernoulli(r) trials in series:
 
        E[accepted | S] = sum_{k=1..S} r^k = r (1 - r^S) / (1 - r)
@@ -32,7 +35,7 @@ This module supplies the two missing ingredients.
    predicts the mean at the S that is *not* live.  The EMA has no such
    transfer: it measures a quantity whose scale changes with every switch,
    which is why the shipped config needs the asymmetric "re-seed on step-down
-   only" hack.  Checked against the 2026-09-05 fixed-profile measurements:
+   only" hack.  Checked against the earlier fixed-profile measurements:
 
        workload    E@15   -> r     -> predicted E@3   measured E@3
        code-edit    9.87    0.930      2.60            2.86
@@ -59,6 +62,8 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
+from sglang.srt.speculative.dl_policy import dl_hostw_enabled
 
 if TYPE_CHECKING:
     pass
@@ -254,7 +259,7 @@ class ChainTracer:
 # Policy
 # ---------------------------------------------------------------------------
 
-# ms/iteration = STEP_A + STEP_B * S.  Fitted to the 2026-09-05 fnbench
+# ms/iteration = STEP_A + STEP_B * S.  Fitted to the reference fnbench
 # end-to-end step times (tokens/acc), which is the quantity being maximised:
 #   W4  (S=3):  11.7-12.2 ms      W16 (S=15): 19.9-21.9 ms
 # The pure-decode profiler numbers quoted in the C1 brief (10.2 / 17.3 ms at
@@ -313,7 +318,7 @@ class ConfidenceStepSlot:
     the first S' tokens of a length-S chain are the same tokens a length-S'
     chain would have drafted.  So a step observed at S tells you exactly what
     S' < S would have accepted: ``min(accepted, S')``.  Checked against the
-    2026-09-06 traces -- ``mean(min(a_15, 3))`` on the W16 run versus the mean
+    earlier traces -- ``mean(min(a_15, 3))`` on the W16 run versus the mean
     accepted actually measured on the separate W4 run:
 
         code-edit  2.66 vs 2.76 (+4%)      prose-en   1.49 vs 1.47 (-1%)
@@ -323,8 +328,8 @@ class ConfidenceStepSlot:
     At S=3 an accepted count of 3 could mean "3" or "would have been 14"; the
     mean saturates and carries no information about how much chain is being
     left on the table.  What survives censoring is the *hazard* at the
-    boundary: ``r = P(a >= S) / P(a >= S-1)``.  Assuming per-position acceptance is flat
-    after position 2 (a modelling assumption), that one rate extends the
+    boundary: ``r = P(a >= S) / P(a >= S-1)``.  Per-position acceptance is flat
+    after position 2 (mtp-train phase0/REPORT.md), so that one rate extends the
     chain:
 
         E[accepted | T] = E[min(a, S)] + P(a >= S) * r (1 - r^(T-S)) / (1 - r)
@@ -341,8 +346,8 @@ class ConfidenceStepSlot:
     bad summary of code-edit, whose accept distribution at S=15 is spread
     across 0..15 with a 30-40% spike at the full chain, and a threshold test on
     it (what the shipped EMA slot does) is answering the wrong question.  The
-    confidence is what makes the sub-populations separable: on the 2026-09-06
-    W16 traces the mean accepted mostly rises across the five buckets (one dip)
+    confidence is what makes the sub-populations separable: on the earlier
+    W16 traces the mean accepted rises monotonically across the five buckets
     -- prose-en 1.29 / 2.15 / 3.58 / 3.20 / 3.45, agent-loop 2.10 / 3.73 /
     4.56 / 4.74 / 5.18, code-edit 2.93 / 4.68 / 8.83 / 9.95 / 11.70 -- with
     corr(p0, accepted) between 0.37 and 0.53.
@@ -360,6 +365,35 @@ class ConfidenceStepSlot:
         candidates = sorted(set(cfg["candidate_steps"]))
         assert candidates, "candidate_steps must have at least 1 value"
         self.candidate_steps = candidates
+        # Optional measured times for this batch-size slot. Keep the global
+        # environment-based model when no table was configured.
+        self.step_time_table = None
+        if "step_time_ms" in cfg:
+            table = cfg["step_time_ms"]
+            error = (
+                "step_time_ms must map every candidate width to a positive finite time"
+            )
+            if not isinstance(table, dict):
+                raise ValueError(error)
+            times = {}
+            for s, ms in table.items():
+                try:
+                    width = int(s)
+                    time = float(ms)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(error) from exc
+                if (
+                    str(s) != str(width)
+                    or isinstance(ms, bool)
+                    or not isinstance(ms, (int, float))
+                    or not math.isfinite(time)
+                    or time <= 0
+                ):
+                    raise ValueError(error)
+                times[width] = time
+            if any(s not in times for s in candidates):
+                raise ValueError(error)
+            self.step_time_table = times
         self.current_steps = (
             initial_steps
             if initial_steps in candidates
@@ -408,7 +442,7 @@ class ConfidenceStepSlot:
         # Asymmetric on purpose, because the two estimates are not equally
         # trustworthy. Going DOWN uses min(accepted, S), which is exact. Going
         # UP uses the hazard extrapolation, which measured 8-17% optimistic --
-        # and on the 2026-09-06 server A/B that optimism cost agent-loop 8.6%:
+        # and on the reference server A/B that optimism cost agent-loop 8.6%:
         # it predicted E@15 = 5.53 (323 tok/s) against a true ~3.5, stepped up
         # mid-benchmark and had to come back 5 s later. A candidate whose
         # estimate is extrapolated must therefore clear a wider margin. It
@@ -416,7 +450,14 @@ class ConfidenceStepSlot:
         # while agent-loop and the prose workloads predict within +/-5%.
         self.up_margin = float(cfg.get("up_margin", 0.30))
         # The hazard extrapolation runs 8-17% optimistic against measurement.
-        self.tail_bias = float(cfg.get("tail_bias", 0.9))
+        # A scalar, or a mapping keyed by the live steps it extends from
+        # (e.g. {"3": .95, "7": .75}); missing keys keep 0.9.
+        tail_bias = cfg.get("tail_bias", 0.9)
+        self.tail_bias = (
+            {int(s): float(v) for s, v in tail_bias.items()}
+            if isinstance(tail_bias, dict)
+            else float(tail_bias)
+        )
         # 0 pools every step into one estimate (option 3: a better statistic,
         # no confidence); 1 trusts the buckets, shrunk by their sample count.
         self.confidence_weight = float(cfg.get("confidence_weight", 1.0))
@@ -448,7 +489,13 @@ class ConfidenceStepSlot:
         self._grace_until = 0
         self._next_bucket = nb // 2
         self._last_conf: Optional[float] = None
+        self._track_rounds = (
+            os.environ.get("SGLANG_RND_DL_STEPUP", "0") == "1" or dl_hostw_enabled()
+        )
+        # Keep the earlier B16 bucket FIFO, including stale/empty consumption,
+        # when neither execution-width feature is enabled.
         self._inflight_bucket: collections.deque = collections.deque(maxlen=8)
+        self._inflight_rounds: collections.deque = collections.deque()
         self._dbg = os.environ.get("SGLANG_ADAPTIVE_DEBUG", "") == "1"
 
     # -- inputs ------------------------------------------------------------
@@ -467,26 +514,46 @@ class ConfidenceStepSlot:
         conf = sum(confidences) / len(confidences)
         self._last_conf = conf
         self._next_bucket = self._bucket(conf)
-        self._inflight_bucket.append(self._next_bucket)
+        if not self._track_rounds:
+            self._inflight_bucket.append(self._next_bucket)
+
+    def observe_execution_steps(self, selected_steps: int, execution_steps: int) -> None:
+        """Register one verify, even when no new confidence has arrived."""
+        if self._track_rounds:
+            self._inflight_rounds.append(
+                (selected_steps, execution_steps, self._next_bucket)
+            )
 
     @staticmethod
     def _ema(cur: float, n: int, x: float, a: float) -> float:
         return x if n == 0 else (1 - a) * cur + a * x
 
     def update(self, num_correct_drafts_per_req: list[int]) -> bool:
+        S = self.current_steps
+        # Consume the entire round before either the empty or stale guard.
+        if self._track_rounds:
+            if not self._inflight_rounds:
+                raise RuntimeError("C1 verify completion has no matching execution round")
+            selected_steps, execution_steps, b = self._inflight_rounds.popleft()
+        else:
+            selected_steps, execution_steps = S, S
+            # B16: consume one bucket even for stale or empty completions.
+            b = (
+                self._inflight_bucket.popleft()
+                if self._inflight_bucket
+                else self._next_bucket
+            )
         if not num_correct_drafts_per_req:
             return False
-        S = self.current_steps
         if S > 0:
-            # Same staleness guard as the EMA slot: a sample longer than the
-            # live chain was produced by the previous, longer state.
-            fresh = [n for n in num_correct_drafts_per_req if n <= S]
+            if selected_steps == S and execution_steps > S:
+                # Only a recorded STEPUP execution is a valid prefix sample.
+                # Older policy selections still use the stale-sample guard.
+                fresh = [min(n, S) for n in num_correct_drafts_per_req]
+            else:
+                # Without STEPUP, retain the original stale-sample guard.
+                fresh = [n for n in num_correct_drafts_per_req if n <= S]
             if fresh:
-                b = (
-                    self._inflight_bucket.popleft()
-                    if self._inflight_bucket
-                    else self._next_bucket
-                )
                 a = self.alpha
                 for c in self.candidate_steps:
                     if c > S:
@@ -524,7 +591,12 @@ class ConfidenceStepSlot:
             return base
         r = min(0.999, sat / satp) if satp > 0 else 0.9
         tail = k if r >= 1.0 else r * (1.0 - r**k) / (1.0 - r)
-        return base + self.tail_bias * sat * tail
+        bias = (
+            self.tail_bias.get(self.current_steps, 0.9)
+            if isinstance(self.tail_bias, dict)
+            else self.tail_bias
+        )
+        return base + bias * sat * tail
 
     def _pooled_estimate(self, c: int) -> float:
         S = self.current_steps
@@ -563,8 +635,14 @@ class ConfidenceStepSlot:
             if self._w[b] > 1e-4
         )
 
+    def step_time_ms(self, steps: int) -> float:
+        """Measured time for this slot, or the legacy global time model."""
+        if self.step_time_table is not None:
+            return self.step_time_table[steps]
+        return step_time_ms(steps)
+
     def value(self, steps: int) -> float:
-        return (1.0 + self.expected_accept_for(steps)) / step_time_ms(steps)
+        return (1.0 + self.expected_accept_for(steps)) / self.step_time_ms(steps)
 
     def best_steps(self) -> tuple[int, float]:
         best, best_tps = self.current_steps, -1.0

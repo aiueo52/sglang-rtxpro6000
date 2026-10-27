@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 aiueo52 and contributors
+
 """Non-persistent HC per-branch norm + low-rank mix for decode-size batches.
 
 The persistent variant in ``hc_fused_triton`` serializes the down projection,

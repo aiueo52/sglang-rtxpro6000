@@ -1,3 +1,6 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
+import torch
 import triton
 import triton.language as tl
 
@@ -14,6 +17,7 @@ def speculative_sampling_classic_kernel(
     UniformSamplesFinal,
     TargetProbs,
     DraftProbs,
+    VTLens,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -31,9 +35,15 @@ def speculative_sampling_classic_kernel(
     NUM_SLOTS: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    HAS_VT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
+    verification_slots = NUM_SLOTS
+    if HAS_VT:
+        verification_slots = (
+            tl.minimum(tl.maximum(tl.load(VTLens + pid), 0), NUM_SLOTS - 1) + 1
+        )
 
     cand_ptr_base = Candidates + pid * stride_cand_b
     idx_ptr_base = RetriveIndex + pid * stride_idx_b
@@ -49,7 +59,7 @@ def speculative_sampling_classic_kernel(
     step = 1
     continue_verifying = 1
 
-    while (step < NUM_SLOTS) and (continue_verifying == 1):
+    while (step < verification_slots) and (continue_verifying == 1):
         draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
 
         offset_prob = (
@@ -86,14 +96,14 @@ def speculative_sampling_classic_kernel(
 
     tl.store(AcceptTokenNum + pid, num_accept)
 
-    # Final Sampling
+    # Hitting the VT cap also samples pure target p at the last accepted row.
     all_drafts_accepted = continue_verifying
     coin_final = tl.load(UniformSamplesFinal + pid)
     norm_sum = 0.0
 
     tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
     # DraftProbs has only num_steps rows (TargetProbs has num_steps + 1). When
-    # all drafts are accepted cur_prob_row == num_steps is out of bounds for
+    # all uncapped drafts are accepted cur_prob_row == num_steps is out of bounds for
     # DraftProbs, but the all-accepted branch samples pure target p and never
     # dereferences this pointer; on rejection cur_prob_row <= num_steps - 1.
     dp_base_ptr_safe = DraftProbs + (pid * stride_dp_b) + (cur_prob_row * stride_dp_s)
@@ -175,9 +185,21 @@ def chain_speculative_sampling_triton(
     threshold_single,
     threshold_acc,
     deterministic,  # not used
+    vt_lens: torch.Tensor | None = None,
 ):
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    if vt_lens is not None:
+        if (
+            vt_lens.shape != (batch_size,)
+            or vt_lens.dtype != torch.int32
+            or not vt_lens.is_contiguous()
+            or not vt_lens.is_cuda
+            or vt_lens.device != candidates.device
+        ):
+            raise ValueError(
+                "vt_lens must be contiguous CUDA int32 [batch_size] on the candidates device"
+            )
 
     grid = (batch_size,)
     speculative_sampling_classic_kernel[grid](
@@ -190,6 +212,7 @@ def chain_speculative_sampling_triton(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
+        vt_lens if vt_lens is not None else candidates,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
@@ -205,4 +228,5 @@ def chain_speculative_sampling_triton(
         NUM_SLOTS=num_slots,
         VOCAB_SIZE=vocab_size,
         BLOCK_V=4096,
+        HAS_VT=vt_lens is not None,
     )

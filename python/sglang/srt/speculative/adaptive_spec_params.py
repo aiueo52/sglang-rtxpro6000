@@ -1,4 +1,5 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 """Adaptive speculative decoding parameters.
 
 Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
@@ -14,6 +15,7 @@ import os
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from sglang.srt.speculative.dl_policy import dl_hostw_enabled, dl_hostw_steps
 from sglang.srt.utils import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -130,12 +132,16 @@ def _load_adaptive_config(
 
 def resolve_candidate_steps_from_config(
     cfg_path: str | None = None,
+    *,
+    include_hostw: bool = True,
 ) -> list[int]:
     """Union of every BS slot's candidate steps; sizes the runtime buffers."""
     _, bs_entries = _load_adaptive_config(cfg_path)
     all_steps: set[int] = set()
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
+    if include_hostw:
+        all_steps.update(dl_hostw_steps())
     return sorted(all_steps)
 
 
@@ -353,6 +359,21 @@ class AdaptiveStepSlot:
         return False
 
 
+def adaptive_capture_bs_for_step(
+    *, capture_bs: list[int], step: int, cfg_path: str | None
+) -> list[int]:
+    _, entries = _load_adaptive_config(cfg_path)
+    slot_bs = sorted(entries)
+    return [
+        bs
+        for bs in capture_bs
+        if step
+        in entries[slot_bs[max(0, bisect.bisect_right(slot_bs, bs) - 1)]][
+            "candidate_steps"
+        ]
+    ]
+
+
 class AdaptiveSpeculativeParams:
     """Routes ``batch_size`` to the correct per-BS slot.
 
@@ -364,6 +385,12 @@ class AdaptiveSpeculativeParams:
         initial_steps: int,
         cfg_path: str | None = None,
     ):
+        if dl_hostw_enabled():
+            from sglang.srt.runtime_context import get_spec
+
+            policy_initial_steps = get_spec()._speculative_adaptive_initial_steps
+            if policy_initial_steps is not None:
+                initial_steps = policy_initial_steps
         cfg, bs_entries = _load_adaptive_config(cfg_path)
         self._bs_list: list[int] = sorted(bs_entries)
         self._slots: dict[int, AdaptiveStepSlot] = {}
@@ -404,6 +431,12 @@ class AdaptiveSpeculativeParams:
     def set_cuda_graph_bs(self, cuda_graph_bs: list[int] | None) -> None:
         self._cuda_graph_bs = sorted(cuda_graph_bs) if cuda_graph_bs else None
 
+    def get_bucket_for_batch(self, batch_size: int) -> int:
+        return self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
+
+    def get_candidate_steps_for_batch(self, batch_size: int) -> list[int]:
+        return self._route(batch_size).candidate_steps
+
     def get_steps_for_batch(self, batch_size: int) -> int:
         return self._route(batch_size).current_steps
 
@@ -414,7 +447,22 @@ class AdaptiveSpeculativeParams:
         """
         if not self._confidence:
             return
+        if batch_size <= 0 and (
+            os.environ.get("SGLANG_RND_DL_STEPUP", "0") == "1" or dl_hostw_enabled()
+        ):
+            return
         self._route(batch_size).observe_confidence(confidences)
+
+    def observe_execution_steps(
+        self, selected_steps: int, execution_steps: int, batch_size: int
+    ) -> None:
+        """Associate one STEPUP/HOSTW round with its eventual verify result."""
+        if self._confidence and batch_size > 0 and (
+            os.environ.get("SGLANG_RND_DL_STEPUP", "0") == "1" or dl_hostw_enabled()
+        ):
+            self._route(batch_size).observe_execution_steps(
+                selected_steps, execution_steps
+            )
 
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
@@ -423,6 +471,10 @@ class AdaptiveSpeculativeParams:
 
         Returns the new step if a switch is warranted, else ``None``.
         """
+        if self._confidence and batch_size <= 0 and (
+            os.environ.get("SGLANG_RND_DL_STEPUP", "0") == "1" or dl_hostw_enabled()
+        ):
+            return None
         params = self._route(batch_size)
         if params.update(num_correct_drafts_per_req):
             return params.current_steps
@@ -451,9 +503,7 @@ class AdaptiveSpeculativeParams:
 
     def _route(self, batch_size: int) -> AdaptiveStepSlot:
         """Map *batch_size* → pad to CUDA-graph BS → closest slot."""
-        return self._slots[
-            self._find_closest_bs(self._pad_to_cuda_graph_bs(batch_size))
-        ]
+        return self._slots[self.get_bucket_for_batch(batch_size)]
 
     def _pad_to_cuda_graph_bs(self, batch_size: int) -> int:
         if self._cuda_graph_bs is None:
