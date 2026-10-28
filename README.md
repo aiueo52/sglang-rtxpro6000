@@ -30,6 +30,8 @@ It adds support for four concurrent requests with long context while retaining t
   - SGLang's own JIT kernels (three small ones) are built on the first start, before the server reports ready: 13–17 s in total on the machine used by aiueo52 and contributors. They need `ninja` on `PATH` (it is installed in the venv; run with the venv active). Without it the server stops at its first request.
   - Not included: kernels that compile on first use at run time (CuTe-DSL NVFP4 quantize, Triton) and CUDA graph capture. These need the GPU and were not timed separately.
 - Host RAM: about 100 GiB for the server process with the defaults (measured peak 100.5 GiB: about 67 GiB for the model and its offloads, plus the 32 GB HiCache host pool). Set `FLASH_NEXT_HICACHE_GB` lower to reduce the pool at `CONC=4`. Measured on a 256 GB machine.
+  - Most of the 67 GiB is the pinned PLE embedding table. Its data is 47.7 GiB, but PyTorch 2.13 rounds pinned host allocations up to a power of two, so with the defaults the table takes 64 GiB.
+  - To keep the table at 47.7 GiB, start with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,pinned_max_round_threshold_mb:1024` (the launcher keeps a value you set; `expandable_segments:True` is its default). In one normal start with this setting and `FLASH_NEXT_HICACHE_GB=0` at `CONC=4`, the server ran under a 56 GiB memory limit with swap off (cgroup `MemoryMax`), with peak process memory of 53.6 GiB. On GSM8K (200 questions) it matched an earlier default start on 195 questions (a second default start matched that earlier start on 193), and it answered a 31,321-token input correctly. Without the setting, the same limit killed the server while the table was being pinned. The limit was set on the 256 GB machine; no 64 GB machine was tested. A 64 GB machine has about 59.6 GiB, so this leaves roughly 6 GiB for the OS and everything else; keep `FLASH_NEXT_HICACHE_GB=0`.
 - Weights (not included; see [Assets](#assets)):
   - normal: RadixArk/Qwen3.8-Flash-Next-NVFP4.
   - hyper pro: a local overlay of ThinkingCap on that model, built with `tools/thinkingcap_overlay/overlay.py` (16 GB of new files; the rest are links to the original).
@@ -293,6 +295,8 @@ executes or accumulates entirely in BF16.
 | Mamba capacity | 24 slots; maximum 5 retained states/path | 24 slots; `extra_buffer`, tracking interval 64 |
 | HiCache/NIXL | 96 GB configured host tier; target KV + Mamba/GDN + DFlash2 state | 32 GB configured host tier; packed target/native-MTP KV + GDN + PLE + QSA keys |
 | Maximum active requests | 4 | 4 |
+
+The PLE entry in the dtype row above refers to looked-up PLE rows. The PLE table itself is not BF16: the public checkpoint's config sets `ple_embedding_dtype` to `float8_e4m3fn`, so with the launcher's default `--ple-offload-embedding` the table stays in pinned host memory as FP8 E4M3 with one per-tensor scale (47.7 GiB). The GPU reads each looked-up row from host memory, converts it to BF16 and applies the scale.
 
 The current 27B launcher uses the 24-slot/five-state setting qualified on
 2026-08-26. The earlier 2026-08-24 performance release used 16 slots, a
