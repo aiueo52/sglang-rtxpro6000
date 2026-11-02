@@ -368,6 +368,9 @@ class QwenSparseAttnBackend(AttentionBackend):
     # instead of the resolved mirror -- an accepted trade for dropping the
     # per-iteration scheduler sync on the graphed serving path.
     needs_cpu_seq_lens: bool = False
+    # SGLANG_QSA_PAGED_PREFILL (set in __init__): prefix chunk prefill reads
+    # the KV pool in place instead of gathering each request's full K/V.
+    _qsa_paged_prefill: bool = False
 
     def __init__(self, runner=None) -> None:
         self.runner = runner
@@ -415,6 +418,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._mtp_shared_sparse_indices = None
         self._trtllm_workspace = None
         self._triton_decode_attn = envs.SGLANG_OPT_TRITON_DECODE_ATTN.get()
+        self._qsa_paged_prefill = envs.SGLANG_QSA_PAGED_PREFILL.get()
         self._decode_attn_workspace: Optional[QSADecodeAttnWorkspace] = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
@@ -1617,6 +1621,26 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_buffer = pool.get_key_buffer(layer.layer_id)
         v_buffer = pool.get_value_buffer(layer.layer_id)
         req_to_token = self.req_to_token_pool.req_to_token
+        if self._qsa_paged_prefill and k_buffer.dim() == 3 and v_buffer.dim() == 3:
+            # SGLANG_QSA_PAGED_PREFILL: the kernel resolves each request's
+            # logical top-k positions through its req_to_token row and reads
+            # the pool in place; no full-context K/V copy, bitwise identical.
+            sequence_lens_tensor = torch.tensor(
+                sequence_lens, dtype=torch.int32, device=q.device
+            )
+            output = sparse_gqa_fwd_interface_triton_ck(
+                q.contiguous(),
+                k_buffer,
+                v_buffer,
+                topk_indices,
+                cu_seqlens_q,
+                None,
+                sequence_lens_tensor,
+                layer.scaling,
+                req_to_token=req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+            )
+            return self._pad_extend_output(output, num_output_rows)
         req_indices = forward_batch.req_pool_indices.tolist()
         k_parts = [
             k_buffer.index_select(

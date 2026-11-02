@@ -330,6 +330,10 @@ class Envs:
     # QSA sparse decode/verify attention as one split-KV Triton kernel over the
     # fp8 KV pool (layers/attention/qsa/decode_attn.py) instead of compaction + XQA.
     SGLANG_OPT_TRITON_DECODE_ATTN = EnvBool(False)
+    # QSA sparse chunk prefill with a prefix reads the KV pool in place through
+    # req_to_token instead of gathering every request's full K/V (~2 GiB at 1M
+    # tokens); bitwise identical output.
+    SGLANG_QSA_PAGED_PREFILL = EnvBool(False)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)

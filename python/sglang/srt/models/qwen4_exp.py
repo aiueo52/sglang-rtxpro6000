@@ -781,18 +781,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and get_attention_dp_size() > 1
             and not self.use_attn_tp_ngram
         )
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if (quant_config is not None and quant_config.get_name() == "fp8")
-                or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
+        # expert-tier R&D (SGLANG_RND_PLE_META=1): when the table is offloaded to
+        # pinned host memory (Qwen4ExpPinnedHostEmbedding replaces it right after),
+        # build it on the meta device so construction does not briefly hold the
+        # ~51 GB table on GPU.
+        table_context = (
+            torch.device("meta")
+            if getattr(config, "ple_offload_embedding", False)
+            and os.environ.get("SGLANG_RND_PLE_META", "0") == "1"
+            else nullcontext()
         )
+        with table_context:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if (quant_config is not None and quant_config.get_name() == "fp8")
+                    or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
         self.ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )

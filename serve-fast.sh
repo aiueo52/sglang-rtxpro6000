@@ -71,7 +71,11 @@ export TMPDIR="${TMPDIR:-$CACHE_BASE/tmp}"
 export TMP="${TMP:-$TMPDIR}" TEMP="${TEMP:-$TMPDIR}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$CACHE_BASE/runtime}" SGLANG_OEA_CTL_FILE="${SGLANG_OEA_CTL_FILE:-$CACHE_BASE/oea/flash-next.ctl}"
 export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$CACHE_BASE/workspace}"
-export ADAPTIVE_CONFIG="${ADAPTIVE_CONFIG:-$REPO/adaptive/w16_c4.json}"
+if [ "$CONC" = 8 ]; then
+  export ADAPTIVE_CONFIG="${ADAPTIVE_CONFIG:-$REPO/adaptive/w16_c8.json}"
+else
+  export ADAPTIVE_CONFIG="${ADAPTIVE_CONFIG:-$REPO/adaptive/w16_c4.json}"
+fi
 export SGLANG_TACTIC_ROWS="${SGLANG_TACTIC_ROWS:-0}"
 PREBUILT_CACHE="${PREBUILT_CACHE:-0}"
 export -n PREBUILT_CACHE
@@ -84,11 +88,52 @@ unset SGLANG_TACTIC_ROWS_APPROVED_SHA256
 if [ "$PREBUILT_CACHE" = 1 ]; then export FLASHINFER_P2_NO_NINJA=1; fi
 
 case "$CONC" in
-  1|4|6) ;;
-  *) echo "[serve-fast] CONC must be 1, 4 or 6" >&2; exit 2 ;;
+  1|4|6|8) ;;
+  *) echo "[serve-fast] CONC must be 1, 4, 6 or 8" >&2; exit 2 ;;
 esac
 if [ "$CONC" != 1 ] && [ "$PROFILE" != wa ]; then
-  echo "[serve-fast] CONC=4/6 requires profile wa" >&2; exit 2
+  echo "[serve-fast] CONC=4/6/8 requires profile wa" >&2; exit 2
+fi
+# Expert residency is opt-in. Do not alter the inherited environment when off.
+EXPERT_TIER_K="${EXPERT_TIER_K:-0}"
+if [[ ! "$EXPERT_TIER_K" =~ ^(0|[1-9][0-9]{0,2})$ ]] || ((EXPERT_TIER_K > 512)); then
+  echo "[serve-fast] EXPERT_TIER_K must be an integer in 0..512" >&2; exit 2
+fi
+if ((EXPERT_TIER_K > 0)); then
+  EXPERT_TIER_HOT="${EXPERT_TIER_HOT:-$REPO/expert-tier/hot-set.json}"
+  EXPERT_TIER_KEEP="${EXPERT_TIER_KEEP:-60}"
+  if [[ ! "$EXPERT_TIER_KEEP" =~ ^(0|[1-9][0-9]{0,3})$ ]] ||
+     ((EXPERT_TIER_KEEP != 0 && (EXPERT_TIER_KEEP < 5 || EXPERT_TIER_KEEP > 3600))); then
+    echo "[serve-fast] EXPERT_TIER_KEEP must be 0 or seconds in 5..3600" >&2; exit 2
+  fi
+  [ -f "$EXPERT_TIER_HOT" ] || {
+    echo "[serve-fast] expert tier HOT file not found: $EXPERT_TIER_HOT" >&2; exit 2;
+  }
+  # Route each graph batch to the greatest table bucket <= batch (or first).
+  # Verify/extend has steps+1 rows per request, each with top-k 10.
+  EXPERT_TIER_ROWS="$("$PYTHON" -I -B -c '
+import bisect, json, sys
+with open(sys.argv[1]) as stream:
+    table = {int(k): v["candidate_steps"] for k, v in json.load(stream).items() if k.isdigit()}
+keys = sorted(table)
+if not keys or any(not v or any(type(s) is not int or s < 0 for s in v) for v in table.values()):
+    sys.exit("[serve-fast] invalid adaptive candidate_steps table")
+print(max(bs * (max(table[keys[max(0, bisect.bisect_right(keys, bs)-1)]]) + 1)
+          for bs in range(1, int(sys.argv[2])+1)))
+' "$ADAPTIVE_CONFIG" "$CONC")"
+  EXPERT_TIER_REQUIRED=$((10 * EXPERT_TIER_ROWS))
+  if ((EXPERT_TIER_K < EXPERT_TIER_REQUIRED)); then
+    echo "[serve-fast] warning: expert tier K=$EXPERT_TIER_K < required K=$EXPERT_TIER_REQUIRED (M=$EXPERT_TIER_ROWS, 10*M); some calls use the arena fallback" >&2
+  fi
+  export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-${CONTEXT_LENGTH:-262144}}"
+  export SGLANG_MOE_PRUNE_IN_PROLOGUE=0
+  export SGLANG_EXPERT_TIER_K="$EXPERT_TIER_K" SGLANG_EXPERT_TIER_HOT="$EXPERT_TIER_HOT"
+  export SGLANG_EXPERT_TIER_SOURCE=mmap SGLANG_EXPERT_TIER_GATHER=v2
+  export SGLANG_EXPERT_TIER_GATHER_CHUNK=8192 SGLANG_EXPERT_TIER_GATHER_CTAS=376
+  export SGLANG_EXPERT_TIER_PRETOUCH=1 SGLANG_EXPERT_TIER_DECIDE=sort SGLANG_EXPERT_TIER_PREDICT=0
+  export SGLANG_EXPERT_TIER_KEEP="$EXPERT_TIER_KEEP" SGLANG_EXPERT_TIER_TIMING=0
+  export SGLANG_EXPERT_TIER_ARENA=v2 SGLANG_EXPERT_TIER_PREFETCH=0 SGLANG_EXPERT_TIER_FUSED=0 SGLANG_EXPERT_TIER_POLICY=lru
+  export SGLANG_EXPERT_TIER_SKIP_EMPTY=0 SGLANG_RND_PLE_META=1
 fi
 OEA="${OEA:-$EDITION_OEA}"
 EDITION_DL_TAU_BY_S='3:0.1,7:0.2,15:0.4,31:0.5'

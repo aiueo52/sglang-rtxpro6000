@@ -67,6 +67,7 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    expert_tier: object = None
 
 
 @dataclass
@@ -230,6 +231,12 @@ def _run_flashinfer_cutlass(
     w13_weight = quant_info.w13_weight
     w2_weight = quant_info.w2_weight
     quant_scales = quant_info.quant_scales
+    if quant_info.expert_tier is not None:
+        from sglang.srt.layers.moe.expert_tier import integration
+        topk_ids, w13_weight, w2_weight, quant_scales = integration.route(
+            quant_info.expert_tier, topk_ids, w13_weight, w2_weight, quant_scales,
+            hidden=x if x_sf is None else None, topk_weights=topk_weights,
+        )
     if quant_info.quant_type == "fp4":
         w13_weight = w13_weight.view(torch.long)
         w2_weight = w2_weight.view(torch.long)

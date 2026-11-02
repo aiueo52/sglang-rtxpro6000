@@ -1,5 +1,6 @@
 """Validated sparse GQA operators migrated from the QSA reference branch."""
 
+import os
 from typing import Optional
 
 import torch
@@ -21,8 +22,14 @@ _L20_CONFIGS = [
 ]
 
 
+# The CPU interpreter has no device to name, and its low-precision dot is
+# unreliable (bf16 operands are multiplied as raw uint16 encodings).
+_INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
+
+
 def _get_best_config(total_q: int):
-    table = _H20_CONFIGS if "H20" in torch.cuda.get_device_name(0) else _L20_CONFIGS
+    device_name = "" if _INTERPRET else torch.cuda.get_device_name(0)
+    table = _H20_CONFIGS if "H20" in device_name else _L20_CONFIGS
     return next(cfg for limit, cfg in table if total_q <= limit)
 
 
@@ -176,6 +183,8 @@ def _sparse_gqa_chunk_prefill(
     kv_lens,
     scale,
     topk,
+    req_to_token,
+    req_pool_indices,
     sq_m: tl.constexpr,
     sq_h: tl.constexpr,
     sq_d: tl.constexpr,
@@ -191,11 +200,14 @@ def _sparse_gqa_chunk_prefill(
     si_m: tl.constexpr,
     si_g: tl.constexpr,
     si_n: tl.constexpr,
+    sr_b: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    PAGED: tl.constexpr,
+    F32_DOT: tl.constexpr,
 ):
     query_relative = tl.program_id(0).to(tl.int64)
     batch_group = tl.program_id(1)
@@ -206,7 +218,8 @@ def _sparse_gqa_chunk_prefill(
     query = (q_start + query_relative).to(tl.int64)
     if query >= q_end:
         return
-    k_start = tl.load(cu_k + batch).to(tl.int64)
+    if not PAGED:
+        k_start = tl.load(cu_k + batch).to(tl.int64)
     kv_len = tl.load(kv_lens + batch).to(tl.int64)
     visible = query_relative + kv_len - (q_end - q_start) + 1
     row_topk = tl.minimum(topk, visible)
@@ -222,8 +235,16 @@ def _sparse_gqa_chunk_prefill(
         other=0.0,
     )
     q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
-    k_base = k + k_start * sk_n + group * sk_h
-    v_base = v + k_start * sv_n + group * sv_h
+    if PAGED:
+        # k/v are the KV pool itself; top-k entries are logical positions of
+        # this request, resolved to pool slots through its req_to_token row.
+        req = tl.load(req_pool_indices + batch).to(tl.int64)
+        slot_row = req_to_token + req * sr_b
+        k_base = k + group * sk_h
+        v_base = v + group * sv_h
+    else:
+        k_base = k + k_start * sk_n + group * sk_h
+        v_base = v + k_start * sv_n + group * sv_h
     idx_row = indices + query * si_m + group * si_g
     max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
     normalizer = tl.zeros([BLOCK_M], tl.float32)
@@ -232,24 +253,54 @@ def _sparse_gqa_chunk_prefill(
     for start in range(0, row_limit, BLOCK_N):
         current = start + offs_n
         token = tl.load(idx_row + current * si_n, mask=current < topk, other=-1)
-        valid = token >= 0
-        keys = tl.load(
-            k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
-            mask=valid[None, :],
-            other=0.0,
-        ).to(q_values.dtype)
-        values = tl.load(
-            v_base + token[:, None] * sv_n + offs_d[None, :] * sv_d,
-            mask=valid[:, None],
-            other=0.0,
-        ).to(q_values.dtype)
-        scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+        if PAGED:
+            # Bounded by kv_len too, so a stray index never walks req_to_token
+            # past this request; slot * row stride overflows int32 past ~4M slots.
+            valid = (token >= 0) & (token < kv_len)
+            slot = tl.load(slot_row + token, mask=valid, other=0).to(tl.int64)
+            keys = tl.load(
+                k_base + slot[None, :] * sk_n + offs_d[:, None] * sk_d,
+                mask=valid[None, :],
+                other=0.0,
+            ).to(q_values.dtype)
+            values = tl.load(
+                v_base + slot[:, None] * sv_n + offs_d[None, :] * sv_d,
+                mask=valid[:, None],
+                other=0.0,
+            ).to(q_values.dtype)
+        else:
+            valid = token >= 0
+            keys = tl.load(
+                k_base + token[None, :] * sk_n + offs_d[:, None] * sk_d,
+                mask=valid[None, :],
+                other=0.0,
+            ).to(q_values.dtype)
+            values = tl.load(
+                v_base + token[:, None] * sv_n + offs_d[None, :] * sv_d,
+                mask=valid[:, None],
+                other=0.0,
+            ).to(q_values.dtype)
+        if F32_DOT:
+            qk = tl.dot(
+                q_values.to(tl.float32), keys.to(tl.float32), input_precision="ieee"
+            )
+        else:
+            qk = tl.dot(q_values, keys)
+        scores = tl.where(valid[None, :], qk, -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.math.exp2(scores - next_max[:, None])
-        accumulator = tl.dot(
-            probabilities.to(values.dtype), values, accumulator * alpha[:, None]
-        )
+        if F32_DOT:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype).to(tl.float32),
+                values.to(tl.float32),
+                accumulator * alpha[:, None],
+                input_precision="ieee",
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype), values, accumulator * alpha[:, None]
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, 1)
         max_value = next_max
     output = accumulator / normalizer[:, None]
@@ -263,8 +314,37 @@ def _sparse_gqa_chunk_prefill(
     )
 
 
-def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
-    k, v = k.contiguous(), v.contiguous()
+def sparse_gqa_fwd_interface_triton_ck(
+    q,
+    k,
+    v,
+    indices,
+    cu_q,
+    cu_k,
+    kv_lens,
+    scale,
+    req_to_token: Optional[torch.Tensor] = None,
+    req_pool_indices: Optional[torch.Tensor] = None,
+):
+    """Chunk prefill over each request's full context.
+
+    Packed (default): k/v hold every request's [0, kv_lens[b]) K/V back to back
+    from cu_k[b], and indices are positions within that segment.
+
+    Paged (req_to_token and req_pool_indices given): k/v are the KV pool
+    [slots, kv heads, D] read in place, indices are the request's logical
+    positions resolved as req_to_token[req_pool_indices[b], position]; cu_k is
+    unused and may be None. Same loads and arithmetic order as packed, so the
+    output is bitwise identical.
+    """
+    paged = req_to_token is not None
+    if paged:
+        if req_pool_indices is None:
+            raise ValueError("paged chunk prefill needs req_pool_indices")
+        if k.dim() != 3 or v.dim() != 3:
+            raise ValueError("paged chunk prefill needs a [slots, heads, dim] KV pool")
+    else:
+        k, v = k.contiguous(), v.contiguous()
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k.shape[1]
     group_size = num_q_heads // num_kv_heads
@@ -279,10 +359,13 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         out,
         indices,
         cu_q,
-        cu_k,
+        # Unused pointers get a live int32 tensor rather than None.
+        cu_q if paged else cu_k,
         kv_lens,
         scale,
         indices.shape[-1],
+        req_to_token if paged else cu_q,
+        req_pool_indices if paged else cu_q,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -298,11 +381,14 @@ def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, sc
         indices.stride(0),
         indices.stride(1) if indices.ndim == 3 else 0,
         indices.stride(2) if indices.ndim == 3 else indices.stride(1),
+        req_to_token.stride(0) if paged else 0,
         NUM_KV_HEADS=num_kv_heads,
         GROUP_SIZE=group_size,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        PAGED=paged,
+        F32_DOT=_INTERPRET,
         num_warps=warps,
         num_stages=stages,
     )

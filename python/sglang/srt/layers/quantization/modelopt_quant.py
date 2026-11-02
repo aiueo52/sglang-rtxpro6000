@@ -2457,12 +2457,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
+        tier_experts = layer.num_local_experts
+        if os.environ.get("SGLANG_EXPERT_TIER_K", "0") != "0":
+            from sglang.srt.layers.moe.expert_tier import integration
+            if integration.is_tier_layer(layer):
+                integration.validate_layer(layer)
+                tier_experts = integration.configured_k()
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
         w13_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                tier_experts,
                 num_shards * intermediate_size_per_partition,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
@@ -2477,7 +2483,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # GEMM 2
         w2_weight = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                tier_experts,
                 hidden_size,
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
@@ -2491,7 +2497,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w13_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                tier_experts,
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -2514,7 +2520,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         w2_weight_scale = ModelWeightParameter(
             data=torch.empty(
-                layer.num_local_experts,
+                tier_experts,
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
@@ -2923,6 +2929,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
 
+        if os.environ.get("SGLANG_EXPERT_TIER_K", "0") != "0":
+            from sglang.srt.layers.moe.expert_tier import integration
+            if integration.is_tier_layer(layer):
+                integration.finalize_layer(layer)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
@@ -3134,6 +3145,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
             )
+            if os.environ.get("SGLANG_EXPERT_TIER_K", "0") != "0":
+                from sglang.srt.layers.moe.expert_tier import integration
+                if integration.is_tier_layer(layer):
+                    integration.apply_quant_info(layer, quant_info)
             return self.runner.run(dispatch_output, quant_info)
 
         raise NotImplementedError(

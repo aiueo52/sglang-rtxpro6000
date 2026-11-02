@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import os
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -1075,6 +1076,12 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        if os.environ.get("SGLANG_EXPERT_TIER_K", "0") != "0":
+            from sglang.srt.layers.moe.expert_tier import integration
+            if integration.is_tier_layer(self):
+                expert_id = integration.loader_expert(self, param, expert_id)
+                if expert_id is None:
+                    return
         tp_rank = self.moe_tp_rank
 
         # Special case for GGUF weights

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -1882,6 +1884,11 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        if os.environ.get("SGLANG_GC_BEFORE_KV_SIZING", "0") == "1":
+            # qwen4_exp の load_weights の入れ子関数が自分を参照する循環で、FP8 に替えた後の
+            # 古い BF16 の重みが残る。spec を切ると次の gc まで空かないので、量る前に集める。
+            collected = gc.collect()
+            logger.info(f"gc before KV sizing: collected {collected} objects")
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
