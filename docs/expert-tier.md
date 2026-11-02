@@ -10,12 +10,18 @@ use the arena path, so reducing K can increase transfer work and reduce speed.
 
 The default is off. `EXPERT_TIER_K=0` adds no tier environment settings and
 preserves the existing launcher behavior, including inherited SGLang settings.
-To enable it, first generate a hot set, then launch from the repository root:
+To enable it, launch from the repository root. A hot set built from public text
+is included at `expert-tier/hot-set.json` (see "Building the hot set"):
+
+```bash
+TARGET_MODEL=models/model CONC=8 EXPERT_TIER_K=320 ./serve-fast.sh wa
+```
+
+To fit the hot set to your own workload, build a replacement from traces first:
 
 ```bash
 python tools/build_hot_set.py traces/trace-000000.npz traces/trace-000001.npz \
   --output expert-tier/hot-set.json
-TARGET_MODEL=models/model CONC=8 EXPERT_TIER_K=320 ./serve-fast.sh wa
 ```
 
 This example uses the default context length of 262,144. With K > 0, an unset
@@ -98,6 +104,13 @@ Each layer is sorted by decreasing frequency, breaking ties by ascending ID;
 unseen experts are included. The runtime loads the first K entries per layer.
 Use representative workloads: hot-set initialization is workload dependent.
 
+The bundled `expert-tier/hot-set.json` was built this way from 109 trace files of
+a K320, `CONC=8` run over public text only: the first user turn of 64 Japanese
+OpenAssistant oasst2 conversations, 256 GSM8K test questions with reasoning off,
+and the interference check over CPython 3.13.0 `Lib/` source text. Initial
+residency changes transfer work only; it does not change which experts a token
+is routed to.
+
 ## Requirements and limits
 
 The integration supports the ModelOpt NVFP4 MoE path with the FlashInfer CUTLASS
@@ -112,12 +125,34 @@ VRAM use shifts work and memory pressure to the host. K is a per-layer weight
 residency budget, not a total VRAM limit. KV cache, context length, concurrency,
 arenas, and other allocations still affect peak VRAM. Transfers and acceptance
 rates affect performance; the measurements below are specific configurations,
-not guarantees. The hot-set JSON and model weights are generated/provided
-separately. This change does not include a new serving benchmark.
+not guarantees. Model weights are provided separately.
 
 ## Reported measurements
 
 These are supplied measurements, not rerun by the CPU-only release tests.
+
+* This launcher as shipped, `CONC=8 EXPERT_TIER_K=320 ./serve-fast.sh wa` with
+  the bundled hot set: context 262,144, `MAX_TOTAL_TOKENS=262144`, HiCache
+  32 GB (the default), prefill chunk 8192, effective memory fraction 0.886778.
+  Peak VRAM **66,230 MiB**. Host MemAvailable fell by about **107 GB** during
+  the run, including the 32 GB HiCache pool.
+
+| Concurrency | Per-request tok/s | Aggregate tok/s |
+| --- | ---: | ---: |
+| c1 | 232 | 232 |
+| c2 | 206 | 409 |
+| c4 | 157 | 610 |
+| c8 | 112 | 869 |
+
+Against profile W4 (draft 4, no adaptive mode) with the tier at K320 and context
+262,144 (earlier launch method), per-request speed was within 2% at c1 and c2,
+2.4% lower at c4, and 10% higher at c8 (aggregate 869 versus 791). Code editing
+at c1 ran at **615 tok/s** with a mean accepted length of about 10. Prompt
+log-probabilities over 8 Japanese prompts (1,479 tokens) were identical to that
+reference. GSM8K, 1,319 questions: **545 versus 570**; 121 questions were solved
+only by the reference and 96 only by this launch (exact McNemar p ≈ 0.10). The two
+524k configurations below scored 549 (W4) and 552 (w16_c8) against the same
+reference. 63k interference check: **8/8**, **0 leaks**.
 
 * K320, context 524,288 (YaRN factor 2), profile wa with table w16_c8:
   peak VRAM **72,922 MiB**. The 524k needle check passed **3/3**, with

@@ -9,13 +9,19 @@ arena を使います。K を減らすと転送量が増え、速度が下がる
 ## 使い方
 
 既定は切です。`EXPERT_TIER_K=0` では置き場用の環境変数を追加せず、既存の
-起動動作と引き継いだ SGLang の環境設定を保ちます。先に hot set を作り、
-リポジトリのルートで起動します。
+起動動作と引き継いだ SGLang の環境設定を保ちます。有効にするにはリポジトリの
+ルートで起動します。公開の文から作った hot set を `expert-tier/hot-set.json`
+に同梱しています（「hot set の作成」を参照）。
+
+```bash
+TARGET_MODEL=models/model CONC=8 EXPERT_TIER_K=320 ./serve-fast.sh wa
+```
+
+自分の負荷に合わせるには、先に trace から hot set を作り直します。
 
 ```bash
 python tools/build_hot_set.py traces/trace-000000.npz traces/trace-000001.npz \
   --output expert-tier/hot-set.json
-TARGET_MODEL=models/model CONC=8 EXPERT_TIER_K=320 ./serve-fast.sh wa
 ```
 
 この例は既定の context 長 262,144 を使います。K > 0 では、`MAX_TOTAL_TOKENS` が
@@ -95,6 +101,13 @@ ID=-1 と重み0を個別に除外します。
 使用回数の降順、同数では番号の昇順とし、未使用の専門家も含めます。
 実行時は各層の先頭 K 人を読みます。初期配置の効果は負荷に依存します。
 
+同梱の `expert-tier/hot-set.json` は、K320・`CONC=8` の実行で公開の文だけを
+流して記録した 109 個の trace から、この手順で作りました。流した文は、
+OpenAssistant oasst2 の日本語の会話 64 件の最初の利用者の発話、GSM8K の
+test の問い 256 問（思考なし）、CPython 3.13.0 の `Lib/` のソースを使う混線の
+確認です。初期配置が変えるのは転送の量だけで、各トークンがどの専門家に
+振り分けられるかは変わりません。
+
 ## 前提と限り
 
 対応するのは ModelOpt NVFP4 MoE、FlashInfer CUTLASS backend、MoE TP=1・EP=1、
@@ -107,12 +120,33 @@ mmap ソースとページ常駐を支える host RAM とストレージが必�
 減らすと host 側のメモリと転送の負担が増えます。K は層ごとの重みの常駐予算で、
 VRAM 全体の上限ではありません。KV cache、context、同時実行数、arena なども
 VRAM の山に影響します。転送や draft の採択率でも速度は変わり、以下の値は
-特定構成の測定結果です。hot set とモデルの重みは別途用意します。
-今回の変更で serving の測定をやり直したものではありません。
+特定構成の測定結果です。モデルの重みは別途用意します。
 
 ## 測った値
 
 以下は提供された測定結果で、公開準備の CPU 試験で再測定した値ではありません。
+
+* この launcher をそのまま使った構成。`CONC=8 EXPERT_TIER_K=320 ./serve-fast.sh wa`
+  と同梱の hot set、context 262,144・`MAX_TOTAL_TOKENS=262144`・HiCache 32 GB
+  （既定）・prefill chunk 8192・実効の mem fraction 0.886778:
+  VRAM の山 **66,230 MiB**。実行中に host の MemAvailable は約 **107 GB**
+  減りました（HiCache の 32 GB を含みます）。
+
+| 同時実行数 | 1本あたり tok/s | 全体 tok/s |
+| --- | ---: | ---: |
+| c1 | 232 | 232 |
+| c2 | 206 | 409 |
+| c4 | 157 | 610 |
+| c8 | 112 | 869 |
+
+置き場 K320・context 262,144 の profile W4（draft 4・adaptive なし、以前の
+起動方法）と比べ、1本あたりの速さは c1 と c2 で差 2% 以内、c4 で 2.4% 遅く、
+c8 で 10% 速い結果でした（全体 869 対 791）。コード編集の c1 は **615 tok/s**、
+採択の長さの平均は約 10 でした。日本語の 8 件の入力（1,479 トークン）の
+logprob はその比較元と完全に同じでした。GSM8K 1,319問は **545 対 570** で、
+比較元だけが正解した問いが 121、この起動だけが正解した問いが 96 でした
+（exact McNemar p ≈ 0.10）。下の 524k の 2 つの構成も、同じ比較元に対して
+549（W4）と 552（w16_c8）でした。63k の混線は **8/8・漏れ0** でした。
 
 * K320・context 524,288（YaRN factor 2）・profile wa（表 w16_c8）:
   VRAM の山 **72,922 MiB**。524k の needle **3/3**、最初の1文字まで **78.6秒**。
