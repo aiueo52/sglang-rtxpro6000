@@ -272,6 +272,20 @@ if [ "${PROFILE:-}" != ngram ]; then
   export SGLANG_OPT_QSA_DRAFT_META_BATCH=${SGLANG_OPT_QSA_DRAFT_META_BATCH:-1} SGLANG_OPT_DRAFT_TAIL=${SGLANG_OPT_DRAFT_TAIL:-1}
   export SGLANG_OPT_COMMIT_GLUE_FUSED=${SGLANG_OPT_COMMIT_GLUE_FUSED:-1} SGLANG_OPT_DRAFT_EXTEND_LENS=${SGLANG_OPT_DRAFT_EXTEND_LENS:-1}
 fi
+# Bundle 2 (2026-11-08): H35a (fused draft-step confidence) and H38 (MTP FC GEMV) were measured
+# with wa, STACK_D=1, E_DRAFT=1, OEA=0 and sparse RS on. HB_BUNDLE2=1 (default) supplies both
+# flags as :- defaults for that configuration only, so a value set by the caller is kept.
+# HB_BUNDLE2=0 supplies nothing and leaves the caller's environment unchanged. H40 (hyperburst
+# patches/flashinfer/2026-11-08) is a FlashInfer build-time patch and is not switched here.
+case "${HB_BUNDLE2:-1}" in
+  0) ;;
+  1)
+    if [ "$PROFILE" = wa ] && [ "${STACK_D:-1}" = 1 ] && [ "${E_DRAFT:-1}" = 1 ] && [ "$OEA" = 0 ] &&
+       [ "$SGLANG_OPT_SPEC_SPARSE_RS" = 1 ]; then
+      export SGLANG_OPT_DRAFT_STEP_FUSED_CONF=${SGLANG_OPT_DRAFT_STEP_FUSED_CONF:-1} SGLANG_MTP_FC_GEMV=${SGLANG_MTP_FC_GEMV:-1}
+    fi ;;
+  *) echo "[serve-fast] HB_BUNDLE2 must be 0 or 1" >&2; exit 2 ;;
+esac
 export TARGET_MODEL
 
 
