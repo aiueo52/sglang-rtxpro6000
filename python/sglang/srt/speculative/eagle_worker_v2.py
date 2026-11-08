@@ -363,6 +363,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._rs_extend_fused_conf = (
             self._rs_extend_tail and envs.SGLANG_OPT_RS_EXTEND_FUSED_CONF.get()
         )
+        # SGLANG_OPT_DRAFT_STEP_FUSED_CONF=1: take each draft step's VT/DL confidence
+        # from the sparse-RS pass instead of a separate top1_prob.
+        # Effective only at batch size 1 (the DL rule): other batch sizes have no VT confidence buffer.
+        _h35_mode = os.environ.get("SGLANG_OPT_DRAFT_STEP_FUSED_CONF", "0")
+        if _h35_mode not in ("0", "1"):
+            raise ValueError("SGLANG_OPT_DRAFT_STEP_FUSED_CONF must be 0 or 1")
+        if _h35_mode != "0" and not self.sparse_rs:
+            raise ValueError("SGLANG_OPT_DRAFT_STEP_FUSED_CONF needs SGLANG_OPT_SPEC_SPARSE_RS")
+        self._draft_step_fused_conf = _h35_mode != "0"
+        if self._draft_step_fused_conf:
+            logger.info("SGLANG_OPT_DRAFT_STEP_FUSED_CONF=1: fused draft step confidence")
         if envs.SGLANG_OPT_RS_EXTEND_TAIL.get():
             logger.info(
                 "SGLANG_OPT_RS_EXTEND_TAIL on: active %s, fused conf %s",
@@ -1484,15 +1495,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         maybe_detect_inf(
                             logits_output.next_token_logits, f"draft_forward step {i}"
                         )
-                    if (
-                        vt_conf_buf is not None
+                    step_conf = (
+                        vt_conf_buf[:bs, i + 1]
+                        if vt_conf_buf is not None
                         and get_spec().speculative_use_rejection_sampling
-                    ):
+                        else None
+                    )
+                    fused_step_conf = step_conf is not None and self._draft_step_fused_conf
+                    if step_conf is not None and not fused_step_conf:
                         # Raw, untempered top-1 mass over every emitted logit, before
                         # RS truncation, temperature scaling, or one-hot conversion.
-                        vt_conf_buf[:bs, i + 1].copy_(
-                            top1_prob(logits_output.next_token_logits)
-                        )
+                        step_conf.copy_(top1_prob(logits_output.next_token_logits))
                     if self.sparse_rs:
                         _, _, topk_p, topk_index = rs_draft_proposal_sparse(
                             next_token_logits=logits_output.next_token_logits,
@@ -1507,6 +1520,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                             draft_tokens=draft_tokens_topk1, draft_token_column=i + 1,
                             draft_support_probs=draft_support_probs[:, i + 1],
                             draft_support_tokens=draft_support_tokens[:, i + 1],
+                            # The same raw-logit top-1 mass from this pass (as p0 with
+                            # SGLANG_OPT_RS_EXTEND_FUSED_CONF), not torch top1_prob.
+                            **({"conf_out": step_conf} if fused_step_conf else {}),
                         )
                     elif get_spec().speculative_use_rejection_sampling:
                         _, topk_p, topk_index = self._rs_draft_proposal(

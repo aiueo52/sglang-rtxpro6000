@@ -275,7 +275,15 @@ def _rs_proposal_sparse(
             WRITE_ROWS=write_rows, WRITE_PROB=write_prob,
         )
     else:
-        assert hidden_states is None and not write_rows and not write_prob
+        assert hidden_states is None and not write_rows
+        if write_prob:
+            # H35a: the draft step's confidence from this pass, as the extend path does for p0.
+            _, splits = _proposal_split(vocab=vocab, k_block=k_block)
+            conf = torch.empty(size=(n,), dtype=torch.float32, device=device)
+            partial_max = torch.empty(size=(n, splits), dtype=torch.float32, device=device)
+            partial_sum = torch.empty(size=(n, splits), dtype=torch.float32, device=device)
+            row_args = dict(_plain_row_args(dummy=next_token_logits), PartialMax=partial_max,
+                            PartialSum=partial_sum, WRITE_PROB=True)
     if n == 0:
         return probs, tokens, topk_p, topk_index, hidden_out, rows_out, conf
     keys = _proposal_topk_keys(
@@ -312,16 +320,21 @@ def rs_draft_proposal_sparse(
     draft_token_column: int = 0, draft_support_probs: torch.Tensor | None = None,
     draft_support_tokens: torch.Tensor | None = None, topk_impl: str = "triton",
     temp_scale: float = 1.0, onehot_above: float = 0.0, greedy_fast: bool = False,
+    conf_out: torch.Tensor | None = None,
 ):
-    probs, tokens, topk_p, topk_index, _, _, _ = _rs_proposal_sparse(
+    """``conf_out[n]`` (may be strided, e.g. a column of the VT buffer) receives each row's
+    softmax max of the raw logits from this pass; fp32 order differs from torch top1_prob."""
+    probs, tokens, topk_p, topk_index, _, _, conf = _rs_proposal_sparse(
         next_token_logits=next_token_logits, temperatures=temperatures, top_ks=top_ks,
         top_ps=top_ps, uniforms=uniforms, k=k, min_ps=min_ps, hot_token_id=hot_token_id,
         positions=positions, draft_tokens=draft_tokens, draft_token_column=draft_token_column,
         draft_support_probs=draft_support_probs, draft_support_tokens=draft_support_tokens,
         topk_impl=topk_impl, temp_scale=temp_scale, onehot_above=onehot_above,
         greedy_fast=greedy_fast, accept_lens=None, num_tokens_per_req=0, hidden_states=None,
-        write_rows=False, write_prob=False,
+        write_rows=False, write_prob=conf_out is not None,
     )
+    if conf_out is not None and conf is not None:
+        conf_out.copy_(conf)
     return probs, tokens, topk_p, topk_index
 
 
