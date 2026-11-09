@@ -127,6 +127,13 @@ arenas, and other allocations still affect peak VRAM. Transfers and acceptance
 rates affect performance; the measurements below are specific configurations,
 not guarantees. Model weights are provided separately.
 
+H40 (the hyperburst FlashInfer build-time patch for the VT MoE prologue,
+`patches/flashinfer/2026-11-08`) has not been tested with the expert tier;
+`serve-fast.sh` refuses `EXPERT_TIER_K>0` when `flashinfer-vt` carries it.
+A module already compiled from H40 source in an existing
+`FLASHINFER_WORKSPACE_BASE` is not detected, so build in a fresh workspace
+after removing the patch.
+
 ## Reported measurements
 
 These are supplied measurements, not rerun by the CPU-only release tests.

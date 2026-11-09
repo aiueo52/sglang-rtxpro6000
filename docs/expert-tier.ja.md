@@ -122,6 +122,13 @@ VRAM 全体の上限ではありません。KV cache、context、同時実行数
 VRAM の山に影響します。転送や draft の採択率でも速度は変わり、以下の値は
 特定構成の測定結果です。モデルの重みは別途用意します。
 
+H40（VT MoE prologue 向けの hyperburst FlashInfer ビルド時パッチ、
+`patches/flashinfer/2026-11-08`）と expert tier の併用は未検証です。
+`flashinfer-vt` にこのパッチがあると、`serve-fast.sh` は
+`EXPERT_TIER_K>0` を拒否します。既存の `FLASHINFER_WORKSPACE_BASE` にある、
+H40 ソースからコンパイル済みのモジュールは検出できません。
+パッチを外した後、新しい workspace でビルドしてください。
+
 ## 測った値
 
 以下は提供された測定結果で、公開準備の CPU 試験で再測定した値ではありません。

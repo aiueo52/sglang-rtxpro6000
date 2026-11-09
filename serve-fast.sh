@@ -100,6 +100,12 @@ if [[ ! "$EXPERT_TIER_K" =~ ^(0|[1-9][0-9]{0,2})$ ]] || ((EXPERT_TIER_K > 512));
   echo "[serve-fast] EXPERT_TIER_K must be an integer in 0..512" >&2; exit 2
 fi
 if ((EXPERT_TIER_K > 0)); then
+  # H40 rewrites the VT MoE prologue and is untested with the expert tier.
+  EXPERT_TIER_VT_KERNELS="$REPO/flashinfer-vt/flashinfer/data/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh"
+  if [ -f "$EXPERT_TIER_VT_KERNELS" ] && grep -qF 'H40 S2' "$EXPERT_TIER_VT_KERNELS"; then
+    echo "[serve-fast] EXPERT_TIER_K>0 has not been tested with the H40 FlashInfer patch (flashinfer-vt carries it); rebuild flashinfer-vt without h40.patch in a fresh FLASHINFER_WORKSPACE_BASE, or set EXPERT_TIER_K=0" >&2
+    exit 2
+  fi
   EXPERT_TIER_HOT="${EXPERT_TIER_HOT:-$REPO/expert-tier/hot-set.json}"
   EXPERT_TIER_KEEP="${EXPERT_TIER_KEEP:-60}"
   if [[ ! "$EXPERT_TIER_KEEP" =~ ^(0|[1-9][0-9]{0,3})$ ]] ||

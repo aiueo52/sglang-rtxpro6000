@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -136,3 +137,65 @@ def test_disabled_does_not_default_max_total_tokens():
     data = json.loads(result.stdout)
     assert 'MAX_TOTAL_TOKENS' not in data['env']
     assert '--max-total-tokens' not in data['argv']
+
+
+@pytest.fixture
+def h40_checkout(tmp_path):
+    checkout = tmp_path / 'checkout'
+    checkout.mkdir()
+    try:
+        for name in ('serve-fast.sh', 'serve-local.sh'):
+            shutil.copy2(ROOT / name, checkout / name)
+        for name in ('adaptive', 'expert-tier'):
+            shutil.copytree(ROOT / name, checkout / name)
+        (checkout / 'flashinfer-vtoea/flashinfer').mkdir(parents=True)
+        (checkout / 'flashinfer').mkdir()
+        marker = checkout / (
+            'flashinfer-vt/flashinfer/data/csrc/fused_moe/cutlass_backend/'
+            'cutlass_fused_moe_kernels.cuh')
+        marker.parent.mkdir(parents=True)
+        marker.write_text('// H40 S2\n')
+        yield checkout, marker
+    finally:
+        shutil.rmtree(checkout)
+
+
+def launch_h40(checkout, **overrides):
+    env = {'PATH': os.environ['PATH'], 'HOME': str(checkout), 'PYTHON': sys.executable,
+           'TARGET_MODEL': str(checkout), 'TOKEN_MAP': 'none', 'CONC': '8',
+           'TMPDIR': os.environ.get('TMPDIR', str(checkout)), 'PYTHONDONTWRITEBYTECODE': '1',
+           'CUDA_VISIBLE_DEVICES': '', 'FLASH_NEXT_ADMIN_API_KEY': 'cpu-test-placeholder'}
+    env.update(overrides)
+    return subprocess.run(['bash', str(checkout / 'serve-fast.sh'), 'wa', '--print'],
+                          cwd=checkout, env=env, capture_output=True, text=True)
+
+
+def test_h40_marker_stops_expert_tier_before_print(h40_checkout):
+    checkout, _ = h40_checkout
+    result = launch_h40(checkout, EXPERT_TIER_K='320', EXPERT_TIER_HOT='missing')
+    assert result.returncode == 2
+    assert 'H40' in result.stderr
+    assert len(result.stderr.splitlines()) == 1
+    assert not result.stdout
+
+
+def test_h40_marker_preserves_disabled_print(h40_checkout):
+    checkout, marker = h40_checkout
+    marked = launch_h40(checkout, EXPERT_TIER_K='0')
+    marker.unlink()
+    baseline = launch_h40(checkout, EXPERT_TIER_K='0')
+    assert marked.returncode == baseline.returncode == 0
+    assert json.loads(marked.stdout) == json.loads(baseline.stdout)
+    assert marked.stdout == baseline.stdout
+
+
+@pytest.mark.parametrize('source', [None, '// Unpatched VT MoE prologue\n'])
+def test_h40_marker_absent_allows_expert_tier(h40_checkout, hot, source):
+    checkout, marker = h40_checkout
+    if source is None:
+        marker.unlink()
+    else:
+        marker.write_text(source)
+    result = launch_h40(checkout, EXPERT_TIER_K='320', EXPERT_TIER_HOT=hot)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['env']['SGLANG_EXPERT_TIER_K'] == '320'
