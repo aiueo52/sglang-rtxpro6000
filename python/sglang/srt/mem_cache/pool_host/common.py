@@ -1,8 +1,15 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
+import math
 import os
+import re
+import threading
+import time
 from collections import defaultdict
 
 import torch
@@ -10,6 +17,52 @@ import torch
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 
 logger = logging.getLogger(__name__)
+
+_PREPIN_ALIGNMENT = 2 * 1024 * 1024
+_prepin_lock = threading.Lock()
+_prepin_base = None
+_prepin_size = 0
+_prepin_cursor = 0
+_prepin_initialized = False
+_prepin_slices = {}
+_prepin_hold = None
+
+
+def prepin_host_arena() -> None:
+    """Populate and register one process-wide host arena before loading weights."""
+    global _prepin_base, _prepin_size, _prepin_initialized, _prepin_hold
+    with _prepin_lock:
+        if _prepin_initialized:
+            return
+        value = os.environ.get("SGLANG_HICACHE_PREPIN_BYTES", "")
+        if not value:
+            return
+        if re.fullmatch(r"[+-]?[0-9]+", value) is None or int(value, 10) < 0:
+            raise ValueError(
+                "SGLANG_HICACHE_PREPIN_BYTES must be a non-negative decimal "
+                f"integer (bytes); got {value!r}"
+            )
+        n = int(value, 10)
+        if n == 0:
+            return
+        logger.info("hicache prepin: start bytes=%d", n)
+        start = time.perf_counter()
+        base = alloc_mmap((n,), torch.uint8)
+        populated = time.perf_counter()
+        logger.info(
+            "hicache prepin: populated bytes=%d in %.2f s", n, populated - start
+        )
+        _cuda_host_register(base)
+        registered = time.perf_counter()
+        logger.info(
+            "hicache prepin: registered bytes=%d in %.2f s (total %.2f s)",
+            n, registered - populated, registered - start,
+        )
+        # Publish only after successful registration; retain the owning mapping.
+        _prepin_base = base
+        _prepin_hold = base
+        _prepin_size = n
+        _prepin_initialized = True
 
 
 class HostTensorAllocator:
@@ -132,6 +185,24 @@ def _cuda_host_register(buffer: torch.Tensor) -> None:
 
 
 def _cuda_host_unregister(buffer: torch.Tensor) -> None:
+    global _prepin_base
+    with _prepin_lock:
+        if buffer.data_ptr() in _prepin_slices:
+            del _prepin_slices[buffer.data_ptr()]
+            if _prepin_slices:
+                return
+            # The last live slice releases the registration of the whole arena; the mapping itself stays alive in _prepin_hold so remaining views never dangle.
+            base = _prepin_base
+            try:
+                _unregister_host_buffer(base)
+            finally:
+                _prepin_base = None
+                _prepin_slices.clear()
+            return
+    _unregister_host_buffer(buffer)
+
+
+def _unregister_host_buffer(buffer: torch.Tensor) -> None:
     cudart = torch.cuda.cudart()
     rc = cudart.cudaHostUnregister(buffer.data_ptr())
     if int(rc) != 0:
@@ -155,6 +226,38 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
+    if pin_memory and type(allocator) is HostTensorAllocator:
+        with _prepin_lock:
+            if _prepin_base is not None:
+                n_bytes = math.prod(dims) * dtype.itemsize
+                if n_bytes > 0:
+                    assert (
+                        device == "cpu"
+                    ), f"HostTensorAllocator only supports CPU allocations; got device={device!r}"
+                    global _prepin_cursor
+                    off = (
+                        (_prepin_cursor + _PREPIN_ALIGNMENT - 1)
+                        // _PREPIN_ALIGNMENT * _PREPIN_ALIGNMENT
+                    )
+                    left = max(0, _prepin_size - off)
+                    if off + n_bytes <= _prepin_size:
+                        ptr = _prepin_base.data_ptr() + off
+                        array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
+                        buffer = torch.frombuffer(array, dtype=dtype).reshape(dims)
+                        allocator.dtype = dtype
+                        allocator.dims = dims
+                        _prepin_slices[ptr] = array
+                        _prepin_cursor = off + n_bytes
+                        logger.info(
+                            "hicache prepin: slice bytes=%d offset=%d left=%d",
+                            n_bytes, off, _prepin_size - _prepin_cursor,
+                        )
+                        return buffer
+                    logger.warning(
+                        "hicache prepin: no room for bytes=%d (left=%d); "
+                        "using the normal path",
+                        n_bytes, left,
+                    )
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer)

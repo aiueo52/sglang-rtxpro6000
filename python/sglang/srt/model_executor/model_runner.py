@@ -649,6 +649,9 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        if self.device == "cuda":
+            from sglang.srt.mem_cache.pool_host.common import prepin_host_arena
+            prepin_host_arena()
         self.load_model()
         prepare_moe_topk(
             model=self.model,

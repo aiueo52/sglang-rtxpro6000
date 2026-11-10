@@ -386,6 +386,10 @@ if [ "$PROFILE" = wa ] && [ "$CONC" != 1 ]; then
     COMMON+=(--enable-hierarchical-cache --hicache-size "$WA_HICACHE_GB"
              --hicache-host-memory-mode cache --hicache-write-policy write_through
              --hicache-io-backend kernel --hicache-mem-layout page_first)
+    # Pin the HiCache host pool once, before the weights load (P9). SGLANG_HICACHE_PREPIN_BYTES=0 keeps the previous path.
+    if [ "$FLASH_NEXT_EDITION" = normal ]; then
+      export SGLANG_HICACHE_PREPIN_BYTES="${SGLANG_HICACHE_PREPIN_BYTES-$((10#$WA_HICACHE_GB * 1000000000 + 200000000))}"
+    fi
   fi
 fi
 if [ "$PROFILE" = ngram ]; then export SGLANG_OPT_SPEC_SPARSE_RS=0
