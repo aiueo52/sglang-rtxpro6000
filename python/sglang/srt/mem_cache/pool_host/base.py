@@ -1,3 +1,5 @@
+# Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+
 from __future__ import annotations
 
 import abc
@@ -14,6 +16,7 @@ from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
+    prepin_room_bytes,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
@@ -48,15 +51,30 @@ def ranks_per_host() -> int:
     return max(world_group.world_size // get_parallel().config.nnodes, 1)
 
 
+def host_free_budget_bytes() -> int:
+    """Unreserved free host RAM available to this rank for new allocations."""
+    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    return free // ranks_per_host()
+
+
 def host_memory_budget_bytes() -> int:
     """Host RAM this rank may claim for a HiCache pool.
 
     psutil reports the whole machine, so co-located ranks each see the same free
     memory; without the split every rank sizes its pool against all of it and
     the host is oversubscribed by the number of ranks it holds.
+    An already registered prepin arena can supply a pool without a new allocation,
+    so its conservative remaining capacity is also a valid pool budget.
     """
-    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
-    return free // ranks_per_host()
+    budget = host_free_budget_bytes()
+    room = prepin_room_bytes()
+    if room > 0:
+        use = max(budget, room)
+        logger.info(
+            "hicache prepin: pool budget free=%d room=%d use=%d", budget, room, use
+        )
+        return use
+    return budget
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:

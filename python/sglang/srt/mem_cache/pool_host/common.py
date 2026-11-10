@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 logger = logging.getLogger(__name__)
 
 _PREPIN_ALIGNMENT = 2 * 1024 * 1024
+_PREPIN_ROOM_SLACK = 64 * 1024 * 1024
 _prepin_lock = threading.Lock()
 _prepin_base = None
 _prepin_size = 0
@@ -63,6 +64,18 @@ def prepin_host_arena() -> None:
         _prepin_hold = base
         _prepin_size = n
         _prepin_initialized = True
+
+
+def prepin_room_bytes() -> int:
+    """Conservative pool capacity remaining in the already registered arena."""
+    with _prepin_lock:
+        if _prepin_base is None:
+            return 0
+        off = (
+            (_prepin_cursor + _PREPIN_ALIGNMENT - 1)
+            // _PREPIN_ALIGNMENT * _PREPIN_ALIGNMENT
+        )
+        return max(0, _prepin_size - off - _PREPIN_ROOM_SLACK)
 
 
 class HostTensorAllocator:
@@ -226,6 +239,7 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
+    no_room = None
     if pin_memory and type(allocator) is HostTensorAllocator:
         with _prepin_lock:
             if _prepin_base is not None:
@@ -253,11 +267,28 @@ def alloc_with_host_register(
                             n_bytes, off, _prepin_size - _prepin_cursor,
                         )
                         return buffer
-                    logger.warning(
-                        "hicache prepin: no room for bytes=%d (left=%d); "
-                        "using the normal path",
-                        n_bytes, left,
-                    )
+                    no_room = (n_bytes, left)
+    if _prepin_base is not None and pin_memory:
+        n_bytes = math.prod(dims) * dtype.itemsize
+        if n_bytes > 0:
+            # Import lazily: base imports common while defining its pool classes.
+            from sglang.srt.mem_cache.pool_host.base import host_free_budget_bytes
+
+            free = host_free_budget_bytes()
+            if n_bytes > free:
+                raise ValueError(
+                    "Not enough host memory available. Requesting "
+                    f"{n_bytes / 1e9:.2f} GB but only have {free / 1e9:.2f} GB free "
+                    "(the HiCache prepin arena could not hold this buffer). "
+                    "Please reduce the size of the hierarchical cache or set "
+                    "SGLANG_HICACHE_PREPIN_BYTES=0."
+                )
+    if no_room is not None:
+        logger.warning(
+            "hicache prepin: no room for bytes=%d (left=%d); "
+            "using the normal path",
+            *no_room,
+        )
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer)
