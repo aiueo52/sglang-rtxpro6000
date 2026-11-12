@@ -88,3 +88,16 @@
 - JIT and CUDA-graph cache state affects startup and first-request behavior.
 - No model weights, cache payloads, private prompts, hidden reasoning traces,
   hostnames, tokens, or service credentials are distributed.
+
+## Experimental QSA relative prefill
+
+`SGLANG_QSA_RELATIVE_PREFILL` is off by default and is not bit-exact: outputs
+are not token-identical to the off path. Measurements cover one RTX PRO 6000
+Blackwell Max-Q, one stream, `wa`, context length 208,896, memory fraction
+0.90, thinking off, on a pre-release tree with matching QSA files apart from
+the knob name and comment header. This exact commit has not been re-measured.
+Real documents, code or conversations, thinking mode, multi-step reasoning over
+long contexts, concurrency above 1 and other serve modes were not tested.
+With thinking off, the model fails two-step lookups at 100,000 tokens and above
+with either setting. Synthetic lookup results in [RESULTS.md](RESULTS.md#experimental-qsa-relative-prefill)
+do not establish quality on those untested workloads. Decode speed is unchanged.

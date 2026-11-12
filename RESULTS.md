@@ -223,3 +223,54 @@ DFlash2's GPU-resident decode rate.
 The dated tag retains the sanitized raw 27B agentic log and machine-generated
 summaries. The current maintained harness and published result catalog are in
 [`jpezzulli/pennyroyal-validation`](https://github.com/jpezzulli/pennyroyal-validation).
+
+## Experimental QSA relative prefill
+
+These measurements compare `SGLANG_QSA_RELATIVE_PREFILL=0` with `1`.
+The knob is experimental and off by default; outputs are not bit-exact or
+token-identical. See [README.md](README.md#experimental-qsa-relative-prefill)
+for dispatch requirements and mechanism, and [PROVENANCE.md](PROVENANCE.md#qsa-relative-prefill-backport)
+for the Apache-2.0 backport source.
+
+### Where it was measured
+
+- One RTX PRO 6000 Blackwell Max-Q (the repository's usual machine), one stream (c=1), the `wa` mode of `serve-fast.sh`,
+  context length 208,896, memory fraction 0.90, thinking off.
+- Measured on a pre-release tree whose two QSA files are the same as this change apart from the knob name and the comment
+  header. It has NOT been re-measured on this exact commit, and not on other modes, not at concurrency above 1.
+
+### Speed (knob 0 -> knob 1)
+
+- Server-side prefill time for 4,096 new tokens after 200,000 cached tokens (2026-11-11, 6 measurements per arm,
+  alternating launches): median 0.431 s -> 0.343 s (-20.3%); ranges 0.421-0.440 s and 0.340-0.350 s.
+  In that test the 16-token continuations were not identical in every pair.
+- Client-side wall time for a request that appends about 4,000 new tokens after 200,000 cached tokens, including a
+  5-token answer and the HTTP round trip (2026-11-12, 16 requests per arm over two sessions of 4 launches each):
+  mean 1.115 s -> 0.984 s (about -12%). Per session: about -17% (6 per arm) and about -9% (10 per arm); launch-to-launch
+  variation is about 0.1 s, the same size as the gain.
+- Same client-side measurement at 100,000 cached tokens (6 per arm): mean 0.652 s -> 0.611 s; the two ranges overlap.
+- Reading a 200,000-token prompt from scratch (one read per launch, 4 launches per arm over two sessions):
+  17.0, 17.0, 16.9, 17.7 s -> 15.8, 16.2, 16.3, 16.3 s (about -6%).
+- Short questions after the long prompt is cached: no measurable difference.
+
+### Answer quality (2026-11-12)
+
+- Task: find one numbered record in a synthetic haystack of about 200,000 tokens and answer with its number
+  ("single lookup"), plus a variant where the haystack holds records with near-identical ids ("similar id").
+- Main run: 4 launches in off/on/on/off order, 300 questions per launch (240 single lookup + 60 similar id), 1,200 in total.
+  The pass rule was fixed before the run: on may be at most 15 questions below off out of 600.
+
+| | all (600) | single lookup (480) | similar id (120) |
+|---|---|---|---|
+| knob 0 | 536 | 420 | 116 |
+| knob 1 | 538 | 423 | 115 |
+
+- Per launch: knob 0 gave 270 and 266; knob 1 gave 268 and 270. Questions whose result flipped between two launches of the
+  same arm: 8 and 10; between the arms: 14 and 8.
+- Two smaller earlier runs with different haystacks, 200,000-token single lookup: 23/32 vs 25/32, and 90/96 vs 90/96
+  (knob 0 vs knob 1). At 32,000 and 100,000 tokens single lookup and similar id were at or near 100% in both arms.
+
+### Not tested
+
+- Real documents, code or conversations; thinking mode; multi-step reasoning over long contexts (with thinking off the
+  model fails two-step lookups at 100,000 tokens and above with either setting); concurrency above 1; other serve modes.

@@ -64,3 +64,13 @@ journals, prompts, conversations, model files, cache payloads, local hostnames,
 tokens, and private endpoints are deliberately excluded. Detailed public test
 logs and the maintained validation harness live in
 [`jpezzulli/pennyroyal-validation`](https://github.com/jpezzulli/pennyroyal-validation).
+
+## QSA relative prefill backport
+
+The experimental, default-off `SGLANG_QSA_RELATIVE_PREFILL` path in
+`python/sglang/srt/layers/attention/qsa/mqa.py` and `qsa_indexer.py` is
+backported from [jpezzulli/sglang-rtxpro6000 commit d4703ed417393655ad84b1062b474b674a238393](https://github.com/jpezzulli/sglang-rtxpro6000/commit/d4703ed417393655ad84b1062b474b674a238393),
+under Apache-2.0. This is a later backport, separate from the historical runtime
+identity above. Measurements used a pre-release tree whose two QSA files match
+apart from the knob name and comment header; this exact commit has not been
+re-measured. See [RESULTS.md](RESULTS.md#experimental-qsa-relative-prefill).

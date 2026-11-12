@@ -88,10 +88,42 @@ CONC=4 FLASH_NEXT_EDITION=normal bash serve-fast.sh wa  # FLASH_NEXT_EDITION=hyp
 | `FLASH_NEXT_ADMIN_API_KEY` | random per start | key required by admin/management routes; visible to local processes through argv (see above) |
 | `SGLANG_TACTIC_ROWS` | `0` | tactic rows are not available in this release (no policy is shipped); any value other than `0` stops at start |
 | `ADAPTIVE_CONFIG` | `adaptive/w16_c4.json` | adaptive draft-length table, for both editions and every `CONC` unless explicitly overridden |
+| `SGLANG_QSA_RELATIVE_PREFILL` | `0` | experimental request-relative QSA prefill logits with key splitting; `1` opts in (requirements and evidence below) |
 
 **`CONC=1` is not a one-request admission limit.** It leaves `serve-local.sh`'s `--max-running-requests 4` and `--chunked-prefill-size 8192` in place, defaults to 10 Mamba cache slots, and does not enable HiCache, even if `FLASH_NEXT_HICACHE_GB` is set. Send only one request at a time to reproduce a single-stream workload. This documents the measured launcher behavior; it has not been changed to enforce a limit of one.
 
 The other retained adaptive tables are explicit alternatives or test fixtures; the launcher does not automatically select them by edition or `CONC`.
+
+### Experimental QSA relative prefill
+
+`SGLANG_QSA_RELATIVE_PREFILL=0` keeps the existing prefill path.
+`SGLANG_QSA_RELATIVE_PREFILL=1` opts into request-relative logits and key
+splitting in the QSA indexer, requiring CUDA, TileLang and a positive width
+derived from host lengths; otherwise the stock path runs. The first activation
+logs `QSA_RELATIVE_PREFILL_ACTIVE` once per indexer. It changes prefill only;
+decode speed is unchanged. It is not bit-exact: outputs are not token-identical
+to the knob-off path. It is experimental and worth trying only for very long
+contexts, well above 100,000 tokens.
+
+In `python/sglang/srt/layers/attention/qsa/mqa.py`, each row's key score is
+written at a column relative to that row's start. The logits workspace uses
+the longest request's compressed-key width instead of all packed batch keys.
+The kernel splits a row block's key tiles along another grid dimension; the
+split selector uses device core count, row blocks and available key tiles.
+`qsa_indexer.py` obtains the width from the metadata's host length tuple or
+the scheduler's CPU lengths, without reading device lengths to size it. Top-k
+reads each relative row from zero to its own key count; columns beyond that
+range are not read, and block indices are expanded to token indices as before.
+
+Measured on one RTX PRO 6000 Blackwell Max-Q, one stream (c=1), `wa` in
+`serve-fast.sh`, context length 208,896, memory fraction 0.90, thinking off.
+The pre-release tree's two QSA files match this change apart from the knob name
+and comment header. This exact commit has not been re-measured; other modes
+and concurrency above 1 were not measured. See [RESULTS.md](RESULTS.md#experimental-qsa-relative-prefill)
+for timing windows and synthetic lookup results, and [LIMITATIONS.md](LIMITATIONS.md#experimental-qsa-relative-prefill)
+for untested workloads. Source: jpezzulli/sglang-rtxpro6000 commit
+`d4703ed417393655ad84b1062b474b674a238393` (Apache-2.0), recorded in
+[PROVENANCE.md](PROVENANCE.md#qsa-relative-prefill-backport).
 
 ### Runtime files and disk use
 
@@ -186,8 +218,8 @@ Model weights have separate terms from this code. Read the model cards and linke
 ## Changes from upstream
 
 - SGLang base: jpezzulli/sglang-rtxpro6000 at 16e5682 plus the flash-next-fast series, the 2026-10-27 update and the later changes listed in `MODIFICATIONS.md` by aiueo52 and contributors ([public base (2026-08-27)](https://github.com/jpezzulli/sglang-rtxpro6000/tree/16e5682aad6e3335f38ec8d5711176278f12a086)), including the published 121-patch series.
-- Compared with the public base `16e5682`, `python/` has **65 modified, 40 added and 5 deleted files**, all under `python/sglang/`. `test/` has **3 modified, 34 added and 1 deleted file**. Counts include all file types, exclude generated Python caches, and compare symlinks by type and target.
-- Of the **2,065 upstream test files**, 2,061 are unchanged, 3 modified and 1 removed, for **2,098 files under `test/`** in this release. The removed file is `test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py`: its fake worker no longer matches this tree's worker, so it failed without testing the production path (see `MODIFICATIONS.md`). The additions include the CPU-only redaction and route-authentication tests.
+- Compared with the public base `16e5682`, `python/` has **66 modified, 40 added and 5 deleted files**, all under `python/sglang/`. `test/` has **3 modified, 35 added and 1 deleted file**. Counts include all file types, exclude generated Python caches, and compare symlinks by type and target.
+- Of the **2,065 upstream test files**, 2,061 are unchanged, 3 modified and 1 removed, for **2,099 files under `test/`** in this release. The removed file is `test/registered/unit/spec/test_eagle_worker_v2_topk1_fastpath.py`: its fake worker no longer matches this tree's worker, so it failed without testing the production path (see `MODIFICATIONS.md`). The additions include the CPU-only redaction and route-authentication tests.
 - Added single-GPU Qwen3.8-Flash-Next NVFP4 serving optimizations, PLE offload, fused verify/draft kernels and adaptive MTP decoding; added four-request scheduling/cache settings, public token maps, launch helpers and ThinkingCap overlay tools.
 - FlashInfer 0.6.17 changes are distributed as `flashinfer-overlays/`, assembled locally into normal and OEA variants rather than shipping full dependency trees.
 - Removed for licensing reasons: the MUSA `fused_add_rms_norm_kernel.mu` and the Hunyuan3D `rasterizer.cpp`, `rasterizer_gpu.cu`, `rasterizer.h` and `mesh_processor.cpp`. The MUSA fused-add-RMSNorm kernel and Hunyuan3D rasterizer/mesh extensions are therefore unavailable in this release.
