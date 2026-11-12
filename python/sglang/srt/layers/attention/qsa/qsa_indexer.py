@@ -1,10 +1,13 @@
 # Modified by aiueo52 for flash-next-fast (2026); see MODIFICATIONS.md.
+# The opt-in request-relative prefill logits and key splitting (SGLANG_QSA_RELATIVE_PREFILL,
+# default 0) are backported from jpezzulli/sglang-rtxpro6000 commit d4703ed (Apache-2.0).
 
 """QSA indexer for Qwen4-Exp checkpoints."""
 
 from __future__ import annotations
 
-from typing import Tuple
+import os
+from typing import Optional, Tuple
 
 import torch
 
@@ -18,7 +21,12 @@ from sglang.srt.layers.attention.qsa.metadata import (
     build_pending_ring_slots,
     build_rope_position_matrix,
 )
-from sglang.srt.layers.attention.qsa.mqa import qsa_mqa_decode, qsa_mqa_prefill
+from sglang.srt.layers.attention.qsa.mqa import (
+    HAS_TILELANG,
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    qsa_mqa_prefill_relative,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
@@ -39,6 +47,26 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
+
+
+def _prefill_max_row_keys(indexer_metadata, forward_batch) -> Optional[int]:
+    """The longest request's compressed-block count, from host lengths only.
+
+    The width of request-relative prefill logits. Uses the backend's prefill
+    length tuple when it set one, else the scheduler's ``seq_lens_cpu`` (padding
+    entries only raise the bound). ``None`` when neither exists: reading the
+    device lengths would sync the host. Ported from upstream
+    ``QSAIndexerMetadata.prefill_max_row_keys`` (#45791); kept beside its only
+    caller because stable's metadata struct carries no host length tuple.
+    """
+    lengths = getattr(indexer_metadata, "prefill_sequence_lengths_cpu", None)
+    if lengths is None:
+        lengths = getattr(forward_batch, "seq_lens_cpu", None)
+    if lengths is None or len(lengths) == 0:
+        return None
+    if isinstance(lengths, torch.Tensor):
+        return int(lengths.max()) // indexer_metadata.compress_ratio
+    return max(int(length) for length in lengths) // indexer_metadata.compress_ratio
 
 
 class QSAIndexer(MultiPlatformOp):
@@ -449,6 +477,7 @@ class QSAIndexer(MultiPlatformOp):
         row_ends: torch.Tensor,
         query_positions: torch.Tensor,
         sequence_lengths_for_rows: torch.Tensor,
+        max_row_keys: Optional[int] = None,
     ) -> torch.Tensor:
         rows = q.shape[0]
         output = torch.empty(
@@ -459,8 +488,17 @@ class QSAIndexer(MultiPlatformOp):
         if rows == 0:
             return output
 
+        relative = (
+            os.environ.get("SGLANG_QSA_RELATIVE_PREFILL", "0") == "1"
+            and max_row_keys is not None and max_row_keys > 0
+            and q.is_cuda and HAS_TILELANG
+        )
+        if relative and not getattr(self, "_relative_prefill_reported", False):
+            import logging
+            logging.getLogger(__name__).warning("QSA_RELATIVE_PREFILL_ACTIVE")
+            self._relative_prefill_reported = True
         row_chunk_size = _qsa_prefill_row_chunk_size(
-            rows, compressed_keys.shape[0], q.shape[1]
+            rows, max_row_keys if relative else compressed_keys.shape[0], q.shape[1]
         )
         for row_start in range(0, rows, row_chunk_size):
             row_end = min(row_start + row_chunk_size, rows)
@@ -474,16 +512,25 @@ class QSAIndexer(MultiPlatformOp):
                 )
                 logits = None
             else:
-                logits = qsa_mqa_prefill(
-                    q[chunk_slice],
-                    compressed_keys,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
-                )
+                chunk_starts = row_starts[chunk_slice]
+                if relative:
+                    logits = qsa_mqa_prefill_relative(
+                        q[chunk_slice], compressed_keys, chunk_starts,
+                        row_ends[chunk_slice], max_row_keys,
+                    )
+                    topk_starts = torch.zeros_like(chunk_starts)
+                    topk_ends = row_ends[chunk_slice] - chunk_starts
+                else:
+                    logits = qsa_mqa_prefill(
+                        q[chunk_slice], compressed_keys, chunk_starts,
+                        row_ends[chunk_slice],
+                    )
+                    topk_starts = chunk_starts
+                    topk_ends = row_ends[chunk_slice]
                 block_indices = qsa_fast_topk(
                     logits,
-                    row_starts[chunk_slice],
-                    row_ends[chunk_slice],
+                    topk_starts,
+                    topk_ends,
                     topk=self.block_topk,
                 )
             selected = expand_qsa_block_indices(
@@ -648,6 +695,8 @@ class QSAIndexer(MultiPlatformOp):
             row_ends,
             logical_positions,
             row_sequence_lengths,
+            **({"max_row_keys": _prefill_max_row_keys(indexer_metadata, forward_batch)}
+               if os.environ.get("SGLANG_QSA_RELATIVE_PREFILL", "0") == "1" else {}),
         )
 
 
