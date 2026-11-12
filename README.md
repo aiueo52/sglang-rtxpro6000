@@ -118,7 +118,8 @@ range are not read, and block indices are expanded to token indices as before.
 Measured on one RTX PRO 6000 Blackwell Max-Q, one stream (c=1), `wa` in
 `serve-fast.sh`, context length 208,896, memory fraction 0.90, thinking off.
 The pre-release tree's two QSA files match this change apart from the knob name
-and comment header. This exact commit has not been re-measured; other modes
+and comment header. The speed and quality numbers have not been re-measured on this tree, where
+a short operation check passed (53/60 vs 52/60 correct, knob 0 vs knob 1); other modes
 and concurrency above 1 were not measured. See [RESULTS.md](RESULTS.md#experimental-qsa-relative-prefill)
 for timing windows and synthetic lookup results, and [LIMITATIONS.md](LIMITATIONS.md#experimental-qsa-relative-prefill)
 for untested workloads. Source: jpezzulli/sglang-rtxpro6000 commit

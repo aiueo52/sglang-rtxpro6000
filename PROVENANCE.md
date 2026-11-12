@@ -72,5 +72,6 @@ The experimental, default-off `SGLANG_QSA_RELATIVE_PREFILL` path in
 backported from [jpezzulli/sglang-rtxpro6000 commit d4703ed417393655ad84b1062b474b674a238393](https://github.com/jpezzulli/sglang-rtxpro6000/commit/d4703ed417393655ad84b1062b474b674a238393),
 under Apache-2.0. This is a later backport, separate from the historical runtime
 identity above. Measurements used a pre-release tree whose two QSA files match
-apart from the knob name and comment header; this exact commit has not been
-re-measured. See [RESULTS.md](RESULTS.md#experimental-qsa-relative-prefill).
+apart from the knob name and comment header; the speed and quality
+numbers have not been re-measured on this tree, where a short operation check passed
+(53/60 vs 52/60 correct, knob 0 vs knob 1). See [RESULTS.md](RESULTS.md#experimental-qsa-relative-prefill).

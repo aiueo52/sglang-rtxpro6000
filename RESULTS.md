@@ -237,7 +237,8 @@ for the Apache-2.0 backport source.
 - One RTX PRO 6000 Blackwell Max-Q (the repository's usual machine), one stream (c=1), the `wa` mode of `serve-fast.sh`,
   context length 208,896, memory fraction 0.90, thinking off.
 - Measured on a pre-release tree whose two QSA files are the same as this change apart from the knob name and the comment
-  header. It has NOT been re-measured on this exact commit, and not on other modes, not at concurrency above 1.
+  header. The speed and quality numbers below have NOT been re-measured on this tree (only the operation check at the end
+  of this section ran on it), and not on other modes, not at concurrency above 1.
 
 ### Speed (knob 0 -> knob 1)
 
@@ -269,6 +270,15 @@ for the Apache-2.0 backport source.
   same arm: 8 and 10; between the arms: 14 and 8.
 - Two smaller earlier runs with different haystacks, 200,000-token single lookup: 23/32 vs 25/32, and 90/96 vs 90/96
   (knob 0 vs knob 1). At 32,000 and 100,000 tokens single lookup and similar id were at or near 100% in both arms.
+
+### Operation check on this tree (2026-11-12)
+
+- Run on this tree with the change applied. One launch per arm (knob 0, then knob 1), the same 60 questions per arm on one
+  synthetic haystack of about 200,000 tokens: 48 single lookup + 12 similar id.
+- Correct answers: knob 0 53/60 (42/48 single lookup, 11/12 similar id); knob 1 52/60 (43/48, 9/12).
+  The rule fixed before the run: knob 1 may be at most 6 questions below knob 0 out of 60.
+- The knob-1 launch logged `QSA_RELATIVE_PREFILL_ACTIVE`; the knob-0 launch did not.
+- This is an operation check only: 60 questions and one launch per arm are too few to measure quality or speed.
 
 ### Not tested
 
